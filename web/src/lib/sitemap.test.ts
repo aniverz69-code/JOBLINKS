@@ -1,0 +1,160 @@
+import { describe, it, expect } from 'vitest';
+import {
+  SITEMAP_CHUNK,
+  STATIC_PATHS,
+  collectionPaths,
+  contributorPaths,
+  blogPaths,
+  roleLandingPaths,
+  skillGlossaryPaths,
+} from './sitemap';
+
+describe('sitemap static paths', () => {
+  it('includes the collections hub and the for-companies page', () => {
+    expect(STATIC_PATHS).toContain('/collections');
+    expect(STATIC_PATHS).toContain('/for-companies');
+  });
+
+  // Indexable pages that the job feed does not link to, so nothing but the sitemap
+  // would lead a crawler to them.
+  it('includes the data and API surfaces', () => {
+    for (const path of [
+      '/open',
+      '/trends',
+      '/docs/api',
+      '/agents',
+      '/cli',
+      '/chatgpt',
+      '/roast',
+      '/contribute',
+      '/status',
+      '/privacy',
+    ]) {
+      expect(STATIC_PATHS).toContain(path);
+    }
+  });
+
+  it('lists each path once', () => {
+    expect(new Set(STATIC_PATHS).size).toBe(STATIC_PATHS.length);
+  });
+
+  it('includes the feature landings', () => {
+    expect(STATIC_PATHS).toContain('/features/inbox');
+    expect(STATIC_PATHS).toContain('/features/referrals');
+    expect(STATIC_PATHS).toContain('/features/tailor');
+  });
+
+  // /referrals now answers with a 301 to its new home. Listing a redirect in the
+  // sitemap tells crawlers to index the address that no longer serves the page.
+  it('drops the moved referrals URL', () => {
+    expect(STATIC_PATHS).not.toContain('/referrals');
+  });
+});
+
+describe('roleLandingPaths', () => {
+  it('lists the category table and one page per country given', () => {
+    expect(roleLandingPaths('backend', ['germany', 'poland'])).toEqual([
+      '/roles/backend',
+      '/roles/backend/germany',
+      '/roles/backend/poland',
+    ]);
+  });
+
+  it('takes the countries already gated, so a thin pair is never listed', () => {
+    // The gate lives in publishedCountries; this builder is handed its output and
+    // adds nothing of its own, which is what keeps the sitemap and the route (404)
+    // reading off one rule instead of two.
+    expect(roleLandingPaths('backend', [])).toEqual(['/roles/backend']);
+  });
+
+  it('lists the hub itself among the static paths, not here', () => {
+    expect(STATIC_PATHS).toContain('/roles');
+    expect(roleLandingPaths('backend', ['germany'])).not.toContain('/roles');
+  });
+});
+
+describe('collectionPaths', () => {
+  it('maps every collection slug to its /collections/:slug landing path', () => {
+    const paths = collectionPaths();
+    expect(paths).toContain('/collections/yc'); // company collection
+    expect(paths).toContain('/collections/remote-worldwide'); // filter collection
+    expect(new Set(paths).size).toBe(paths.length);
+  });
+});
+
+describe('contributorPaths', () => {
+  // Each profile is a page a person is meant to share and be found by, so each needs
+  // its own sitemap entry rather than riding on the showcase's.
+  it('maps every shown contributor to their /contributors/:login profile path', () => {
+    const paths = contributorPaths();
+
+    expect(paths).toContain('/contributors/strelov1');
+    expect(new Set(paths).size).toBe(paths.length);
+  });
+
+  // The showcase does not list bots, so the sitemap must not offer crawlers a page
+  // that 404s.
+  it('offers no path the showcase would not serve', () => {
+    expect(contributorPaths().some((p) => p.includes('bot'))).toBe(false);
+  });
+
+  it('does not carry the showcase itself, which is a static path', () => {
+    expect(contributorPaths()).not.toContain('/contributors');
+  });
+});
+
+describe('blogPaths', () => {
+  it('includes the /blog index followed by one entry per post', () => {
+    const paths = blogPaths([
+      { slug: 'first', date: '2026-01-02' },
+      { slug: 'second', date: '2026-01-05' },
+    ]);
+    expect(paths).toEqual([
+      // The index changes whenever its newest post does.
+      { path: '/blog', lastmod: '2026-01-05' },
+      { path: '/blog/first', lastmod: '2026-01-02' },
+      { path: '/blog/second', lastmod: '2026-01-05' },
+    ]);
+  });
+
+  it('dates the index from the newest post regardless of input order', () => {
+    const paths = blogPaths([
+      { slug: 'older', date: '2025-11-30' },
+      { slug: 'newest', date: '2026-03-01' },
+      { slug: 'middle', date: '2026-01-15' },
+    ]);
+    expect(paths[0]).toEqual({ path: '/blog', lastmod: '2026-03-01' });
+  });
+
+  it('is just the index, undated, when there are no posts', () => {
+    expect(blogPaths([])).toEqual([{ path: '/blog', lastmod: undefined }]);
+  });
+});
+
+describe('SITEMAP_CHUNK', () => {
+  // The chunk is a latency budget, not a protocol allowance: one chunk is one
+  // Postgres read that has to finish inside the 60s proxy timeout even while an
+  // ingest run is evicting the buffer cache. Keep it an order of magnitude under the
+  // 50,000-URL protocol cap, and in step with internal/handler's companySitemapChunk.
+  it('stays well under the sitemap protocol cap', () => {
+    expect(SITEMAP_CHUNK).toBe(10000);
+    expect(SITEMAP_CHUNK).toBeLessThanOrEqual(50000 / 4);
+  });
+});
+
+describe('skillGlossaryPaths', () => {
+  it('lists the index and one page per described skill', () => {
+    expect(skillGlossaryPaths(['dbt', 'kubernetes'])).toEqual([
+      '/skills',
+      '/skills/dbt',
+      '/skills/kubernetes',
+    ]);
+  });
+
+  // The route 404s on a skill with no description, so listing every canonical would
+  // point a crawler at pages that do not exist. It takes the described set for exactly
+  // that reason — the caller reads it from the same catalog the route does.
+  it('lists nothing but the index when nothing is described', () => {
+    expect(skillGlossaryPaths([])).toEqual(['/skills']);
+  });
+});

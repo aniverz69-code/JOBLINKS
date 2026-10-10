@@ -1,0 +1,17 @@
+# Dockerfile linting. NOTHING IS IGNORED HERE, and that is the point of the file existing
+# at all rather than being deleted: every exclusion is a `# hadolint ignore=<rule>` beside
+# the line it excuses, where the argument sits next to what it argues about and a new
+# Dockerfile inherits nothing.
+#
+# The version-pinning rules (DL3018, DL3008) were briefly listed here and moved out for
+# that reason. Ignoring them globally would have meant the next Dockerfile added to this
+# repository silently inherited the exemption — including one that installs something where
+# the version genuinely matters. The three lines that carry the marker today each install
+# tooling from a pinned base image, and pinning the package version on top trades one
+# failure for a worse one: the version disappears on the next security update, and the
+# build then breaks weeks later, on an unrelated commit, in whichever image rebuilt first.
+#
+# `info` findings do not fail. They are style — consecutive RUN instructions, a non-numeric
+# user id — and a Dockerfile that reads clearly is worth more than one flattened into a
+# single layer to satisfy a linter.
+failure-threshold: warning

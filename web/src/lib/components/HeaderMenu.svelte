@@ -1,0 +1,397 @@
+<script lang="ts">
+  import { page } from '$app/state';
+  import { afterNavigate } from '$app/navigation';
+  import { resolve } from '$app/paths';
+  import { Menu, X, Sun, Moon, CircleUser, SquarePlus, ShieldCheck, LogOut, LogIn } from '@lucide/svelte';
+  import { isAuthenticated, currentUser, logout as doLogout } from '$lib/auth.svelte';
+  import { promptSignIn } from '$lib/signin';
+  import { themeStore } from '$lib/theme.svelte';
+  import { lockScroll, unlockScroll } from '$lib/scrollLock';
+  import { openedOverlay, closedOverlay } from '$lib/headerOverlay';
+  import { cn } from '$lib/ui';
+  import BrandMark from './BrandMark.svelte';
+  import GithubStars from './GithubStars.svelte';
+  import NotificationBell from './NotificationBell.svelte';
+  import HeaderProfileMenu from './HeaderProfileMenu.svelte';
+  import { ensureAccountSetupLoaded, setupOutstanding } from '$lib/accountSetup.svelte';
+  import { ProviderIcon } from '$lib/ui';
+  import { NAV } from '$lib/siteNav';
+  import { accountLinks } from '$lib/headerAccountLinks';
+  import { DISCORD_URL } from '$lib/socialLinks';
+
+  // This menu carries the site nav and the theme toggle on every viewport; on
+  // mobile it additionally carries the signed-in account items and the auth
+  // action (Sign in/Log out) — on desktop those live in HeaderProfileMenu, the
+  // bar's separate profile trigger, so Log out is reachable without scrolling
+  // past the whole site nav first (openspec/changes/split-header-profile-menu).
+  //
+  // Two layouts from one markup: on mobile the panel is a full-screen drawer
+  // (own top bar · scrollable sectioned links · pinned bottom action bar); on
+  // desktop it stays the small anchored dropdown.
+
+  let open = $state(false);
+  let root = $state<HTMLElement | null>(null);
+
+  const path = $derived(page.url.pathname);
+  const isActive = (href: string) => path === href || path.startsWith(`${href}/`);
+
+  // Shared row classes: a ≥44px tap target with base text on mobile, collapsing
+  // to the compact dropdown row on desktop. Active section is emphasised.
+  const rowBase =
+    'flex items-center gap-2 rounded-md px-4 min-h-11 text-base transition-colors hover:bg-accent hover:text-accent-foreground sm:min-h-0 sm:rounded-none sm:px-3 sm:py-2 sm:text-sm';
+  const linkClass = (href: string) =>
+    cn(rowBase, isActive(href) ? 'font-medium text-foreground' : 'text-muted-foreground');
+  // Shared icon-button treatment for this component's own bar controls
+  // (Discord, menu) — HeaderProfileMenu defines its own copy for its trigger.
+  const iconButton =
+    'size-9 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-accent hover:text-accent-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring';
+
+  // The theme button only renders inside the open panel (client-only), so no
+  // SSR mounted-guard is needed — read the store directly.
+  const isDark = $derived(themeStore.isDark);
+  const email = $derived(currentUser()?.email ?? '');
+  const isModerator = $derived(currentUser()?.role === 'moderator');
+
+  // Static nav (always shown) and the signed-in account items (shown only when
+  // authenticated). Moderation is gated on the moderator role at render time.
+  // Primary destinations pinned to the very top of the menu. Jobs is the feed at
+  // /jobs — the homepage is the landing page above it, reachable via the logo.
+  const primaryLinks = [NAV.jobs, NAV.companies];
+
+  // About and Open are rendered on their own at the foot of the list, so their
+  // glyphs are lifted out of NAV here rather than spelled a second time.
+  const AboutIcon = NAV.about.icon;
+  const OpenIcon = NAV.open.icon;
+
+  // The rest of the site. The two feature pages here are what the product DOES beyond
+  // listing jobs, and until now nothing in this menu led to either of them — the
+  // /features/* landings were reachable only from the pages that happened to link
+  // them, which for a signed-out visitor was almost nowhere.
+  //
+  // A signed-in visitor also has "Tailor" and "Search alerts" in the account section
+  // above. Those are the app; these are what it is for, and the divider between the
+  // sections is what tells them apart — so the labels here name the subject
+  // ("CV tailoring") rather than the tool.
+  // How it works leads this group rather than sitting beside /about at the bottom:
+  // /about is who publishes the site, this is how the thing in front of you works, and
+  // it is the answer a first-time visitor is looking for. The homepage header names it
+  // too, but only there and only above 640px — this is where it is always reachable.
+  const navLinks = [
+    NAV.collections,
+    NAV.talent,
+    NAV.howItWorks,
+    NAV.cvTailoring,
+    NAV.jobNotifications,
+    NAV.analytics,
+    NAV.trends,
+    NAV.discussions,
+  ];
+
+  // What the setup dot reads. The signed-in check is inside the call, shared with the
+  // card on the tracking page.
+  $effect(() => {
+    ensureAccountSetupLoaded();
+  });
+
+  // Mobile only: the open panel is a full-screen overlay, so lock the page behind
+  // it. Desktop keeps the small anchored dropdown and stays scrollable.
+  $effect(() => {
+    if (!open) return;
+    if (window.matchMedia('(min-width: 640px)').matches) return;
+    lockScroll();
+    return () => unlockScroll();
+  });
+
+  function closeSelf() {
+    open = false;
+  }
+
+  // Close whatever other header overlay (the bell dropdown, search suggestions)
+  // was open, and let them close this one back — see headerOverlay.ts.
+  $effect(() => {
+    if (!open) return;
+    openedOverlay(closeSelf);
+    return () => closedOverlay(closeSelf);
+  });
+
+  afterNavigate(() => {
+    open = false;
+  });
+
+  function onWindowClick(e: MouseEvent) {
+    if (open && root && !root.contains(e.target as Node)) open = false;
+  }
+
+  function signIn() {
+    open = false;
+    promptSignIn();
+  }
+
+  function logout() {
+    open = false;
+    void doLogout();
+  }
+</script>
+
+<svelte:window
+  onclick={onWindowClick}
+  onkeydown={(e) => e.key === 'Escape' && (open = false)}
+/>
+
+<!-- Theme toggle: reused across layouts, in the mobile bottom bar and, on
+     desktop, inline at the end of the link list. Auth action: reused only on
+     mobile (its own bottom bar) — desktop's Sign in/Log out live in
+     HeaderProfileMenu instead, so this snippet is unused there. -->
+{#snippet themeButton()}
+  <button
+    type="button"
+    role="menuitem"
+    onclick={() => themeStore.toggle()}
+    class={cn(rowBase, 'w-full text-left text-muted-foreground')}
+  >
+    {#if isDark}
+      <Moon class="size-4 shrink-0" /> Light theme
+    {:else}
+      <Sun class="size-4 shrink-0" /> Dark theme
+    {/if}
+  </button>
+{/snippet}
+
+{#snippet authButton()}
+  {#if isAuthenticated()}
+    <button
+      type="button"
+      role="menuitem"
+      onclick={logout}
+      class={cn(rowBase, 'w-full text-left text-muted-foreground')}
+    >
+      <LogOut class="size-4 shrink-0" /> Log out
+    </button>
+  {:else}
+    <button
+      type="button"
+      role="menuitem"
+      onclick={signIn}
+      class={cn(rowBase, 'w-full text-left font-medium text-foreground')}
+    >
+      <LogIn class="size-4 shrink-0" /> Sign in
+    </button>
+  {/if}
+{/snippet}
+
+<div class="relative flex items-center gap-1" bind:this={root}>
+  <!-- Desktop bar order: GitHub stars, Discord, then the visitor's OWN two controls —
+       the bell and profile/sign-in — then the menu button pinned to the far right. The
+       bell used to sit ahead of the project's links, which put two icons about the site
+       between it and the account it notifies about. On mobile the two about the site
+       collapse into the drawer (below) and the two that are the visitor's stay: the
+       bell is how they learn something happened, and it cannot be a tap deeper than
+       the menu that would tell them. -->
+  <GithubStars class="hidden sm:inline-flex" />
+
+  <!-- eslint-disable-next-line svelte/no-navigation-without-resolve -- external Discord invite, not an internal route -->
+  <a href={DISCORD_URL}
+    target="_blank"
+    rel="noreferrer"
+    aria-label="freehire on Discord"
+    class={cn('hidden sm:inline-flex', iconButton)}
+  >
+    <ProviderIcon provider="discord" />
+  </a>
+
+  <NotificationBell />
+
+  <!-- Desktop only: the profile menu (signed in) or a direct sign-in action
+       (signed out) sits before the menu button — see HeaderProfileMenu.svelte. -->
+  <HeaderProfileMenu />
+
+  <button
+    type="button"
+    aria-label={setupOutstanding() > 0 ? 'Menu — account setup unfinished' : 'Menu'}
+    aria-haspopup="menu"
+    aria-expanded={open}
+    onclick={(e) => {
+      // Stop the toggle's own click from reaching the window outside-handler.
+      // Without this, opening detaches the clicked icon (the {#if open} Menu/X
+      // swap) from the DOM, so onWindowClick's root.contains(e.target) reads
+      // false and immediately re-closes the just-opened menu — the "center of
+      // the button doesn't open, only the edge does" bug.
+      e.stopPropagation();
+      open = !open;
+    }}
+    class={cn('relative inline-flex', iconButton)}
+  >
+    {#if open}
+      <X class="size-5" />
+    {:else}
+      <Menu class="size-5" />
+    {/if}
+    <!-- Setup still outstanding. On the MENU button rather than the profile icon beside
+         it, because that icon is `hidden sm:inline-flex` — on a phone it is not there to
+         carry anything, and this is the one account control at every width.
+
+         No count, deliberately: the notification bell is two controls away and does carry
+         one, and a second numbered badge beside it would make two signals compete for one
+         glance. The bell wins on urgency; this is a nudge, and a nudge only has to be
+         noticeable. Hidden while the menu is open — by then it has been acted on.
+
+         The screen-reader equivalent is in this button's aria-label, not an sr-only span
+         in here: an aria-label REPLACES an element's contents as its accessible name, so
+         a span would have been silently unreadable. -->
+    {#if isAuthenticated() && !open && setupOutstanding() > 0}
+      <span
+        class="absolute right-1.5 top-1.5 size-2 rounded-full bg-brand ring-2 ring-background"
+        aria-hidden="true"
+      ></span>
+    {/if}
+  </button>
+
+  {#if open}
+    <div
+      role="menu"
+      class="z-50 bg-background
+             max-sm:fixed max-sm:inset-0 max-sm:flex max-sm:flex-col
+             sm:absolute sm:right-0 sm:top-full sm:mt-2 sm:max-h-[80vh] sm:w-64 sm:overflow-y-auto sm:rounded-md sm:border sm:border-border sm:py-1 sm:shadow-lg"
+    >
+      <!-- Mobile top bar: brand + close (drawer reads as a screen, not a dropdown). -->
+      <div class="flex h-14 shrink-0 items-center justify-between border-b border-border px-4 sm:hidden">
+        <span class="flex items-center gap-2 text-sm font-semibold tracking-tight">
+          <BrandMark />
+          freehire
+        </span>
+        <button
+          type="button"
+          aria-label="Close menu"
+          onclick={() => (open = false)}
+          class="inline-flex size-9 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-accent hover:text-accent-foreground"
+        >
+          <X class="size-5" />
+        </button>
+      </div>
+
+      <!-- Middle: scrollable, sectioned links. -->
+      <div class="max-sm:flex-1 max-sm:overflow-y-auto max-sm:px-2 max-sm:pb-3">
+        <!-- Primary destinations pinned to the top, then a divider before the
+             signed-in personal items and the rest of the site nav. -->
+        {#each primaryLinks as link (link.href)}
+          {@const Icon = link.icon}
+          <a href={resolve(link.href)} role="menuitem" onclick={() => (open = false)} class={linkClass(link.href)}>
+            <Icon class="size-4 shrink-0" />
+            {link.label}
+          </a>
+        {/each}
+        <div class="my-1 h-px bg-border"></div>
+
+        <!-- Mobile-only: the account section moved to HeaderProfileMenu on desktop
+             (openspec/changes/split-header-profile-menu), so this stays scoped to
+             the drawer via sm:hidden rather than removed — the mobile drawer's
+             markup and item list are otherwise unchanged. accountLinks — the
+             personal items in the same order as the account sidebar (Profile is
+             rendered separately just above them, so the full run reads Profile ·
+             Activity · Tracking · Inbox · …) — is shared with HeaderProfileMenu's
+             desktop panel via $lib/headerAccountLinks, so the two cannot drift
+             apart. "Submit a job" below is a create action, split off from the
+             "My submissions" reading item it used to sit next to. -->
+        <div class="sm:hidden">
+          {#if isAuthenticated()}
+            <a
+              href={resolve('/my/profile')}
+              role="menuitem"
+              onclick={() => (open = false)}
+              class={linkClass('/my/profile')}
+              title={email}
+            >
+              <CircleUser class="size-4 shrink-0" />
+              Profile
+            </a>
+            {#each accountLinks as link (link.href)}
+              {@const Icon = link.icon}
+              <a href={resolve(link.href)} role="menuitem" onclick={() => (open = false)} class={linkClass(link.href)}>
+                <Icon class="size-4 shrink-0" />
+                {link.label}
+              </a>
+            {/each}
+
+            <!-- Create/action items, split off from the account reading items above. -->
+            <div class="my-1 h-px bg-border"></div>
+            <a href={resolve('/submit')} role="menuitem" onclick={() => (open = false)} class={linkClass('/submit')}>
+              <SquarePlus class="size-4 shrink-0" />
+              Submit a job
+            </a>
+            {#if isModerator}
+              <a
+                href={resolve('/moderation')}
+                role="menuitem"
+                onclick={() => (open = false)}
+                class={linkClass('/moderation')}
+              >
+                <ShieldCheck class="size-4 shrink-0" />
+                Moderation
+              </a>
+            {/if}
+            <div class="my-1 h-px bg-border"></div>
+          {/if}
+        </div>
+
+        {#each navLinks as link (link.href)}
+          {@const Icon = link.icon}
+          <a href={resolve(link.href)} role="menuitem" onclick={() => (open = false)} class={linkClass(link.href)}>
+            <Icon class="size-4 shrink-0" />
+            {link.label}
+          </a>
+        {/each}
+
+        <!-- About and Open sit at the very bottom of the link list, just before the
+             theme toggle (the marketing landing lives at /about; Open is the
+             open-startup transparency page, already linked from the footer). Read
+             from NAV like every other destination — spelled here it would be a
+             second copy of a page the header row already draws. -->
+        <a
+          href={resolve(NAV.about.href)}
+          role="menuitem"
+          onclick={() => (open = false)}
+          class={linkClass(NAV.about.href)}
+        >
+          <AboutIcon class="size-4 shrink-0" />
+          About
+        </a>
+        <a
+          href={resolve(NAV.open.href)}
+          role="menuitem"
+          onclick={() => (open = false)}
+          class={linkClass(NAV.open.href)}
+        >
+          <OpenIcon class="size-4 shrink-0" />
+          Open
+        </a>
+
+        <!-- Desktop-only: theme toggle inline at the end of the dropdown. Auth is
+             not rendered here — signed in, it lives in HeaderProfileMenu's Log
+             out; signed out, the bar's own direct Sign-in action already covers
+             it (see HeaderProfileMenu.svelte). -->
+        <div class="hidden sm:block">
+          <div class="my-1 h-px bg-border"></div>
+          {@render themeButton()}
+        </div>
+      </div>
+
+      <!-- Mobile-only: GitHub + theme + auth pinned to the bottom of the drawer. -->
+      <div class="shrink-0 border-t border-border p-2 sm:hidden">
+        <GithubStars variant="row" class={cn(rowBase, 'text-muted-foreground')} />
+        <!-- eslint-disable-next-line svelte/no-navigation-without-resolve -- external Discord invite, not an internal route -->
+        <a href={DISCORD_URL}
+          target="_blank"
+          rel="noreferrer"
+          role="menuitem"
+          aria-label="freehire on Discord"
+          class={cn(rowBase, 'text-muted-foreground')}
+        >
+          <ProviderIcon provider="discord" class="size-4 shrink-0" />
+          <span>Discord</span>
+        </a>
+        {@render themeButton()}
+        {@render authButton()}
+      </div>
+    </div>
+  {/if}
+</div>

@@ -1,0 +1,27 @@
+-- migrate: no-transaction
+--
+-- Recreates users_talent_network_public_id_key, which 0117 dropped because prod's copy
+-- was INVALID. Same definition as 0086 — this is a repair, not a redesign, so the shape
+-- must not drift: a bare unique index (no named UNIQUE table constraint), which is what
+-- 0086 chose and what credit_ledger_reward_ref_uniq (0041) established as the precedent
+-- for a concurrently-built uniqueness guard.
+--
+-- It restores both things the invalid index was failing to do: the uniqueness of the
+-- public profile UUID, and an index scan for `WHERE u.talent_network_public_id = $1`
+-- instead of the sequential scan on users that EXPLAIN showed on prod.
+--
+-- CONCURRENTLY in its own no-transaction file, same reasoning as 0086/0101. On an
+-- existing prod volume, run it DETACHED from the SSH session (systemd-run or nohup):
+-- attached is how the original build died and left the invalid index this pair exists
+-- to clean up.
+--
+-- Deliberately NO `IF NOT EXISTS`, unlike 0086 and 0101. A failed CONCURRENTLY build
+-- leaves an invalid index UNDER THIS NAME, and a no-transaction file that errors is not
+-- recorded as applied — so the next migrate run retries this file. With IF NOT EXISTS
+-- that retry would see the name taken, skip silently, and record the migration as done,
+-- leaving prod with the invalid index and the ledger claiming it was rebuilt. That is
+-- precisely the failure this pair exists to repair, re-created automatically and this
+-- time invisibly. Without it the retry fails loudly and the operator runs 0117 first,
+-- which is the only order that actually works.
+CREATE UNIQUE INDEX CONCURRENTLY users_talent_network_public_id_key
+    ON public.users (talent_network_public_id);

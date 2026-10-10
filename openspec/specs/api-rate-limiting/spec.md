@@ -1,0 +1,277 @@
+# api-rate-limiting Specification
+
+## Purpose
+TBD - created by archiving change redis-rate-limiting. Update Purpose after archive.
+## Requirements
+### Requirement: Shared rate-limit backend
+Every rate-limited HTTP route SHALL enforce its limit through one shared `Throttler`
+backend rather than a per-route, per-process counter.
+
+#### Scenario: Two different routes do not share a counter
+- **WHEN** the same authenticated user exhausts the limit on one rate-limited route
+- **THEN** their request budget on every other rate-limited route is unaffected
+
+#### Scenario: Limit survives a process restart
+- **WHEN** the API server process restarts after a user has partially consumed a route's
+  limit within the current window
+- **THEN** the user's remaining budget for that window reflects requests already made
+  before the restart, not a reset counter
+
+### Requirement: Route-namespaced rate-limit keys
+Every rate-limit key SHALL be namespaced by the route it protects, so that no two distinct
+routes can ever produce the same key for the same caller.
+
+#### Scenario: Same user, two different routes, no bare identifier key
+- **WHEN** a request is rate-limited using the caller's user ID or IP address as part of the
+  key
+- **THEN** the generated key includes a route-specific prefix and cannot collide with the
+  key generated for a different route for the same user ID or IP address
+
+### Requirement: Fail-open on backend error
+If the rate-limit backend is unreachable or errors, the affected request SHALL be allowed
+through rather than rejected, and the failure SHALL be logged.
+
+#### Scenario: Backend unreachable
+- **WHEN** the rate-limit backend cannot be reached (connection error or timeout) while
+  checking a request against its limit
+- **THEN** the request proceeds as if it were within the limit, and a warning is logged
+
+#### Scenario: Backend call is bounded in time
+- **WHEN** the rate-limit backend does not respond promptly
+- **THEN** the check gives up after a short bounded timeout and treats the request as
+  allowed, rather than blocking the request indefinitely
+
+### Requirement: Existing per-route limits preserved
+
+Migrating a route onto the shared backend SHALL NOT change its configured limit,
+window, or rejection status code, and SHALL NOT remove any header the route
+already sent.
+
+Adding the budget headers is additive: a route that answered `429` with
+`Retry-After` still answers `429` with `Retry-After`, and gains
+`X-RateLimit-*` alongside. No caller relying on the previous behaviour observes
+a regression; a caller ignoring the new headers is unaffected.
+
+#### Scenario: Request over the limit is rejected the same way
+
+- **WHEN** a caller exceeds a route's configured limit within its configured window
+- **THEN** the response is `429 Too Many Requests` with a `Retry-After` header, as it
+  was before migrating that route onto the shared backend
+
+#### Scenario: An existing limiter's configured budget is unchanged
+
+- **WHEN** a route that was rate-limited before this change is exercised up to and
+  past its limit
+- **THEN** it admits exactly the same number of requests in the same window as it
+  did before
+
+### Requirement: Conditional rate limiting for content-dependent routes
+A route SHALL be permitted to skip rate-limit enforcement based on properties of the
+individual request (for example, an empty payload that triggers no downstream work),
+independent of the shared backend's key/limit/window contract.
+
+#### Scenario: Request with no actionable payload is not counted
+- **WHEN** a request to a conditionally-limited route carries no payload that would trigger
+  the work the limit exists to bound
+- **THEN** the request is not counted against the caller's limit for that route
+
+### Requirement: Rate-limit budget headers on every limited response
+
+Every response from a rate-limited route SHALL carry `X-RateLimit-Limit`,
+`X-RateLimit-Remaining` and `X-RateLimit-Reset`, on success as well as on
+rejection.
+
+The headers exist so a ceiling can be respected rather than merely discovered.
+A limit disclosed only in the 429 that enforces it tells a client what it did
+wrong after the request has already failed; a client that can read its remaining
+budget can slow down before that point. `X-RateLimit-Reset` SHALL be whole
+seconds until the caller's budget is full again, and `X-RateLimit-Remaining` the
+count of further requests permitted in the current window.
+
+The backend already computes all three values on every check. They SHALL be
+carried through the `Throttler` contract rather than recomputed or estimated in
+the middleware, so a caller's remaining budget can never disagree with the
+decision that produced it.
+
+A request allowed because the backend failed (see *Fail-open on backend error*)
+SHALL carry no rate-limit headers. No check happened, so there is no budget to
+report, and reporting a fabricated one would be worse than silence.
+
+#### Scenario: Headers accompany an allowed request
+
+- **WHEN** a caller makes a request to a rate-limited route while within its budget
+- **THEN** the response is the route's normal success response and additionally
+  carries `X-RateLimit-Limit`, `X-RateLimit-Remaining` and `X-RateLimit-Reset`
+
+#### Scenario: Remaining decreases across successive requests
+
+- **WHEN** a caller makes two successive requests to the same rate-limited route
+  inside one window
+- **THEN** the `X-RateLimit-Remaining` on the second response is lower than on the
+  first
+
+#### Scenario: Headers accompany a rejection
+
+- **WHEN** a caller exceeds a route's limit
+- **THEN** the `429` response carries `Retry-After` as before, and additionally
+  `X-RateLimit-Limit`, `X-RateLimit-Remaining` and `X-RateLimit-Reset`
+
+#### Scenario: A fail-open response reports no budget
+
+- **WHEN** the rate-limit backend errors or times out and the request is allowed
+  through
+- **THEN** the response carries none of the `X-RateLimit-*` headers
+
+### Requirement: Public read endpoints are rate-limited by cost class
+
+The public, unauthenticated read endpoints SHALL enforce a request budget, split
+into two classes by the cost of serving them.
+
+**Every** public job and company read SHALL share one budget — the job list, job
+search, job facets, a single job and its copies and apply form, similar jobs,
+company search and its vocabulary, a single company, and city lookup. The set is
+exhaustive by intent rather than by enumeration: leaving one read out would void
+the limit rather than narrow it, since the job list returns the same catalogue as
+job search, so an unbounded sibling is simply the door a throttled caller walks
+through instead. The
+agent-oriented job search SHALL have its own, smaller budget, because it
+rehydrates every result's full description from the database and so costs
+several times more per request in both bytes and latency than any other read. A
+single shared budget would have to be sized for the expensive endpoint, and
+would then throttle the cheap ones far harder than their cost justifies.
+
+Each budget SHALL be namespaced separately, so exhausting one leaves the other
+untouched, and SHALL identify a caller by source address.
+
+This once said "by user rather than by address … so that callers sharing an egress
+address do not share an allowance". That was never how it behaved. Fiber runs a route's
+handlers in registration order, and every public read mounts its limiter before the
+optional-auth gate or without a gate at all, so the user branch read a value nothing had
+written and the key was always the address. Moving the gate would have fixed three of ten
+routes and put a database lookup ahead of throttling on the hottest reads on the site;
+naming what actually happens is the smaller answer, and the cost — colleagues behind one
+office NAT sharing a budget — is one this endpoint has always carried.
+
+#### Scenario: A signed-in caller is budgeted by address like any other
+
+- **WHEN** two signed-in callers read a public endpoint from the same source address
+- **THEN** they draw on the same budget
+
+#### Scenario: Exhausting the agent search budget leaves ordinary search available
+
+- **WHEN** a caller exhausts the budget for the agent job-search endpoint
+- **THEN** their next request to the ordinary job-search endpoint is still served
+
+#### Scenario: A caller over the public read budget is refused
+
+- **WHEN** an external caller exceeds a public read budget within its window
+- **THEN** the response is `429 Too Many Requests` with `Retry-After` and the
+  rate-limit headers
+
+#### Scenario: Two callers do not share an allowance
+
+- **WHEN** two distinct callers each make requests to the same public read endpoint
+- **THEN** neither caller's requests count against the other's budget
+
+### Requirement: Trusted internal callers are not rate-limited
+
+A request arriving from a loopback or private-network peer SHALL bypass
+rate-limit enforcement entirely, and SHALL carry no rate-limit headers.
+
+The server-rendered front end reaches the API directly over loopback rather than
+through the reverse proxy, and forwards no client-address header, so every
+server-rendered page presents the same peer address. Counting those requests
+would place the whole site in one caller's budget and throttle it as a single
+abusive client.
+
+The trusted set SHALL be exactly the proxy-trust list the server already uses to
+decide whether an address may assert a client address on another's behalf.
+Defining it twice invites the two to drift, and a peer trusted to speak for
+other callers is by construction not one this limit defends against.
+
+#### Scenario: A loopback caller is never refused
+
+- **WHEN** a request reaches a rate-limited route from a loopback address, in
+  volume far exceeding the route's configured limit
+- **THEN** every request is served, and none carries rate-limit headers
+
+#### Scenario: An external caller is still limited
+
+- **WHEN** a request reaches the same route from a public address that exceeds the
+  configured limit
+- **THEN** it is refused with `429`
+
+### Requirement: Bounded pagination depth on every list endpoint
+
+Every paginated list endpoint SHALL refuse a request whose `offset + limit` reaches past a
+single shared window, whichever store answers the endpoint. The refusal SHALL be `400` and
+SHALL NOT be a clamped `200`.
+
+A per-caller rate limit cannot substitute for this bound. A rate limit caps requests per
+minute; an endpoint whose `OFFSET` the caller chooses has a cost per request the caller also
+chooses, so a caller obeying its budget in full can still exhaust the connection pool. The
+two are separate defences and both are required.
+
+#### Scenario: A request past the window is refused
+
+- **WHEN** a caller requests a list endpoint with `offset + limit` greater than the shared
+  pagination window
+- **THEN** the endpoint answers `400` with an error naming the pagination as too deep, and
+  no database query for that page is issued
+
+#### Scenario: The last page inside the window still serves
+
+- **WHEN** a caller requests a list endpoint with `offset + limit` exactly equal to the
+  shared pagination window
+- **THEN** the endpoint answers `200` with that page
+
+#### Scenario: A refused page is never silently substituted
+
+- **WHEN** a caller requests a page past the window
+- **THEN** the response is an error, not a successful page carrying rows from a different
+  offset — a walker must be able to tell "no such page" from "here is a page"
+
+#### Scenario: The window is one number for every store
+
+- **WHEN** the same offset and limit are requested from a list served by Postgres and from a
+  list served by the search index
+- **THEN** both apply the same window, so neither store's lists can drift to a different
+  depth than the other's
+
+#### Scenario: An out-of-range offset does not become a server error
+
+- **WHEN** a caller supplies an offset larger than a 32-bit integer can hold
+- **THEN** the endpoint answers `400` for being too deep rather than `500` from a wrapped
+  negative bind parameter
+
+### Requirement: Every public list endpoint carries a rate limiter
+
+Every unauthenticated list endpoint SHALL mount a rate limiter. An endpoint registered
+without one is a defect regardless of how cheap its query is.
+
+#### Scenario: The public company-feedback list is throttled
+
+- **WHEN** an anonymous caller exceeds the public-read budget on `GET /api/v1/companies/:slug/feedback`
+- **THEN** the request is refused with `429`, as it is on the other public reads
+
+### Requirement: A query may not hold a pooled connection without bound
+
+The API server's database pool SHALL impose a server-side statement timeout, so a single
+slow query cannot hold a pooled connection indefinitely and starve every other request.
+
+This is a backstop, not the primary bound: it exists for the endpoint whose cost nobody
+anticipated. It applies to the request-serving pool only — the cron workers share the same
+package and some legitimately run for hours.
+
+#### Scenario: A runaway query is cut, not left to hold its connection
+
+- **WHEN** a query issued on the API server's pool runs past the configured statement timeout
+- **THEN** Postgres cancels it and the connection returns to the pool, and the request
+  answers an error rather than hanging
+
+#### Scenario: A cron worker's pool is not bounded by the server's timeout
+
+- **WHEN** a batch worker opens a pool through the shared database package without asking
+  for a statement timeout
+- **THEN** its queries carry no statement timeout, so a multi-hour backfill is not cut
+

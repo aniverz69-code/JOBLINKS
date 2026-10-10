@@ -1,0 +1,179 @@
+package handler
+
+import (
+	"context"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/gofiber/fiber/v2"
+
+	"github.com/strelov1/freehire/internal/application/jobtracking"
+	"github.com/strelov1/freehire/internal/application/userjob"
+	"github.com/strelov1/freehire/internal/identity/auth"
+)
+
+// stubTrackingRepo is a DB-free jobtracking.Repository for the handler unit
+// tests. The empty/bad-stage cases under test are rejected by the Service before
+// it touches the repository, so these methods only need to exist (they panic if
+// the validation order ever regresses and a request unexpectedly reaches them).
+type stubTrackingRepo struct{}
+
+func (stubTrackingRepo) JobIDBySlug(context.Context, string) (int64, error) { return 1, nil }
+func (stubTrackingRepo) RecordView(context.Context, int64, int64) (jobtracking.Interaction, error) {
+	return jobtracking.Interaction{JobID: 1}, nil
+}
+func (stubTrackingRepo) MarkApplied(context.Context, int64, int64, string) (jobtracking.Interaction, error) {
+	return jobtracking.Interaction{JobID: 1}, nil
+}
+func (stubTrackingRepo) MarkAppliedAt(context.Context, int64, int64, time.Time, string) (jobtracking.Interaction, error) {
+	return jobtracking.Interaction{JobID: 1}, nil
+}
+func (stubTrackingRepo) MarkAppliedOn(context.Context, int64, int64, time.Time, string) (jobtracking.Interaction, error) {
+	return jobtracking.Interaction{JobID: 1}, nil
+}
+func (stubTrackingRepo) SaveJob(context.Context, int64, int64) (jobtracking.Interaction, error) {
+	return jobtracking.Interaction{JobID: 1}, nil
+}
+func (stubTrackingRepo) UnsaveJob(context.Context, int64, int64) (jobtracking.Interaction, error) {
+	return jobtracking.Interaction{JobID: 1}, nil
+}
+func (stubTrackingRepo) DismissJob(context.Context, int64, int64) (jobtracking.Interaction, error) {
+	return jobtracking.Interaction{JobID: 1}, nil
+}
+func (stubTrackingRepo) UndismissJob(context.Context, int64, int64) (jobtracking.Interaction, error) {
+	return jobtracking.Interaction{JobID: 1}, nil
+}
+func (stubTrackingRepo) TrackJob(context.Context, int64, int64, *string, *string, string) (jobtracking.Interaction, error) {
+	return jobtracking.Interaction{JobID: 1}, nil
+}
+func (stubTrackingRepo) ClearJobProgress(context.Context, int64, int64) (jobtracking.Interaction, error) {
+	return jobtracking.Interaction{JobID: 1}, nil
+}
+func (stubTrackingRepo) UntrackJob(context.Context, int64, int64) (jobtracking.Interaction, error) {
+	return jobtracking.Interaction{JobID: 1}, nil
+}
+func (stubTrackingRepo) TrackApplication(context.Context, int64, int64, *string, *string, string) (jobtracking.Interaction, error) {
+	return jobtracking.Interaction{JobID: 1}, nil
+}
+func (stubTrackingRepo) ClearApplicationProgress(context.Context, int64, int64) (jobtracking.Interaction, error) {
+	return jobtracking.Interaction{JobID: 1}, nil
+}
+func (stubTrackingRepo) UntrackApplication(context.Context, int64, int64) (jobtracking.Interaction, error) {
+	return jobtracking.Interaction{JobID: 1}, nil
+}
+func (stubTrackingRepo) ListInteractions(context.Context, int64, jobtracking.Filter, int32, int32) ([]jobtracking.TrackedJob, error) {
+	return nil, nil
+}
+func (stubTrackingRepo) CountInteractions(context.Context, int64) (jobtracking.Counts, error) {
+	return jobtracking.Counts{}, nil
+}
+func (stubTrackingRepo) ViewedSlugs(context.Context, int64) ([]string, error)    { return nil, nil }
+func (stubTrackingRepo) SavedSlugs(context.Context, int64) ([]string, error)     { return nil, nil }
+func (stubTrackingRepo) DismissedSlugs(context.Context, int64) ([]string, error) { return nil, nil }
+func (stubTrackingRepo) ExcludedJobIDs(context.Context, int64, int32) ([]int64, error) {
+	return nil, nil
+}
+func (stubTrackingRepo) PipelineCounts(context.Context, int64) ([]userjob.StageCount, error) {
+	return nil, nil
+}
+func (stubTrackingRepo) ReplyRateCounts(context.Context, int64) (userjob.ReplyRateSide, userjob.ReplyRateSide, error) {
+	return userjob.ReplyRateSide{}, userjob.ReplyRateSide{}, nil
+}
+
+// trackApp mounts the track route on a handler whose tracking service is backed
+// by a stub repository (no DB). The auth gate and the service's body validation
+// (empty / unknown stage) reject before any repository call runs. The DB-backed
+// path is covered by the user_jobs integration tests.
+func trackApp() (*fiber.App, *auth.Issuer) {
+	iss := auth.NewIssuer("test-secret", time.Hour)
+	h := &trackingHandlers{tracking: jobtracking.New(stubTrackingRepo{})}
+	app := fiber.New()
+	app.Patch("/jobs/:slug/track", auth.RequireAuth(iss, testVersions), h.TrackJob)
+	return app, iss
+}
+
+func TestTrackJob_RejectsEmptyAndUnknownStage(t *testing.T) {
+	app, iss := trackApp()
+	token, _ := iss.Issue(7, testTokenVersion)
+	cases := []struct {
+		name, body string
+	}{
+		{"empty body", `{}`},
+		{"unknown stage", `{"stage":"banana"}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequestWithContext(context.Background(), fiber.MethodPatch, "/jobs/go-dev/track", strings.NewReader(tc.body))
+			req.Header.Set("Content-Type", "application/json")
+			req.AddCookie(&http.Cookie{Name: auth.CookieName, Value: token})
+			resp, err := app.Test(req)
+			if err != nil {
+				t.Fatalf("Test: %v", err)
+			}
+			defer resp.Body.Close()
+			if resp.StatusCode != fiber.StatusBadRequest {
+				t.Errorf("status = %d, want 400", resp.StatusCode)
+			}
+		})
+	}
+}
+
+func TestTrackJob_RequiresAuth(t *testing.T) {
+	app, _ := trackApp()
+	req := httptest.NewRequestWithContext(context.Background(), fiber.MethodPatch, "/jobs/go-dev/track", strings.NewReader(`{"stage":"interview"}`))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := app.Test(req)
+	if err != nil {
+		t.Fatalf("Test: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != fiber.StatusUnauthorized {
+		t.Errorf("status = %d, want 401", resp.StatusCode)
+	}
+}
+
+func TestIsValidStage(t *testing.T) {
+	for _, s := range userjob.Stages {
+		if !userjob.ValidStage(s) {
+			t.Errorf("%q should be a valid stage", s)
+		}
+	}
+	for _, s := range []string{"banana", "", "Applied", "interviewing"} {
+		if userjob.ValidStage(s) {
+			t.Errorf("%q should be invalid", s)
+		}
+	}
+}
+
+// The interaction shape now carries stage and notes alongside the timestamps.
+func TestInteractionResponse_HasStageAndNotes(t *testing.T) {
+	fields := marshalToFields(t, interactionResponse{JobID: 7})
+	for _, want := range []string{"job_id", "viewed_at", "saved_at", "applied_at", "stage", "notes"} {
+		if _, ok := fields[want]; !ok {
+			t.Errorf("interactionResponse missing %q", want)
+		}
+	}
+}
+
+// `expired` reaches the write path like any other stage: the vocabulary is the only gate, so
+// adding a stage to internal/application/userjob is all it takes for the endpoint to accept it. The test
+// guards the wiring rather than the word — a validation copy kept anywhere else in the handler
+// would fail here.
+func TestTrackJob_AcceptsExpired(t *testing.T) {
+	app, iss := trackApp()
+	token, _ := iss.Issue(7, testTokenVersion)
+	req := httptest.NewRequestWithContext(context.Background(), fiber.MethodPatch, "/jobs/go-dev/track", strings.NewReader(`{"stage":"expired"}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.AddCookie(&http.Cookie{Name: auth.CookieName, Value: token})
+	resp, err := app.Test(req)
+	if err != nil {
+		t.Fatalf("Test: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != fiber.StatusOK {
+		t.Errorf("status = %d, want 200", resp.StatusCode)
+	}
+}

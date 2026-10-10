@@ -1,0 +1,314 @@
+package sources
+
+import (
+	"context"
+	"errors"
+	"strings"
+	"testing"
+)
+
+func TestBambooHRProvider(t *testing.T) {
+	if got := NewBambooHR(nil).Provider(); got != "bamboohr" {
+		t.Errorf("Provider() = %q, want %q", got, "bamboohr")
+	}
+}
+
+// BambooHR earns fullBoardListing because Fetch's list request is a single unpaginated call
+// returning the board's whole result array — no loop that could stop early, so any listing
+// failure aborts the whole Fetch. Detail fetches are best-effort per posting.
+func TestBambooHRMarkers(t *testing.T) {
+	s := NewBambooHR(nil)
+	if _, ok := s.(fullBoardListing); !ok {
+		t.Error("bamboohr should implement the fullBoardListing marker")
+	}
+}
+
+func TestBambooHRRegisteredAsFullBoardListing(t *testing.T) {
+	if !FullBoardListingProviders(All(nil))["bamboohr"] {
+		t.Error("FullBoardListingProviders(All(nil)) should include bamboohr")
+	}
+}
+
+// A listing fetch failure must abort the whole Fetch, never return a partial result as
+// success — the property TestBambooHRMarkers' fullBoardListing claim rests on.
+func TestBambooHRFetchPropagatesAListingError(t *testing.T) {
+	fake := &fakeHTTP{err: errors.New("boom")}
+	if _, err := NewBambooHR(fake).Fetch(context.Background(), CompanyEntry{Board: "acme"}); err == nil {
+		t.Fatal("Fetch succeeded despite a listing error")
+	}
+}
+
+func bambooDetail(id, name string) string {
+	return `{"result": {"jobOpening": {
+		"jobOpeningName": "` + name + `",
+		"jobOpeningShareUrl": "https://acme.bamboohr.com/careers/` + id + `",
+		"description": "<p>Do the work.</p>",
+		"location": {"city": "Yerevan", "state": null, "addressCountry": "Armenia"},
+		"datePosted": "2025-01-14"
+	}}}`
+}
+
+func TestBambooHRFetchListsAndFetchesDetail(t *testing.T) {
+	fake := (&routedHTTP{}).
+		route("/careers/52/detail", bambooDetail("52", "Senior Designer")).
+		route("/careers/53/detail", bambooDetail("53", "Remote Engineer")).
+		route("/careers/list", `{"result": [
+			{"id": "52", "jobOpeningName": "Senior Designer", "isRemote": false},
+			{"id": "53", "jobOpeningName": "Remote Engineer", "isRemote": true}
+		]}`)
+
+	jobs, err := NewBambooHR(fake).Fetch(context.Background(), CompanyEntry{
+		Company: "Acme", Provider: "bamboohr", Board: "acme",
+	})
+	if err != nil {
+		t.Fatalf("Fetch: %v", err)
+	}
+	if len(jobs) != 2 {
+		t.Fatalf("len(jobs) = %d, want 2", len(jobs))
+	}
+
+	byID := map[string]Job{}
+	for _, j := range jobs {
+		byID[j.ExternalID] = j
+	}
+	j, ok := byID["52"]
+	if !ok {
+		t.Fatal("job 52 missing")
+	}
+	if j.Title != "Senior Designer" {
+		t.Errorf("Title = %q", j.Title)
+	}
+	if j.URL != "https://acme.bamboohr.com/careers/52" {
+		t.Errorf("URL = %q, want the share url from detail", j.URL)
+	}
+	if j.Location != "Yerevan, Armenia" {
+		t.Errorf("Location = %q, want city/country joined (null state skipped)", j.Location)
+	}
+	if !strings.Contains(j.Description, "Do the work.") {
+		t.Errorf("Description = %q", j.Description)
+	}
+	if j.Remote {
+		t.Error("Remote = true, want false from list isRemote")
+	}
+	if j.PostedAt == nil || j.PostedAt.UTC().Year() != 2025 {
+		t.Errorf("PostedAt = %v, want parsed datePosted (2025)", j.PostedAt)
+	}
+	if !byID["53"].Remote {
+		t.Error("job 53 isRemote=true should set Remote = true")
+	}
+}
+
+// bambooTwoPostingList is a careers list naming one posting whose detail answers and one
+// whose detail the test breaks, so the two failure readings can be told apart.
+const bambooTwoPostingList = `{"result": [
+	{"id": "52", "jobOpeningName": "Designer", "isRemote": false},
+	{"id": "53", "jobOpeningName": "Broken", "isRemote": false}
+]}`
+
+// A detail request the crawl could not READ must not look like a posting that is not there:
+// the detail is bamboohr's only source for a posting and is re-requested every run, so a
+// dropped one leaves a live vacancy missing from a crawl that reported no failure, and the
+// stale-job sweep closes it once the grace window elapses.
+func TestBambooHRUnreadableDetailIsMarkedNotDropped(t *testing.T) {
+	// id 53 has no detail route -> its detail fetch errors with a plain transport failure.
+	fake := (&routedHTTP{}).
+		route("/careers/52/detail", bambooDetail("52", "Designer")).
+		route("/careers/list", bambooTwoPostingList)
+
+	jobs, err := NewBambooHR(fake).Fetch(context.Background(), CompanyEntry{
+		Company: "Acme", Provider: "bamboohr", Board: "acme",
+	})
+	if err != nil {
+		t.Fatalf("Fetch should not abort the board on one failed detail: %v", err)
+	}
+	read := readPostings(jobs)
+	if len(read) != 1 || read[0].ExternalID != "52" {
+		t.Fatalf("read = %v, want only 52", read)
+	}
+	markers := unreadableMarkers(jobs)
+	if len(markers) != 1 || markers[0].ExternalID != "53" {
+		t.Fatalf("unreadable markers = %v, want one for 53", markers)
+	}
+	if markers[0].Company != "Acme" {
+		t.Errorf("marker Company = %q, want the board's employer — it names the close scope the run withholds", markers[0].Company)
+	}
+}
+
+// The other half of the distinction: 404 is the platform's own answer that the posting is
+// gone, so the crawl drops it and the board's evidence stays complete.
+func TestBambooHRGoneDetailDropsThePosting(t *testing.T) {
+	fake := (&routedHTTP{}).
+		route("/careers/52/detail", bambooDetail("52", "Designer")).
+		routeErr("/careers/53/detail", &StatusError{Method: "GET", Code: 404, URL: "https://acme.bamboohr.com/careers/53/detail"}).
+		route("/careers/list", bambooTwoPostingList)
+
+	jobs, err := NewBambooHR(fake).Fetch(context.Background(), CompanyEntry{
+		Company: "Acme", Provider: "bamboohr", Board: "acme",
+	})
+	if err != nil {
+		t.Fatalf("Fetch: %v", err)
+	}
+	if len(jobs) != 1 || jobs[0].ExternalID != "52" {
+		t.Fatalf("want only 52, got %v — a 404 is evidence, not a hole", jobs)
+	}
+}
+
+// BambooHR leaves isRemote null on the public careers list and carries the real signal in
+// locationType: "0" onsite, "1" remote, "2" hybrid.
+func TestBambooHRFetchReadsLocationType(t *testing.T) {
+	fake := (&routedHTTP{}).
+		route("/careers/60/detail", bambooDetail("60", "Office Manager")).
+		route("/careers/61/detail", bambooDetail("61", "Account Manager")).
+		route("/careers/62/detail", bambooDetail("62", "Security Engineer")).
+		route("/careers/list", `{"result": [
+			{"id": "60", "jobOpeningName": "Office Manager", "isRemote": null, "locationType": "0"},
+			{"id": "61", "jobOpeningName": "Account Manager", "isRemote": null, "locationType": "1"},
+			{"id": "62", "jobOpeningName": "Security Engineer", "isRemote": null, "locationType": "2"}
+		]}`)
+
+	jobs, err := NewBambooHR(fake).Fetch(context.Background(), CompanyEntry{
+		Company: "Acme", Provider: "bamboohr", Board: "acme",
+	})
+	if err != nil {
+		t.Fatalf("Fetch: %v", err)
+	}
+	byID := map[string]Job{}
+	for _, j := range jobs {
+		byID[j.ExternalID] = j
+	}
+
+	for id, want := range map[string]string{"60": "onsite", "61": "remote", "62": "hybrid"} {
+		if got := byID[id].WorkMode; got != want {
+			t.Errorf("job %s WorkMode = %q, want %q", id, got, want)
+		}
+	}
+	if !byID["61"].Remote {
+		t.Error("locationType 1 should set Remote = true")
+	}
+	if byID["62"].Remote {
+		t.Error("locationType 2 (hybrid) should leave Remote = false")
+	}
+}
+
+// A board that omits locationType falls back to the list's isRemote flag.
+func TestBambooHRFetchFallsBackToIsRemote(t *testing.T) {
+	fake := (&routedHTTP{}).
+		route("/careers/70/detail", bambooDetail("70", "Support Lead")).
+		route("/careers/list", `{"result": [
+			{"id": "70", "jobOpeningName": "Support Lead", "isRemote": true}
+		]}`)
+
+	jobs, err := NewBambooHR(fake).Fetch(context.Background(), CompanyEntry{
+		Company: "Acme", Provider: "bamboohr", Board: "acme",
+	})
+	if err != nil {
+		t.Fatalf("Fetch: %v", err)
+	}
+	if len(jobs) != 1 {
+		t.Fatalf("len(jobs) = %d, want 1", len(jobs))
+	}
+	if jobs[0].WorkMode != "remote" || !jobs[0].Remote {
+		t.Errorf("WorkMode = %q, Remote = %v; want remote/true from the isRemote fallback",
+			jobs[0].WorkMode, jobs[0].Remote)
+	}
+}
+
+// The same hole as smartrecruiters': a 200 with no jobOpening on it decodes cleanly, and the
+// listing has already supplied the id, the name and the location — so the posting looks read
+// while carrying no URL and no description, counts toward the board's coverage, and is closed
+// by the sweep anyway.
+func TestBambooHREmptyDetailPayloadIsUnreadable(t *testing.T) {
+	for name, body := range map[string]string{
+		"empty object":   `{}`,
+		"null":           `null`,
+		"no jobOpening":  `{"result": {}}`,
+		"blank shareUrl": `{"result": {"jobOpening": {"jobOpeningShareUrl": "  "}}}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			fake := (&routedHTTP{}).
+				route("/careers/53/detail", body).
+				route("/careers/52/detail", bambooDetail("52", "Designer")).
+				route("/careers/list", bambooTwoPostingList)
+
+			jobs, err := NewBambooHR(fake).Fetch(context.Background(), CompanyEntry{
+				Company: "Acme", Provider: "bamboohr", Board: "acme",
+			})
+			if err != nil {
+				t.Fatalf("Fetch: %v", err)
+			}
+			read := readPostings(jobs)
+			if len(read) != 1 || read[0].ExternalID != "52" {
+				t.Fatalf("read = %v, want only 52 — 53's detail answered with nothing", read)
+			}
+			markers := unreadableMarkers(jobs)
+			if len(markers) != 1 || markers[0].ExternalID != "53" {
+				t.Fatalf("unreadable markers = %v, want one for 53", markers)
+			}
+		})
+	}
+}
+
+// The four destinations BambooHR redirected a not-served board to, observed across 135 prod
+// boards on 2026-09-06. None is matched by name — the rule is leaving the careers path — so
+// this table is evidence the rule covers them, not a spec of what the rule looks for.
+func TestBambooHRFetchReportsBoardGoneOnRedirect(t *testing.T) {
+	for name, final := range map[string]string{
+		"no such tenant":    "https://www.bamboohr.com",
+		"public board off":  "https://acme.bamboohr.com/login.php",
+		"account expired":   "https://acme.bamboohr.com/settings/account/expired.php",
+		"account suspended": "https://acme.bamboohr.com/settings/account/temporarily_suspended",
+	} {
+		t.Run(name, func(t *testing.T) {
+			fake := (&routedHTTP{}).routeRedirect("/careers/list", final)
+			_, err := NewBambooHR(fake).Fetch(context.Background(), CompanyEntry{Board: "acme"})
+			if !errors.Is(err, ErrBoardGone) {
+				t.Fatalf("err = %v, want it to wrap ErrBoardGone", err)
+			}
+			// The destination has to survive into the message: these four do not mean the
+			// same thing to whoever decides whether to retire the board, and re-probing to
+			// find out is what this check exists to avoid.
+			if !strings.Contains(err.Error(), final) {
+				t.Errorf("err = %q, want the redirect destination in it", err)
+			}
+			if !strings.Contains(err.Error(), "acme") {
+				t.Errorf("err = %q, want the board named in it", err)
+			}
+		})
+	}
+}
+
+// A board still served answers on its own careers path, and a listing failure there is an
+// ordinary failure — not a dead board. Without this the first transport hiccup would file a
+// live board as gone.
+func TestBambooHRFetchKeepsAnOrdinaryFailureDistinct(t *testing.T) {
+	fake := (&routedHTTP{}).routeErr("/careers/list", errors.New("connection refused"))
+	_, err := NewBambooHR(fake).Fetch(context.Background(), CompanyEntry{Board: "acme"})
+	if err == nil {
+		t.Fatal("a failed listing must fail the crawl")
+	}
+	if errors.Is(err, ErrBoardGone) {
+		t.Errorf("err = %v, want a transport failure, not ErrBoardGone", err)
+	}
+}
+
+// A redirect that stays on the board's careers path is still the board being served, so a
+// canonicalisation BambooHR may add later must not read as a death.
+func TestBambooHRBoardGoneAllowsRedirectsWithinTheCareersPath(t *testing.T) {
+	for _, final := range []string{
+		"https://acme.bamboohr.com/careers",
+		"https://acme.bamboohr.com/careers/list",
+		"https://acme.bamboohr.com/careers/list?x=1",
+	} {
+		if _, gone := bambooHRBoardGone("acme", final); gone {
+			t.Errorf("%s read as a gone board", final)
+		}
+	}
+	// No response at all is not a verdict about the board.
+	if _, gone := bambooHRBoardGone("acme", ""); gone {
+		t.Error("an empty final URL read as a gone board")
+	}
+	// One board's careers path must not vouch for another's.
+	if _, gone := bambooHRBoardGone("acme", "https://other.bamboohr.com/careers"); !gone {
+		t.Error("a redirect to a different tenant's careers page was accepted")
+	}
+}

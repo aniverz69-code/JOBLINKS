@@ -1,0 +1,731 @@
+// The job-search facets, as a data-driven registry. Each entry declares its
+// query param (matching the backend search API), section label, the control to
+// render, its options (for pills/select), and whether it supports an "exclude"
+// mode. The panel iterates this list; the store keys facet state by `param`.
+//
+// SOURCE_VALUES and the other generated value arrays (WORK_MODE_VALUES, etc.)
+// in ./generated/contracts are the single source of truth for closed-vocabulary
+// option values, and labels.ts is the single source of their display text. A new
+// backend value appears automatically here, title-cased, unless labels.ts overrides
+// it — except for categories, whose map is exhaustive and fails its test until the
+// new value is named. REGION and CURRENCY are curated subsets not driven by
+// generated arrays — leave those alone. Job language is a dynamic facet: its
+// options come from the live distribution (any detected language), labelled via
+// languageLabel.
+
+import {
+  WORK_MODE_VALUES, SENIORITY_VALUES, CATEGORY_VALUES,
+  EMPLOYMENT_TYPE_VALUES, RELOCATION_VALUES, ENGLISH_LEVEL_VALUES,
+  COMPANY_TYPE_VALUES, DOMAIN_VALUES, INDUSTRY_VALUES, FACET_ALIASES,
+  AI_ARCHETYPE_VALUES, SKILL_LABELS, INDUSTRY_LABELS, ROLE_TYPE_VALUES,
+} from './generated/contracts';
+import { fuzzyMatch } from './fuzzy';
+import {
+  REGION_LABELS, SENIORITY_LABELS, EMPLOYMENT_LABELS, WORK_MODE_LABELS,
+  CATEGORY_LABELS, DOMAIN_LABELS, COMPANY_TYPE_LABELS, ENGLISH_LEVEL_LABELS,
+  RELOCATION_LABELS, AI_ARCHETYPE_LABELS, ROLE_TYPE_LABELS, titleCase,
+} from './labels';
+import { COLLECTIONS } from './collections';
+import { TIMEZONE_REGIONS } from './talentFacetModel';
+import { backerBadges } from './backers';
+import { api } from './api';
+import { sourceLogoUrl } from './logo';
+
+export interface FacetOption {
+  value: string;
+  label: string;
+  /** Number of matching jobs, for dynamic (distribution-driven) options. */
+  count?: number;
+  /** ISO 3166-1 alpha-2 code for country options, so the pill shows a flag icon. */
+  flag?: string;
+  /** Sub-heading this option renders under, for a facet whose options are not all
+   *  the same sort of thing. Used by the collections facet to keep credentials
+   *  (verifiable licences) visually apart from editorial collections while both
+   *  stay on one `collections` query param — the facet machinery keys state and URL
+   *  serialization by param, so two facet entries sharing one param would double
+   *  every value in the URL and in the active-filter count. */
+  group?: string;
+  /** Image URL for a mark rendered inside the pill, left of the label. Used by the
+   *  backer collections, whose brand mark is recognised faster than their name. */
+  icon?: string;
+}
+
+type FacetControl = 'pills' | 'select' | 'tokens' | 'remote';
+
+/** One facet's live selection, as FacetSection reads it: the included and excluded
+ *  values (a value is in at most one set), plus the include-set match mode. */
+export interface FacetSelection {
+  include: string[];
+  exclude: string[];
+  matchAll: boolean;
+}
+
+/** The narrow store contract FacetSection drives — the subset of FilterStore's
+ *  surface a facet control touches. Both the job FilterStore and the company
+ *  filter store satisfy it, so the same section/control components render either.
+ *  (cycle/toggleSign move a value between include and exclude; the company registry
+ *  has no excludable facets, so pick/add/remove only ever land values in include.) */
+export interface FacetStore {
+  facet(param: string): FacetSelection;
+  /** Pills: cycle a value off → include → exclude → off. */
+  cycle(param: string, v: string): void;
+  /** Select dropdown: add a value to include, or clear it if already selected. */
+  pick(param: string, v: string): void;
+  /** Per-chip toggle: flip a value between include and exclude. */
+  toggleSign(param: string, v: string): void;
+  add(param: string, raw: string): void;
+  remove(param: string, v: string): void;
+  clearFacet(param: string): void;
+  setMatchAll(param: string, on: boolean): void;
+}
+
+export interface FacetDef {
+  param: string;
+  label: string;
+  control: FacetControl;
+  options?: FacetOption[];
+  excludable: boolean;
+  /** Show a per-facet AND/OR toggle (match all vs match any) over selected values. */
+  hasAndOr?: boolean;
+  placeholder?: string;
+  /**
+   * Cap the number of options rendered when the facet-local search is empty, to
+   * keep a very large distribution (role, with hundreds of values) readable: the
+   * top `cap` busiest options show, the rest are reachable by typing. Unset =
+   * render all (the default for smaller selects).
+   */
+  cap?: number;
+  /**
+   * Options come from the live facet distribution (with counts), not a static
+   * `options` list — for open/large vocabularies (skills, countries). The panel
+   * builds them from the facet-counts endpoint at render time.
+   */
+  dynamic?: boolean;
+  /**
+   * Server-backed option source for a `'remote'` control: a debounced query
+   * function returning matching options with counts. Used for an entity facet too
+   * large to ship as a distribution (company), whose options are fetched from a
+   * dedicated endpoint instead of the Meili facet counts.
+   */
+  remote?: (query: string) => Promise<FacetOption[]>;
+  /**
+   * Curated slug → shorthand-aliases map letting the picker's search match a facet
+   * value by abbreviation or synonym, not just the display label — typing "swe" or
+   * "data engineer" finds the specialization. See optionMatches / FACET_ALIASES
+   * (generated from the same dictionaries that tag titles).
+   */
+  searchAliases?: Record<string, readonly string[]>;
+  /**
+   * Show a brand logo (via SkillIcon) beside an option's label, for a facet whose
+   * values are the `skills` dictionary — the only one techmarks.ts has real marks
+   * for. A `select`/`remote` control on any other facet (company, role, industry)
+   * leaves this unset: their slugs are a different vocabulary, and one could
+   * coincidentally collide with a tech mark's key (a company named "Docker").
+   */
+  techIcons?: boolean;
+  /**
+   * Show the option's brand mark (via EntityLogo, resolved from its display label
+   * through the logo proxy) beside its label — set only by the source facet, whose
+   * values are ATS/aggregator names the proxy actually resolves.
+   */
+  entityLogos?: boolean;
+}
+
+// Resolve an ISO 3166-1 alpha-2 code to an English country name via platform Intl
+// data (no hand-maintained table); fall back to the upper-cased code.
+const regionNames = (() => {
+  try {
+    return new Intl.DisplayNames(['en'], { type: 'region' });
+  } catch {
+    return null;
+  }
+})();
+
+export function countryLabel(code: string): string {
+  const up = code.toUpperCase();
+  try {
+    return regionNames?.of(up) ?? up;
+  } catch {
+    return up;
+  }
+}
+
+// Resolve an ISO 639-1 code (en, pt, ru, …) to an English language name via
+// platform Intl data (no hand-maintained table); fall back to the upper-cased
+// code. Mirrors countryLabel — the posting-language facet is dynamic, so any
+// code the language detector emits gets a readable label.
+const languageNames = (() => {
+  try {
+    return new Intl.DisplayNames(['en'], { type: 'language' });
+  } catch {
+    return null;
+  }
+})();
+
+function languageLabel(code: string): string {
+  if (!code) return code;
+  try {
+    return languageNames?.of(code) ?? code.toUpperCase();
+  } catch {
+    return code.toUpperCase();
+  }
+}
+
+// Company facet values are slugs (group-ib, epam); the live distribution carries
+// no display name, so title-case the slug for a readable label. Imperfect for
+// acronyms (group-ib → "Group Ib") but consistent with the other facets — a real
+// slug→name lookup would need a per-company fetch, which this facet forgoes.
+function companyLabel(slug: string): string {
+  return titleCase(slug.replace(/-/g, '_'));
+}
+
+// Option source for the Company facet's 'remote' control: the count-ordered
+// companies endpoint (real names + open-job counts), not the Meili facet
+// distribution (which Meili caps at 300 values and returns alphabetically — so
+// popular employers never surface). An empty query returns the most active
+// companies (the endpoint's first page).
+export async function companySearch(query: string): Promise<FacetOption[]> {
+  const { items } = await api.listCompanies(query, 20, 0);
+  return items.map((c) => ({ value: c.slug, label: c.name, count: c.job_count }));
+}
+
+// Composes one /geo/cities result into a FacetOption: the value stays the bare city
+// name (what a profile's location_preferences already stores), the label adds the
+// country via the same countryLabel() resolver COUNTRY_OPTIONS uses, so the country a
+// suggestion came from is at least readable.
+export function cityOption(row: { value: string; country: string }): FacetOption {
+  return { value: row.value, label: `${row.value}, ${countryLabel(row.country)}` };
+}
+
+// Option source for the profile's base-city and relocation-cities controls: a
+// server-side prefix search over the embedded GeoNames dictionary (RemoteSearchSelect's
+// debounce means this fires at most once per ~250ms of typing, not per keystroke).
+// `country` narrows the base-city search to the already-chosen base country; the
+// relocation-cities search omits it, since that set may span multiple countries.
+//
+export async function searchCities(query: string, country?: string): Promise<FacetOption[]> {
+  return collapseCities(await api.searchCities(query, country));
+}
+
+// One city name is one option. /geo/cities answers per (name, country), so a prefix
+// like "london" or "victoria" comes back several times over — and since a preference
+// stores the bare name, every one of those rows would save the identical value. Listing
+// them separately offered a choice that does not exist, and the repeated value collided
+// in the picker's keyed {#each}, which in Svelte takes down the whole list rather than
+// the duplicate row. The first row per name wins: /geo/cities returns them by
+// descending population, so that is the city a reader means by the name.
+export function collapseCities(rows: { value: string; country: string }[]): FacetOption[] {
+  const byName = new Map<string, FacetOption>();
+  for (const row of rows) if (!byName.has(row.value)) byName.set(row.value, cityOption(row));
+  return [...byName.values()];
+}
+
+// Skill facet values are canonical slugs (postgresql, ci-cd, nodejs); the live
+// distribution carries no display name, so map them through the generated SKILL_LABELS
+// catalog (the skilltag dictionary is the source of truth). The fallback title-cases the
+// slug the way companyLabel does, so a value that outlived a dictionary edit still reads
+// as words rather than as data.
+/** Display label for a normalised city slug: `new-york` reads as `New York`.
+ *
+ *  Title-casing the slug rather than looking the city up: `users.resume_cities` stores
+ *  the normalisation, and the dictionary's own spellings (internal/dict/location's
+ *  CityMatch.Name) are reachable only through a search API keyed by query text, not by
+ *  slug. THE SEAM: a city whose real name is not its title-cased slug — 's-Hertogenbosch,
+ *  Rio de Janeiro — is spelled wrong here, and fixing it means exposing a slug lookup
+ *  from that dictionary rather than adding a second list of exceptions.
+ *
+ *  Worth having anyway: without it a card reads "berlin" beside the timezone's own
+ *  "Berlin", which looks like a bug in the half that is correct. */
+export function cityLabel(slug: string): string {
+  return slug
+    .split('-')
+    .map((part) => (part ? part.charAt(0).toUpperCase() + part.slice(1) : part))
+    .join(' ');
+}
+
+export function skillLabel(slug: string): string {
+  return (SKILL_LABELS as Record<string, string>)[slug] ?? titleCase(slug.replace(/-/g, '_'));
+}
+
+/** Display label for a dynamic facet value: country code → name, company slug →
+ *  title-cased name, else the value. */
+export function dynamicLabel(param: string, value: string): string {
+  if (param === 'countries') return countryLabel(value);
+  if (param === 'posting_language') return languageLabel(value);
+  if (param === 'company_slug') return companyLabel(value);
+  if (param === 'source') return sourceLabel(value);
+  // Skills have no static option list, so every surface naming a SELECTED skill — the
+  // filter summary chips above all — arrives here. Without this it fell through to the
+  // raw slug, and one skill was spelled two ways on one screen: "ci-cd" in the summary,
+  // "CI/CD" in the panel beside it.
+  if (param === 'skills') return skillLabel(value);
+  return value;
+}
+
+/** Drop options with a duplicate `value`, keeping the first. The facet controls
+ *  render a keyed `{#each}` on `value`, and Svelte aborts the whole render with
+ *  `each_key_duplicate` on a collision — so a single stray duplicate (e.g. a
+ *  generated-vocabulary regression) would take down every page with a filter
+ *  panel. This makes that failure mode a harmless repeat instead of a crash. */
+export function uniqueByValue(opts: FacetOption[]): FacetOption[] {
+  const seen = new Set<string>();
+  return opts.filter((o) => (seen.has(o.value) ? false : seen.add(o.value)));
+}
+
+/** Read one value's count out of a distribution for DISPLAY.
+ *
+ *  A count arrives NEGATIVE when the endpoint holds a value's number back — the Talent
+ *  Network withholds counts below a small floor (internal/candidate/talentnetwork's
+ *  CountWithheld) so a single member cannot be identified by arithmetic across panes.
+ *  Undefined means "show the option, no number"; rendering the sentinel as 0 would instead
+ *  claim nobody carries a value the list is about to show somebody for. Endpoints that
+ *  withhold nothing never emit a negative, so this is inert for them. */
+export function reportedCount(n: number): number | undefined {
+  return n < 0 ? undefined : n;
+}
+
+/** Brand-mark URL for a dynamic facet value, where the facet's values are entity
+ *  names the logo proxy can resolve — today only `source` (see EntityLogo /
+ *  sourceLogoUrl, the same pair /sources and JobSourceRow render their marks with).
+ *  Other dynamic facets (skills, countries, cities) have no logo proxy to ask. */
+function dynamicIcon(param: string, value: string): string | undefined {
+  if (param === 'source') return sourceLogoUrl(sourceLabel(sourceLogoBrand(value))) ?? undefined;
+  return undefined;
+}
+
+/** Build select options for a dynamic facet from its live distribution (value →
+ *  count) plus any already-selected values (so a selection absent from the current
+ *  distribution stays listed and removable), labelled via dynamicLabel and sorted
+ *  busiest-first. Shared by the filter panel's dynamic selects (FacetSection) and
+ *  the onboarding stack picker. */
+export function dynamicOptions(param: string, dist: Record<string, number>, selected: string[]): FacetOption[] {
+  const keys = new Set<string>([...Object.keys(dist), ...selected]);
+  return [...keys]
+    .map((value) => ({
+      value,
+      label: dynamicLabel(param, value),
+      count: reportedCount(dist[value] ?? 0),
+      icon: dynamicIcon(param, value),
+    }))
+    .sort((a, b) => (b.count ?? 0) - (a.count ?? 0) || a.label.localeCompare(b.label));
+}
+
+/** Fetch one dynamic facet's live distribution and shape it into sorted typeahead
+ *  options — the shared body behind skillDictionary.ts and sourceDictionary.ts (each
+ *  a thin, differently-named wrapper so callers import "the skills dictionary" /
+ *  "the source dictionary" rather than a bare param string). `opts.facets` narrows the
+ *  request to just this facet, when the caller has no other use for the rest. Best-effort:
+ *  any failure (network, decode) resolves to an empty list rather than throwing, so a
+ *  caller can render "nothing to suggest yet" instead of an error. */
+export async function loadFacetDistribution(param: string, opts?: { facets?: string[] }): Promise<FacetOption[]> {
+  try {
+    const counts = await api.facetCounts(new URLSearchParams(), opts);
+    return dynamicOptions(param, counts.facets?.[param] ?? {}, []);
+  } catch {
+    return [];
+  }
+}
+
+// Role slugs carry an optional seniority grade prefix (senior_backend); the
+// related-role map is keyed by the ungraded base (backend), so one entry serves
+// every grade. Longest prefix first is unnecessary — the grades share no
+// prefix among themselves — but drawing them from SENIORITY_VALUES keeps this in
+
+/** Does a facet option match the picker's search query? Always typo-tolerantly
+ *  matches the display label; when `searchAliases` is supplied, also matches the
+ *  option's curated shorthand aliases — the same terms that tag titles, so "swe"
+ *  surfaces Software Engineering and "data engineer" finds Data Engineering. An
+ *  empty query matches everything (via the label match). */
+export function optionMatches(
+  option: FacetOption,
+  query: string,
+  searchAliases?: Record<string, readonly string[]>,
+): boolean {
+  if (fuzzyMatch(option.label, query)) return true;
+  const aliases = searchAliases?.[option.value];
+  return !!aliases && aliases.some((a) => fuzzyMatch(a, query));
+}
+
+/** Build facet options from generated values, overriding labels where given. */
+function options(values: readonly string[], labels: Record<string, string> = {}): FacetOption[] {
+  return values.map((value) => ({ value, label: labels[value] ?? titleCase(value) }));
+}
+
+// Label overrides for the source facet, where the display name differs from the
+// title-cased fallback (e.g. "smartrecruiters" → "SmartRecruiters"). A new ATS
+// adapter needs no entry unless its casing is special — EXCEPT a slug that
+// concatenates several English words with no separator (weworkremotely,
+// nofluffjobs), which the fallback cannot split correctly at all and so always
+// needs one. Used by sourceLabel for the dynamic (distribution-driven) source
+// select, so a source with a real job count renders with its proper name.
+export const SOURCE_LABELS: Record<string, string> = {
+  telegram: 'Telegram', greenhouse: 'Greenhouse', smartrecruiters: 'SmartRecruiters',
+  bamboohr: 'BambooHR', successfactors: 'SAP SuccessFactors',
+  workatastartup: 'Work at a Startup', remoteok: 'RemoteOK', arc: 'Arc',
+  jobstash: 'JobStash', globalpayments: 'Global Payments',
+  usajobs: 'USAJobs', whatjobs: 'WhatJobs', ukgready: 'UKG Ready',
+  jettycloud: 'JettyCloud',
+  edjoin: 'EDJOIN', weworkremotely: 'We Work Remotely', hackernews: 'Hacker News',
+  cryptocurrencyjobs: 'Cryptocurrency Jobs', landingjobs: 'Landing.Jobs',
+  getonbrd: 'Get on Board', mycareersfuture: 'My Careers Future',
+  nofluffjobs: 'No Fluff Jobs', powertofly: 'PowerToFly',
+  // Vendor brands, spelled the way the vendor spells them. Title-casing a slug yields
+  // "Jazzhr" and "Adpmyjobs", which are nobody's name — and the same string is what the
+  // logo proxy is asked for, so a wrong name is a missing logo as well as a wrong label.
+  zohorecruit: 'Zoho Recruit', jazzhr: 'JazzHR', adpmyjobs: 'ADP MyJobs',
+  applicantpro: 'ApplicantPro', '4dayweek': '4 Day Week',
+  isolvedhire: 'isolved Hire', hrmdirect: 'HRM Direct', catsone: 'CATS',
+  alfabank: 'Alfa-Bank', aijobs: 'AI Jobs', remotedotcom: 'Remote.com',
+  sber: 'Sber', freshteam: 'Freshteam',
+};
+
+/** Display label for a source slug (e.g. smartrecruiters → "SmartRecruiters"),
+ *  used by the dynamic source select; falls back to the title-cased slug, with
+ *  hyphens normalised to word breaks first (the same convention companyLabel and
+ *  skillLabel use) so a regional variant like "whatjobs-ae" reads as "Whatjobs Ae"
+ *  rather than one unbroken word. */
+export function sourceLabel(value: string): string {
+  return SOURCE_LABELS[value] ?? titleCase(value.replace(/-/g, '_'));
+}
+
+// The whatjobs-<country> boards (~40 of them) are one crawl adapter's regional
+// splits of a single brand, not distinct companies — WhatJobs itself is the only
+// one with a mark the logo proxy can resolve. Used only for the LOGO lookup, never
+// the label: a picker listing every region needs each one to stay distinguishable.
+function sourceLogoBrand(value: string): string {
+  return value.startsWith('whatjobs-') ? 'whatjobs' : value;
+}
+
+// The backend's `regions` reach vocabulary (vocab.RegionValues): one consistent
+// macro level (continents/macro-regions, plus `global` and the distinct `uk`).
+// Country-level filtering lives in the Countries facet, so the US sits under
+// `north_america` and Russia under `cis`. Built from the shared REGION_LABELS
+// whose insertion order is the curated display order.
+const REGION: FacetOption[] = options(Object.keys(REGION_LABELS), REGION_LABELS);
+
+// Reserved `regions` value selecting jobs with no resolved geography (an empty
+// regions array) — the "region not specified" bucket — rather than a real region
+// code. The backend maps it to Meilisearch's IS EMPTY (see search.RegionUnspecified),
+// so it ORs with real regions and supports exclude like any region pill. Only the
+// job facet offers it; the company facet omits it (companies filter by SQL array
+// overlap, which has no empty-set sentinel).
+export const REGION_UNSPECIFIED = 'none';
+
+// Job region options: the macro-regions plus the "Not specified" sentinel chip,
+// appended last so it reads after the real regions.
+const JOB_REGION: FacetOption[] = [...REGION, { value: REGION_UNSPECIFIED, label: 'Not specified' }];
+
+const WORK_MODE: FacetOption[] = options(WORK_MODE_VALUES, WORK_MODE_LABELS);
+const SENIORITY: FacetOption[] = options(SENIORITY_VALUES, SENIORITY_LABELS);
+const COMPANY_TYPE: FacetOption[] = options(COMPANY_TYPE_VALUES, COMPANY_TYPE_LABELS);
+const EMPLOYMENT: FacetOption[] = options(EMPLOYMENT_TYPE_VALUES, EMPLOYMENT_LABELS);
+const RELOCATION: FacetOption[] = options(RELOCATION_VALUES, RELOCATION_LABELS);
+const ENGLISH: FacetOption[] = options(ENGLISH_LEVEL_VALUES, ENGLISH_LEVEL_LABELS);
+const CATEGORY: FacetOption[] = options(CATEGORY_VALUES, CATEGORY_LABELS);
+
+// IANA timezone REGIONS — the part before the slash. What a recruiter asking "can we
+// overlap for a call" means is a continent, not a city's zone; there are dozens of zones
+// per region. The list is the regions a candidate can actually be in: Antarctica and the
+// single-city oddities are left out, because a chip nobody will ever match is a chip in
+// the way of the ones they will.
+const TIMEZONE_REGION: FacetOption[] = TIMEZONE_REGIONS.map((r) => ({ value: r, label: r }));
+
+// The category facet options, exported for reuse outside the filter panel (the search
+// profile's specialization picker) so the same labels/order are shared, not duplicated.
+export const CATEGORY_OPTIONS: FacetOption[] = CATEGORY;
+
+// Six fixed values (internal/aiarchetype) — a static select like CATEGORY/DOMAINS,
+// not a dynamic (distribution-driven) control like role/skills.
+const AI_ARCHETYPE: FacetOption[] = options(AI_ARCHETYPE_VALUES, AI_ARCHETYPE_LABELS);
+const ROLE_TYPE: FacetOption[] = options(ROLE_TYPE_VALUES, ROLE_TYPE_LABELS);
+
+// Work-mode and region options, exported for the profile's location preferences editor so
+// it shares the filter panel's vocabulary/order instead of duplicating it.
+export const WORK_MODE_OPTIONS: FacetOption[] = WORK_MODE;
+export const REGION_OPTIONS: FacetOption[] = REGION;
+
+// Seniority and employment-type options, exported for the submit form so a submitter's
+// choice aligns with the filter panel's vocabulary/order instead of duplicating it.
+export const SENIORITY_OPTIONS: FacetOption[] = SENIORITY;
+export const EMPLOYMENT_TYPE_OPTIONS: FacetOption[] = EMPLOYMENT;
+
+const DOMAINS: FacetOption[] = options(DOMAIN_VALUES, DOMAIN_LABELS);
+
+// The curated company-industry vocabulary (internal/industrytag) — not a level
+// beneath domains but the company catalogue's single industry axis, which the
+// backend answers from the curated column and the job-derived domains alike.
+// Generated, like DOMAINS, so the options cannot drift from the Go dictionary.
+const INDUSTRIES: FacetOption[] = options(INDUSTRY_VALUES, INDUSTRY_LABELS);
+
+// The job-reality classes (internal/jobreality) — a small closed set, spelled out
+// like CURRENCY (not a generated values array). Offered excludable so the common use
+// is "exclude Likely evergreen" to hide probable ghost postings; not hidden by default.
+const REALITY: FacetOption[] = [
+  { value: 'fresh', label: 'Fresh' },
+  { value: 'stale', label: 'Stale' },
+  { value: 'likely-evergreen', label: 'Likely evergreen' },
+];
+
+const CURRENCY: FacetOption[] = [
+  { value: 'USD', label: 'USD' },
+  { value: 'EUR', label: 'EUR' },
+  { value: 'GBP', label: 'GBP' },
+  { value: 'RUB', label: 'RUB' },
+];
+
+// The salary currency vocabulary, reused by the submit form so a submitter's choice
+// aligns with the filter's currency facet.
+export const CURRENCY_OPTIONS: FacetOption[] = CURRENCY;
+
+// The company-tag registry as pill options, from the generated registry the
+// /collections hub also renders, so the label/slug pairs cannot drift.
+// Credentials last, under their own sub-heading: a credential is a verifiable
+// licence drawn from a public register, not one of our curated picks, and running
+// them together would read as though we vouched for both the same way. They stay on
+// one `collections` param regardless: facet state and URL serialization are keyed by
+// param, so a second facet entry sharing it would append every value twice.
+//
+// Everything that is not a credential is offered ungrouped, rather than listing the
+// kinds that qualify. Naming them was how `yc` and `techstars` fell out of the
+// filters entirely the day they became backers — filterable through the API,
+// unreachable in the UI, and silent about it.
+const COLLECTION: FacetOption[] = [
+  ...COLLECTIONS.filter((c) => c.kind !== 'credential').map((c) => ({
+    value: c.slug,
+    label: c.title,
+    icon: backerBadges([c.slug])[0]?.mark,
+  })),
+  ...COLLECTIONS.filter((c) => c.kind === 'credential').map((c) => ({
+    value: c.slug,
+    label: c.title,
+    group: 'Employer credentials',
+  })),
+];
+
+// The job filter modal splits COLLECTION across two panes instead of one grouped
+// list: the curated picks stay on Industry & collection, the credentials move to
+// their own block on the Relocation pane (they're evidence of visa/sponsorship
+// eligibility, which is what that pane is about). Both stay ChipFacet `options`
+// overrides on the same `collections` param rather than becoming separate FACETS
+// entries — a second entry sharing the param would double its value in the query
+// string. The company modal has no Relocation pane to split into, so it keeps using
+// COLLECTION (and its "Employer credentials" sub-heading) unchanged.
+export const JOB_COLLECTION: FacetOption[] = COLLECTION.filter((o) => o.group !== 'Employer credentials');
+
+// Stripped of `group`: this renders as its own ChipFacet block with its own "Employer
+// credentials" header, so the in-list sub-heading PillGroup would otherwise add above
+// the first pill (COLLECTION's grouping cue for the combined company-modal list) would
+// just repeat that header.
+export const EMPLOYER_CREDENTIALS: FacetOption[] = COLLECTION.filter((o) => o.group === 'Employer credentials').map(
+  ({ group: _group, ...o }) => o,
+);
+
+// Company-size buckets — the vocab.CompanySizeValues vocabulary. Not exported as
+// a generated values array (it's a scalar enrichment field, not a search facet on
+// jobs), so the closed set is spelled out here like CURRENCY; the values are
+// already display-ready.
+const COMPANY_SIZE: FacetOption[] = ['1-10', '11-50', '51-200', '201-500', '501-1000', '1000+'].map(
+  (value) => ({ value, label: value }),
+);
+
+// The ISO 3166-1 alpha-2 code set — the country vocabulary the location dictionary
+// draws from. The company country facet is a static searchable select over this
+// (labelled via countryLabel), not a live distribution: the companies list is plain
+// SQL with no facet-count endpoint yet, so options carry no counts.
+const ISO_COUNTRY_CODES = [
+  'ad', 'ae', 'af', 'ag', 'ai', 'al', 'am', 'ao', 'aq', 'ar', 'as', 'at', 'au', 'aw', 'ax', 'az',
+  'ba', 'bb', 'bd', 'be', 'bf', 'bg', 'bh', 'bi', 'bj', 'bl', 'bm', 'bn', 'bo', 'bq', 'br', 'bs',
+  'bt', 'bv', 'bw', 'by', 'bz', 'ca', 'cc', 'cd', 'cf', 'cg', 'ch', 'ci', 'ck', 'cl', 'cm', 'cn',
+  'co', 'cr', 'cu', 'cv', 'cw', 'cx', 'cy', 'cz', 'de', 'dj', 'dk', 'dm', 'do', 'dz', 'ec', 'ee',
+  'eg', 'eh', 'er', 'es', 'et', 'fi', 'fj', 'fk', 'fm', 'fo', 'fr', 'ga', 'gb', 'gd', 'ge', 'gf',
+  'gg', 'gh', 'gi', 'gl', 'gm', 'gn', 'gp', 'gq', 'gr', 'gs', 'gt', 'gu', 'gw', 'gy', 'hk', 'hm',
+  'hn', 'hr', 'ht', 'hu', 'id', 'ie', 'il', 'im', 'in', 'io', 'iq', 'ir', 'is', 'it', 'je', 'jm',
+  'jo', 'jp', 'ke', 'kg', 'kh', 'ki', 'km', 'kn', 'kp', 'kr', 'kw', 'ky', 'kz', 'la', 'lb', 'lc',
+  'li', 'lk', 'lr', 'ls', 'lt', 'lu', 'lv', 'ly', 'ma', 'mc', 'md', 'me', 'mf', 'mg', 'mh', 'mk',
+  'ml', 'mm', 'mn', 'mo', 'mp', 'mq', 'mr', 'ms', 'mt', 'mu', 'mv', 'mw', 'mx', 'my', 'mz', 'na',
+  'nc', 'ne', 'nf', 'ng', 'ni', 'nl', 'no', 'np', 'nr', 'nu', 'nz', 'om', 'pa', 'pe', 'pf', 'pg',
+  'ph', 'pk', 'pl', 'pm', 'pn', 'pr', 'ps', 'pt', 'pw', 'py', 'qa', 're', 'ro', 'rs', 'ru', 'rw',
+  'sa', 'sb', 'sc', 'sd', 'se', 'sg', 'sh', 'si', 'sj', 'sk', 'sl', 'sm', 'sn', 'so', 'sr', 'ss',
+  'st', 'sv', 'sx', 'sy', 'sz', 'tc', 'td', 'tf', 'tg', 'th', 'tj', 'tk', 'tl', 'tm', 'tn', 'to',
+  'tr', 'tt', 'tv', 'tw', 'tz', 'ua', 'ug', 'um', 'us', 'uy', 'uz', 'va', 'vc', 've', 'vg', 'vi',
+  'vn', 'vu', 'wf', 'ws', 'ye', 'yt', 'za', 'zm', 'zw',
+];
+/** Turn an English display name into a URL segment: strip diacritics, lowercase, and
+ *  collapse every run of non-alphanumerics into one hyphen. Local to the country
+ *  index — a general slugifier would invite callers whose input is not a name Intl
+ *  produced, and the guarantees below (injective, round-tripping) only hold for that. */
+function slugifyName(name: string): string {
+  return name
+    .normalize('NFD')
+    .replace(/\p{Diacritic}/gu, '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '');
+}
+
+/** A country that has earned a URL segment: its ISO code and the slug it resolves by. */
+export interface SlugifiedCountry {
+  code: string;
+  slug: string;
+}
+
+// The bidirectional country↔slug index, built once from ISO_COUNTRY_CODES. The
+// landing routes address a country by its slugified English name ('germany'), never
+// by ISO code — the code is not a phrase anyone searches. Intl gives the forward
+// direction and no reverse one, so the reverse is derived here rather than in a
+// hand-kept table that could disagree with countryLabel.
+//
+// Two codes are refused a slug:
+//   - one countryLabel only ECHOES (it returns the uppercased code when Intl has no
+//     name, e.g. the user-assigned 'xk'); an echo is not a name, and indexing it
+//     would mint a URL out of a two-letter non-word.
+//   - both members of any pair that slugify alike. Handing the slug to whichever
+//     came first in the list would be an arbitrary choice made silently, so the
+//     collision drops the whole group and the ambiguity stays visible as an absence.
+const COUNTRY_SLUGS: { byCode: Map<string, string>; bySlug: Map<string, string>; list: SlugifiedCountry[] } =
+  (() => {
+    const claims = new Map<string, string[]>();
+    for (const code of ISO_COUNTRY_CODES) {
+      const label = countryLabel(code);
+      if (label === code.toUpperCase()) continue;
+      const slug = slugifyName(label);
+      if (!slug) continue;
+      claims.set(slug, [...(claims.get(slug) ?? []), code]);
+    }
+
+    const byCode = new Map<string, string>();
+    const bySlug = new Map<string, string>();
+    const list: SlugifiedCountry[] = [];
+    for (const [slug, codes] of claims) {
+      const [code, ...rest] = codes;
+      if (!code || rest.length > 0) continue;
+      byCode.set(code, slug);
+      bySlug.set(slug, code);
+      list.push({ code, slug });
+    }
+    list.sort((a, b) => a.slug.localeCompare(b.slug));
+    return { byCode, bySlug, list };
+  })();
+
+/** ISO alpha-2 → its URL slug, or undefined when the code earns no slug (see above). */
+export function countrySlug(code: string): string | undefined {
+  return COUNTRY_SLUGS.byCode.get(code.toLowerCase());
+}
+
+/** A URL slug → its ISO alpha-2, or undefined when the slug names no country. */
+export function countryFromSlug(slug: string): string | undefined {
+  return COUNTRY_SLUGS.bySlug.get(slug.toLowerCase());
+}
+
+/** Every country carrying a slug, sorted by slug. The generator's country axis. */
+export function slugifiedCountries(): SlugifiedCountry[] {
+  return COUNTRY_SLUGS.list;
+}
+
+const COUNTRY: FacetOption[] = ISO_COUNTRY_CODES.map((value) => ({
+  value,
+  label: countryLabel(value),
+  flag: value,
+})).sort((a, b) => a.label.localeCompare(b.label));
+
+// The full ISO country select, exported for the profile's location editor (base +
+// remote/relocation countries) so it reuses the same list/labels as the company facet.
+export const COUNTRY_OPTIONS: FacetOption[] = COUNTRY;
+
+// The company catalog's filter facets: mostly a subset of the job facets whose
+// values are mostly derived from a company's open jobs and denormalized onto the
+// companies row (collections + the RefreshCompanyFacets arrays), including
+// `remote_regions` (regions scoped to remote jobs). `yc_batch`/`yc_status` are the
+// curated YC-directory facets loaded by cmd/import-yc. No exclude/AND-OR modes — the
+// companies list endpoint filters by plain array overlap. Reuses the same option
+// vocabularies as the job facets so labels never drift.
+const YC_STATUS: FacetOption[] = options(['Active', 'Acquired', 'Public', 'Inactive']);
+const YC_STAGE: FacetOption[] = options(['Early', 'Growth']);
+// Deterministic company maturity (see the company-classification-facets change),
+// derived server-side from company signals; unknown (NULL) companies match nothing.
+const MATURITY: FacetOption[] = options(['startup', 'scaleup', 'enterprise', 'government'], {
+  startup: 'Startup',
+  scaleup: 'Scaleup',
+  enterprise: 'Enterprise',
+  government: 'Government',
+});
+const YC_FLAGS: FacetOption[] = options(['top_company', 'hiring'], {
+  top_company: 'YC Top Company',
+  hiring: 'Hiring',
+});
+// YC batch labels are the verbatim source strings ("Winter 2012"). Generate the full
+// season×year grid so the searchable select covers any batch; phantom combinations
+// that no company has simply match nothing. The grid runs from the first YC batch
+// (2005) through next year so a fresh batch is covered as soon as it appears.
+const YC_BATCH: FacetOption[] = (() => {
+  const max = new Date().getFullYear() + 1;
+  return Array.from({ length: max - 2005 + 1 }, (_, i) => max - i).flatMap((y) =>
+    ['Winter', 'Spring', 'Summer', 'Fall'].map((s) => ({ value: `${s} ${y}`, label: `${s} ${y}` })),
+  );
+})();
+/** The Talent Network catalogue's facets.
+ *
+ *  All include-only — the catalogue endpoint has no `_exclude` and no AND/OR mode — so
+ *  every entry sets `excludable: false` and none carries `hasAndOr`.
+ *
+ *  Skills and city are `dynamic`: their options come from the live facet distribution
+ *  (`/talent/facets`) rather than a static list, which is what makes them searchable and
+ *  what puts a count beside each value. A closed vocabulary offered as pills and an open
+ *  one offered as a searched select are not two styles of the same control — thousands of
+ *  skills as pills is the wrong control, and a skill offered without a count cannot be
+ *  told apart from one nobody carries.
+ *
+ *  `specializations` and `categories` share the category vocabulary and ask different
+ *  questions of it: what a candidate SAYS they want, and what their most recent title
+ *  resolves to. Both are selects rather than pills because 48 values is a wall. */
+export const TALENT_FACETS: FacetDef[] = [
+  { param: 'specializations', label: 'Open to', control: 'select', options: CATEGORY, excludable: false, placeholder: 'Search disciplines' },
+  { param: 'categories', label: 'Has worked in', control: 'select', options: CATEGORY, excludable: false, placeholder: 'Search disciplines' },
+  { param: 'seniorities', label: 'Grade', control: 'pills', options: SENIORITY, excludable: false },
+  { param: 'skills', label: 'Skills', control: 'select', dynamic: true, excludable: false, placeholder: 'Search skills', techIcons: true },
+  { param: 'tz', label: 'Timezone', control: 'pills', options: TIMEZONE_REGION, excludable: false },
+  { param: 'cities', label: 'City', control: 'select', dynamic: true, excludable: false, placeholder: 'Search cities' },
+];
+
+export const COMPANY_FACETS: FacetDef[] = [
+  { param: 'collections', label: 'Collection', control: 'pills', options: COLLECTION, excludable: false },
+  { param: 'regions', label: 'Region', control: 'pills', options: REGION, excludable: false },
+  { param: 'remote_regions', label: 'Remote hiring', control: 'pills', options: REGION, excludable: false },
+  { param: 'countries', label: 'Country', control: 'select', options: COUNTRY, excludable: false, placeholder: 'Search countries' },
+  // The catalogue's only industry control. The backend matches it against the curated
+  // industries column AND the job-derived domains one (internal/industrytag maps
+  // between the vocabularies), so the Domain facet that used to sit here asked the
+  // same question of one of the same columns and is gone. `domains` remains a working
+  // query parameter for a caller who wants the raw job-derived value.
+  { param: 'industries', label: 'Industry', control: 'select', options: INDUSTRIES, excludable: false, placeholder: 'Search industries' },
+  { param: 'company_type', label: 'Company type', control: 'pills', options: COMPANY_TYPE, excludable: false },
+  { param: 'company_size', label: 'Company size', control: 'pills', options: COMPANY_SIZE, excludable: false },
+  { param: 'maturity', label: 'Company stage', control: 'pills', options: MATURITY, excludable: false },
+  { param: 'yc_status', label: 'YC status', control: 'pills', options: YC_STATUS, excludable: false },
+  { param: 'yc_stage', label: 'YC stage', control: 'pills', options: YC_STAGE, excludable: false },
+  { param: 'yc_flags', label: 'YC highlights', control: 'pills', options: YC_FLAGS, excludable: false },
+  { param: 'yc_batch', label: 'YC batch', control: 'select', options: YC_BATCH, excludable: false, placeholder: 'Search YC batches' },
+];
+
+export const FACETS: FacetDef[] = [
+  { param: 'collections', label: 'Collection', control: 'pills', options: COLLECTION, excludable: false },
+  { param: 'regions', label: 'Region', control: 'pills', options: JOB_REGION, excludable: true },
+  { param: 'work_mode', label: 'Work format', control: 'pills', options: WORK_MODE, excludable: true },
+  { param: 'category', label: 'Specialization', control: 'select', options: CATEGORY, excludable: true, placeholder: 'Search specializations', searchAliases: FACET_ALIASES },
+  { param: 'ai_archetype', label: 'AI Specialization', control: 'select', options: AI_ARCHETYPE, excludable: true, placeholder: 'Search AI specializations' },
+  { param: 'seniority', label: 'Seniority', control: 'pills', options: SENIORITY, excludable: true },
+  { param: 'role_type', label: 'Role type', control: 'pills', options: ROLE_TYPE, excludable: true },
+  { param: 'skills', label: 'Skills', control: 'select', dynamic: true, excludable: true, hasAndOr: true, placeholder: 'Search skills', techIcons: true },
+  { param: 'domains', label: 'Industry', control: 'select', options: DOMAINS, excludable: true, placeholder: 'Search industries' },
+  { param: 'company_type', label: 'Company type', control: 'pills', options: COMPANY_TYPE, excludable: true },
+  { param: 'countries', label: 'Countries', control: 'select', dynamic: true, excludable: true, placeholder: 'Search countries' },
+  { param: 'cities', label: 'City', control: 'select', dynamic: true, excludable: true, placeholder: 'Search cities' },
+  { param: 'relocation', label: 'Relocation', control: 'pills', options: RELOCATION, excludable: true },
+  { param: 'employment_type', label: 'Employment', control: 'pills', options: EMPLOYMENT, excludable: true },
+  { param: 'english_level', label: 'English', control: 'pills', options: ENGLISH, excludable: true },
+  { param: 'posting_language', label: 'Job language', control: 'select', dynamic: true, excludable: true, placeholder: 'Search languages' },
+  { param: 'reality', label: 'Posting reality', control: 'pills', options: REALITY, excludable: true },
+  { param: 'salary_currency', label: 'Currency', control: 'pills', options: CURRENCY, excludable: true },
+  { param: 'company_slug', label: 'Company', control: 'remote', excludable: true, placeholder: 'Search companies', remote: companySearch },
+  { param: 'source', label: 'Source', control: 'select', dynamic: true, excludable: true, placeholder: 'Search sources', entityLogos: true },
+];

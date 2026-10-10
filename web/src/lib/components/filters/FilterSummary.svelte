@@ -1,0 +1,115 @@
+<script lang="ts">
+  import { dynamicLabel, FACETS } from '$lib/facets';
+  import { type FilterStore, savedSearchQuery, displayQuery } from '$lib/filters';
+  import { experienceLabel, freshnessLabel, salaryLabel } from '$lib/filterControls';
+  import FilterSummaryShell, { type SummaryChip, type SummaryGroup } from './FilterSummaryShell.svelte';
+  import SaveSearchAlert from './SaveSearchAlert.svelte';
+
+  // The job filters sidebar: a summary of the *applied* filters as chips grouped by
+  // facet, over the reusable FilterSummaryShell. Removing a chip edits the live store
+  // directly — the sidebar applies immediately; only the modal defers. The shared
+  // save-then-alert control (Save filter → get it in Telegram) sits under the
+  // All-filters button on the standalone list (`canSave`); the modal's "My filters"
+  // tab drives the same control.
+  let { store, exclude = [], onOpen, canSave = false, description }: { store: FilterStore; exclude?: string[]; onOpen: () => void; canSave?: boolean; description?: string } = $props();
+
+  // The current filters as the saved-search / alert target. The ordering is view-only
+  // and savedSearchQuery drops it, so reordering the feed never marks this dirty.
+  const current = $derived(savedSearchQuery(store.value));
+
+  function valueLabel(param: string, value: string): string {
+    const def = FACETS.find((d) => d.param === param);
+    const o = def?.options?.find((opt) => opt.value === value);
+    return o ? o.label : dynamicLabel(param, value);
+  }
+
+  const groups = $derived.by((): SummaryGroup[] => {
+    const f = store.value;
+    const out: SummaryGroup[] = [];
+    const push = (label: string, chips: SummaryChip[]) => {
+      if (chips.length) out.push({ label, chips });
+    };
+    // Chips for one facet: included values first, then excluded (destructive style).
+    // `withIcon` carries the raw value through as `slug` for the skills group, so its
+    // chips can show a brand logo — see SummaryChip.slug.
+    const facetChips = (param: string, withIcon = false): SummaryChip[] => {
+      const st = f.facets[param];
+      if (!st) return [];
+      return [
+        ...st.include.map((v) => ({ key: `${param}:${v}`, text: valueLabel(param, v), exclude: false, remove: () => store.remove(param, v), slug: withIcon ? v : undefined })),
+        ...st.exclude.map((v) => ({ key: `${param}:${v}`, text: valueLabel(param, v), exclude: true, remove: () => store.remove(param, v), slug: withIcon ? v : undefined })),
+      ];
+    };
+    const facetGroup = (param: string, label: string, withIcon = false) => {
+      if (exclude.includes(param)) return;
+      push(label, facetChips(param, withIcon));
+    };
+
+    // The text query (from the header search on the standalone list) as a removable
+    // chip, so the sidebar shows what you searched, not just the facet filters.
+    push('Search', f.q.trim() ? [{ key: 'q', text: displayQuery(f.q), exclude: false, remove: () => store.setQuery('') }] : []);
+
+    facetGroup('category', 'Specialization');
+    facetGroup('ai_archetype', 'AI Specialization');
+    // Location: regions + countries + cities under one heading.
+    push('Location', [...facetChips('regions'), ...facetChips('countries'), ...facetChips('cities')]);
+
+    facetGroup('seniority', 'Seniority');
+    facetGroup('role_type', 'Role type');
+    facetGroup('work_mode', 'Work format');
+    facetGroup('skills', 'Skills', true);
+    facetGroup('domains', 'Industry');
+    facetGroup('company_type', 'Company type');
+    facetGroup('employment_type', 'Employment');
+    facetGroup('collections', 'Collection');
+    facetGroup('company_slug', 'Company');
+    facetGroup('english_level', 'English');
+    facetGroup('posting_language', 'Job language');
+    facetGroup('relocation', 'Relocation');
+
+    // Salary: currency + one chip for the range, however many ends are set.
+    const salary: SummaryChip[] = facetChips('salary_currency');
+    if (f.salaryMin != null || f.salaryMax != null)
+      salary.push({ key: 'salary_range', text: salaryLabel(f.salaryMin, f.salaryMax), exclude: false, remove: () => store.clearSalary() });
+    push('Salary', salary);
+
+    if (f.visa) push('Visa', [{ key: 'visa', text: 'Sponsorship', exclude: false, remove: () => store.setVisa(false) }]);
+    if (f.autoApplyAvailable)
+      push('Auto-apply', [
+        { key: 'auto_apply_available', text: 'Available', exclude: false, remove: () => store.setAutoApplyAvailable(false) },
+      ]);
+    if (f.hideAIInterview)
+      push('AI interview', [
+        { key: 'ai_interview', text: 'Hidden', exclude: true, remove: () => store.setHideAIInterview(false) },
+      ]);
+    if (f.clearance !== 'any')
+      push('Clearance', [
+        {
+          key: 'clearance',
+          text: f.clearance === 'hide' ? 'Hidden' : 'Required only',
+          exclude: false,
+          remove: () => store.setClearance('any'),
+        },
+      ]);
+    // Two chips under two headings, never merged: they are separate bounds, and a
+    // reader who set only one must be able to see which. `Open` is not gated on the
+    // feature flag — a bound arriving from a shared link applies whether or not the
+    // control that writes it is revealed, and a filter narrowing the list with no chip
+    // to remove it is the untruth this summary exists to prevent.
+    if (f.openWithinDays != null) push('Open', [{ key: 'open_within_days', text: freshnessLabel(f.openWithinDays), exclude: false, remove: () => store.setOpenWithinDays(null) }]);
+    if (f.postedWithinDays != null) push('Posted', [{ key: 'posted_within_days', text: freshnessLabel(f.postedWithinDays), exclude: false, remove: () => store.setPostedWithinDays(null) }]);
+    // `!= null`, not truthiness: a zero bound is the entry-level filter, and hiding
+    // its chip would leave the narrowest experience filter with no way to remove it.
+    if (f.experienceYearsMax != null) push('Experience', [{ key: 'experience_years_max', text: experienceLabel(f.experienceYearsMax), exclude: false, remove: () => store.setExperienceYearsMax(null) }]);
+
+    return out;
+  });
+</script>
+
+<FilterSummaryShell {groups} active={store.active} onReset={() => store.clear()} {onOpen} {description}>
+  {#snippet afterButton()}
+    {#if canSave}
+      <SaveSearchAlert query={current} variant="full" alerts="manage" />
+    {/if}
+  {/snippet}
+</FilterSummaryShell>

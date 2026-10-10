@@ -1,0 +1,227 @@
+package sources
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"encoding/xml"
+	"fmt"
+	"io"
+	"time"
+
+	fhttp "github.com/bogdanfinn/fhttp"
+	tls_client "github.com/bogdanfinn/tls-client"
+	"github.com/bogdanfinn/tls-client/profiles"
+	"golang.org/x/net/html"
+
+	"github.com/strelov1/freehire/internal/platform/safehttp"
+)
+
+// fingerprintHTTP is the Chrome-fingerprint transport shared by the adapters whose edge rejects
+// Go's default TLS+HTTP/2 fingerprint (Meta's edge 400s it; Bayt's and GulfTalent's Akamai/
+// Cloudflare edges 403 it). A live spike confirmed plain JA3 spoofing via utls is not enough — the
+// edge fingerprints the HTTP/2 layer too; tls-client with a Chrome profile spoofs both the JA3 and
+// the Chrome HTTP/2 fingerprint and is served normally. This is the only file in the package that
+// imports tls-client/fhttp; the fork never leaks into the rest of internal/ingest/sources. Connections
+// still dial through the safehttp SSRF guard via WithDialer (TestFingerprintHTTPBlocksInternalTarget
+// locks that contract).
+//
+// Upgrade note: tls-client bundles forks of net/http (fhttp) and utls. When bumping it, re-run the
+// live adapter smoke of every consumer (an edge can tighten its fingerprint check) and re-confirm
+// the SSRF dial path still routes through WithDialer's Control hook.
+type fingerprintHTTP struct {
+	client tls_client.HttpClient
+}
+
+const (
+	fpClientTimeout = 30 * time.Second
+	fpDialTimeout   = 15 * time.Second
+	// fpUserAgent must agree with the spoofed Chrome profile below; a mismatched UA is a
+	// cheap bot tell. Kept at Chrome/144 to match the Chrome_144 profile.
+	fpUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36"
+)
+
+// newFingerprintHTTP builds the shared Chrome-fingerprint transport: a tls-client with the
+// Chrome_144 profile dialing through the SSRF-guarded dialer.
+func newFingerprintHTTP() (*fingerprintHTTP, error) {
+	client, err := tls_client.NewHttpClient(tls_client.NewNoopLogger(),
+		tls_client.WithTimeoutSeconds(int(fpClientTimeout/time.Second)),
+		tls_client.WithClientProfile(profiles.Chrome_144),
+		tls_client.WithDialer(*safehttp.GuardedDialer(fpDialTimeout)),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("sources: build fingerprint tls-client: %w", err)
+	}
+	return &fingerprintHTTP{client: client}, nil
+}
+
+// newProxiedFingerprintHTTP builds a Chrome-fingerprint transport that egresses through the
+// proxy at proxyURL — for a source blocked by BOTH its TLS-fingerprint check AND the prod
+// datacenter IP. gulftalent is the case: a correct Chrome fingerprint from the direct
+// datacenter IP still 403s, but the same fingerprint through the residential proxy is served
+// 200 (spike-verified — via the same proxy, curl's JA3 403s while this Chrome JA3 is 200). The
+// proxy dial replaces the SSRF-guarded direct dialer; the target is a fixed trusted host, so the
+// SSRF guard is moot.
+func newProxiedFingerprintHTTP(proxyURL string) (*fingerprintHTTP, error) {
+	client, err := tls_client.NewHttpClient(tls_client.NewNoopLogger(),
+		tls_client.WithTimeoutSeconds(int(fpClientTimeout/time.Second)),
+		tls_client.WithClientProfile(profiles.Chrome_144),
+		tls_client.WithProxyUrl(proxyURL),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("sources: build proxied fingerprint tls-client: %w", err)
+	}
+	return &fingerprintHTTP{client: client}, nil
+}
+
+// get issues a Chrome-shaped GET and returns the bounded response body, erroring on any
+// non-2xx status. Unlike the shared Client, it does not retry: these are low-volume crawls of a
+// single host, a dropped detail page reappears on the next run, and a transient list-fetch failure
+// simply fails the board for that run (no jobs are closed on a single miss).
+func (c *fingerprintHTTP) get(ctx context.Context, url string) ([]byte, error) {
+	req, err := fhttp.NewRequestWithContext(ctx, fhttp.MethodGet, url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("sources: build request %s: %w", url, err)
+	}
+	req.Header = fpHeaders()
+
+	resp, err := c.client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("sources: GET %s: %w", url, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("sources: GET %s: status %d", url, resp.StatusCode)
+	}
+	body, err := io.ReadAll(newCappedReader(resp.Body, url, maxResponseBody))
+	if err != nil {
+		return nil, fmt.Errorf("sources: read %s: %w", url, err)
+	}
+	return body, nil
+}
+
+// GetXML fetches url over the Chrome-fingerprint client and decodes its XML body into v.
+func (c *fingerprintHTTP) GetXML(ctx context.Context, url string, v any) error {
+	body, err := c.get(ctx, url)
+	if err != nil {
+		return err
+	}
+	if err := xml.Unmarshal(body, v); err != nil {
+		return fmt.Errorf("sources: decode %s: %w", url, err)
+	}
+	return nil
+}
+
+// GetHTML fetches url over the Chrome-fingerprint client and returns its parsed HTML tree.
+func (c *fingerprintHTTP) GetHTML(ctx context.Context, url string) (*html.Node, error) {
+	body, err := c.get(ctx, url)
+	if err != nil {
+		return nil, err
+	}
+	node, err := html.Parse(bytes.NewReader(body))
+	if err != nil {
+		return nil, fmt.Errorf("sources: parse %s: %w", url, err)
+	}
+	return node, nil
+}
+
+// GetJSON fetches url over the Chrome-fingerprint client and decodes its JSON body into v.
+func (c *fingerprintHTTP) GetJSON(ctx context.Context, url string, v any) error {
+	body, err := c.get(ctx, url)
+	if err != nil {
+		return err
+	}
+	if err := json.Unmarshal(body, v); err != nil {
+		return fmt.Errorf("sources: decode %s: %w", url, err)
+	}
+	return nil
+}
+
+// post is the POST sibling of get: a Chrome-shaped POST with the raw payload, returning
+// the bounded response body and erroring on any non-2xx status. No retry, for the same
+// reason get does not retry.
+func (c *fingerprintHTTP) post(ctx context.Context, url string, payload []byte) ([]byte, error) {
+	req, err := fhttp.NewRequestWithContext(ctx, fhttp.MethodPost, url, bytes.NewReader(payload))
+	if err != nil {
+		return nil, fmt.Errorf("sources: build request %s: %w", url, err)
+	}
+	req.Header = fpPostHeaders()
+
+	resp, err := c.client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("sources: POST %s: %w", url, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("sources: POST %s: status %d", url, resp.StatusCode)
+	}
+	body, err := io.ReadAll(newCappedReader(resp.Body, url, maxResponseBody))
+	if err != nil {
+		return nil, fmt.Errorf("sources: read %s: %w", url, err)
+	}
+	return body, nil
+}
+
+// PostJSON sends a Chrome-shaped POST with the JSON-encoded body and decodes the JSON
+// response into v. jobleads' search endpoint is POST-only, and its Cloudflare edge
+// rejects the default Go TLS+HTTP2 fingerprint exactly as the meta/bayt/gulftalent/
+// uber edges do — hence the transport lives here, not on the shared client.
+func (c *fingerprintHTTP) PostJSON(ctx context.Context, url string, body, v any) error {
+	payload, err := json.Marshal(body)
+	if err != nil {
+		return fmt.Errorf("sources: marshal POST body for %s: %w", url, err)
+	}
+	raw, err := c.post(ctx, url, payload)
+	if err != nil {
+		return err
+	}
+	if err := json.Unmarshal(raw, v); err != nil {
+		return fmt.Errorf("sources: decode %s: %w", url, err)
+	}
+	return nil
+}
+
+// fpHeaders is a Chrome-shaped header set with an explicit order (fhttp's HeaderOrderKey). The
+// header presence and order are part of the fingerprint the edge checks, so they are kept
+// consistent with the spoofed Chrome_144 profile.
+func fpHeaders() fhttp.Header {
+	return fhttp.Header{
+		"sec-ch-ua":          {`"Chromium";v="144", "Not(A:Brand";v="99"`},
+		"sec-ch-ua-mobile":   {"?0"},
+		"sec-ch-ua-platform": {`"macOS"`},
+		"user-agent":         {fpUserAgent},
+		"accept":             {"text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8"},
+		"sec-fetch-site":     {"none"},
+		"sec-fetch-mode":     {"navigate"},
+		"sec-fetch-user":     {"?1"},
+		"sec-fetch-dest":     {"document"},
+		"accept-language":    {"en-US,en;q=0.9"},
+		fhttp.HeaderOrderKey: {
+			"sec-ch-ua", "sec-ch-ua-mobile", "sec-ch-ua-platform", "user-agent",
+			"accept", "sec-fetch-site", "sec-fetch-mode", "sec-fetch-user",
+			"sec-fetch-dest", "accept-language",
+		},
+	}
+}
+
+// fpPostHeaders is the fetch()-call sibling of fpHeaders: the header set a Chrome page
+// emits for an XHR/fetch request (the search and JSON endpoints of jobleads).
+func fpPostHeaders() fhttp.Header {
+	return fhttp.Header{
+		"sec-ch-ua":          {`"Chromium";v="144", "Not(A:Brand";v="99"`},
+		"sec-ch-ua-mobile":   {"?0"},
+		"sec-ch-ua-platform": {`"macOS"`},
+		"user-agent":         {fpUserAgent},
+		"accept":             {"application/json, text/plain, */*"},
+		"content-type":       {"application/json"},
+		"sec-fetch-site":     {"same-origin"},
+		"sec-fetch-mode":     {"cors"},
+		"sec-fetch-dest":     {"empty"},
+		"accept-language":    {"en-US,en;q=0.9"},
+		fhttp.HeaderOrderKey: {
+			"sec-ch-ua", "sec-ch-ua-mobile", "sec-ch-ua-platform", "user-agent",
+			"accept", "content-type", "sec-fetch-site", "sec-fetch-mode",
+			"sec-fetch-dest", "accept-language",
+		},
+	}
+}

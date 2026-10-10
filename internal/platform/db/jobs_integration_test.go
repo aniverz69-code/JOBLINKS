@@ -1,0 +1,510 @@
+//go:build integration
+
+// Integration tests for the ingest write path's SQL contract: re-ingest must preserve
+// enrichment (UpsertJob no longer touches the enrichment columns) and the gated
+// transactional enqueue must queue only jobs that still need enriching. These are SQL
+// behaviors, verifiable only against a real Postgres.
+// Run with: go test -tags=integration ./internal/platform/db/
+package db
+
+import (
+	"context"
+	"encoding/json"
+	"reflect"
+	"testing"
+	"time"
+
+	"github.com/jackc/pgx/v5/pgtype"
+)
+
+// jsonEqual compares two JSON documents by value, ignoring Postgres JSONB whitespace
+// reformatting.
+func jsonEqual(a, b []byte) bool {
+	var av, bv any
+	if json.Unmarshal(a, &av) != nil || json.Unmarshal(b, &bv) != nil {
+		return false
+	}
+	return reflect.DeepEqual(av, bv)
+}
+
+func ingestParams(externalID, title string) UpsertJobParams {
+	return UpsertJobParams{
+		Source:      "greenhouse",
+		ExternalID:  externalID,
+		URL:         "https://example.test/job",
+		Title:       title,
+		Company:     "Acme",
+		CompanySlug: "acme",
+		// Stable per external_id (not per title) so a re-ingest with an edited
+		// title carries the same slug — mirroring the pipeline, which mints the
+		// slug from (source, external_id), not from volatile fields.
+		PublicSlug: "pslug-" + externalID,
+		Location:   "Remote",
+		Remote:     true,
+		// A body and a resolved category are what the pipeline produces for an
+		// ordinary posting, and what makes this row searchable — RefreshCompanyFacets
+		// counts only postings the job search index holds, so a fixture missing
+		// either would be counted by no company.
+		Description: "Build things.",
+		Category:    "backend",
+		PostedAt:    pgtype.Timestamptz{},
+	}
+}
+
+func TestUpsertJobPreservesEnrichmentOnReingest(t *testing.T) {
+	pool := startPostgres(t)
+	q := New(pool)
+	ctx := context.Background()
+	truncate(t, pool)
+
+	first, err := ingestUpsert(ctx, q, ingestParams("acme:1", "Old Title"))
+	if err != nil {
+		t.Fatalf("initial upsert: %v", err)
+	}
+
+	// The enrichment worker enriches the job out of band.
+	enrichment := []byte(`{"seniority":"senior"}`)
+	if err := q.SetJobEnrichment(ctx, SetJobEnrichmentParams{
+		Enrichment:        enrichment,
+		EnrichedAt:        pgtype.Timestamptz{Time: time.Now(), Valid: true},
+		EnrichmentVersion: 1,
+		ID:                first.ID,
+	}); err != nil {
+		t.Fatalf("set enrichment: %v", err)
+	}
+
+	// Re-ingest the same job (same source+external_id) with an edited title.
+	second, err := ingestUpsert(ctx, q, ingestParams("acme:1", "New Title"))
+	if err != nil {
+		t.Fatalf("re-ingest upsert: %v", err)
+	}
+
+	if second.ID != first.ID {
+		t.Fatalf("re-ingest created a new row (id %d != %d) — dedup broken", second.ID, first.ID)
+	}
+	if second.Title != "New Title" {
+		t.Errorf("Title = %q, want the re-ingested value", second.Title)
+	}
+	if !jsonEqual(second.Enrichment, enrichment) {
+		t.Errorf("Enrichment = %s, want preserved %s (re-ingest wiped it)", second.Enrichment, enrichment)
+	}
+	if second.EnrichmentVersion != 1 {
+		t.Errorf("EnrichmentVersion = %d, want preserved 1", second.EnrichmentVersion)
+	}
+	if !second.EnrichedAt.Valid {
+		t.Error("EnrichedAt was cleared by re-ingest, want preserved")
+	}
+}
+
+func TestEnqueueJobEnrichmentGating(t *testing.T) {
+	pool := startPostgres(t)
+	q := New(pool)
+	ctx := context.Background()
+
+	outboxCount := func() int {
+		t.Helper()
+		var n int
+		if err := pool.QueryRow(ctx, "SELECT count(*) FROM enrichment_outbox").Scan(&n); err != nil {
+			t.Fatalf("count outbox: %v", err)
+		}
+		return n
+	}
+
+	t.Run("unenriched job is enqueued, idempotently", func(t *testing.T) {
+		truncate(t, pool)
+		p := ingestParams("acme:1", "A Job")
+		p.IsTech = pgtype.Bool{Bool: true, Valid: true}
+		job, err := ingestUpsert(ctx, q, p)
+		if err != nil {
+			t.Fatalf("upsert: %v", err)
+		}
+
+		n, err := q.EnqueueJobEnrichment(ctx, EnqueueJobEnrichmentParams{TargetVersion: 1, JobID: job.ID})
+		if err != nil {
+			t.Fatalf("enqueue: %v", err)
+		}
+		if n != 1 {
+			t.Errorf("first enqueue affected %d rows, want 1", n)
+		}
+
+		if _, err := q.EnqueueJobEnrichment(ctx, EnqueueJobEnrichmentParams{TargetVersion: 1, JobID: job.ID}); err != nil {
+			t.Fatalf("second enqueue: %v", err)
+		}
+		if got := outboxCount(); got != 1 {
+			t.Errorf("outbox rows = %d, want 1 (enqueue is idempotent)", got)
+		}
+	})
+
+	t.Run("already-enriched job is not enqueued", func(t *testing.T) {
+		truncate(t, pool)
+		job, err := ingestUpsert(ctx, q, ingestParams("acme:2", "Enriched Job"))
+		if err != nil {
+			t.Fatalf("upsert: %v", err)
+		}
+		if err := q.SetJobEnrichment(ctx, SetJobEnrichmentParams{
+			Enrichment:        []byte(`{}`),
+			EnrichedAt:        pgtype.Timestamptz{Time: time.Now(), Valid: true},
+			EnrichmentVersion: 1,
+			ID:                job.ID,
+		}); err != nil {
+			t.Fatalf("set enrichment: %v", err)
+		}
+
+		n, err := q.EnqueueJobEnrichment(ctx, EnqueueJobEnrichmentParams{TargetVersion: 1, JobID: job.ID})
+		if err != nil {
+			t.Fatalf("enqueue: %v", err)
+		}
+		if n != 0 {
+			t.Errorf("enqueue affected %d rows, want 0 (job already at target version)", n)
+		}
+		if got := outboxCount(); got != 0 {
+			t.Errorf("outbox rows = %d, want 0", got)
+		}
+	})
+
+	// A recrawl of an already-deduped repost reaches this call as an UPDATE, not the
+	// clustering INSERT — the write path's own dedup check (cmd/ingest's clustersByRole)
+	// never fires for it, so this gate is the only thing standing between the recrawl and
+	// an outbox row ClaimEnrichmentBatch's duplicate_of IS NULL filter can never claim.
+	t.Run("job already marked a duplicate is not enqueued", func(t *testing.T) {
+		truncate(t, pool)
+		canon, err := ingestUpsert(ctx, q, ingestParams("acme:3", "Canonical Job"))
+		if err != nil {
+			t.Fatalf("upsert canon: %v", err)
+		}
+		p := ingestParams("acme:4", "Reposted Job")
+		p.IsTech = pgtype.Bool{Bool: true, Valid: true}
+		repost, err := ingestUpsert(ctx, q, p)
+		if err != nil {
+			t.Fatalf("upsert repost: %v", err)
+		}
+		if _, err := q.MarkJobDuplicateOfRole(ctx, MarkJobDuplicateOfRoleParams{
+			ID:              repost.ID,
+			DuplicateOfRole: pgtype.Int8{Int64: canon.ID, Valid: true},
+		}); err != nil {
+			t.Fatalf("mark duplicate: %v", err)
+		}
+
+		n, err := q.EnqueueJobEnrichment(ctx, EnqueueJobEnrichmentParams{TargetVersion: 1, JobID: repost.ID})
+		if err != nil {
+			t.Fatalf("enqueue: %v", err)
+		}
+		if n != 0 {
+			t.Errorf("enqueue affected %d rows, want 0 (job is a known duplicate)", n)
+		}
+		if got := outboxCount(); got != 0 {
+			t.Errorf("outbox rows = %d, want 0 — a duplicate must never reach ClaimEnrichmentBatch", got)
+		}
+	})
+}
+
+// A failed detail fetch makes an adapter yield a job with an empty description while
+// still upserting it (the vacancy must not be dropped). UpsertJob must treat an empty
+// incoming description as "no new value" and keep the stored one, so a transient
+// detail-fetch failure (e.g. an anti-bot challenge on a Habr detail page) cannot wipe a
+// good description. A non-empty description still overwrites, so real edits propagate.
+func TestUpsertJobPreservesDescriptionWhenReingestEmpty(t *testing.T) {
+	pool := startPostgres(t)
+	q := New(pool)
+	ctx := context.Background()
+	truncate(t, pool)
+
+	first, err := ingestUpsert(ctx, q, ingestParams("acme:desc", "Job"))
+	if err != nil {
+		t.Fatalf("initial upsert: %v", err)
+	}
+	if first.Description != "Build things." {
+		t.Fatalf("precondition: description = %q, want the seeded value", first.Description)
+	}
+
+	// Re-crawl whose detail fetch failed: empty description, same identity.
+	empty := ingestParams("acme:desc", "Job")
+	empty.Description = ""
+	second, err := ingestUpsert(ctx, q, empty)
+	if err != nil {
+		t.Fatalf("re-ingest with empty description: %v", err)
+	}
+	if second.ID != first.ID {
+		t.Fatalf("re-ingest created a new row — dedup broken")
+	}
+	if second.Description != "Build things." {
+		t.Errorf("Description = %q, want preserved %q (empty re-ingest wiped it)", second.Description, "Build things.")
+	}
+
+	// A non-empty re-ingest still overwrites, so a genuine content edit propagates.
+	updated := ingestParams("acme:desc", "Job")
+	updated.Description = "Updated description."
+	third, err := ingestUpsert(ctx, q, updated)
+	if err != nil {
+		t.Fatalf("re-ingest with new description: %v", err)
+	}
+	if third.Description != "Updated description." {
+		t.Errorf("Description = %q, want overwritten with the new value", third.Description)
+	}
+}
+
+func TestUpsertJobWritesAndRefreshesGeography(t *testing.T) {
+	pool := startPostgres(t)
+	q := New(pool)
+	ctx := context.Background()
+	truncate(t, pool)
+
+	p := ingestParams("acme:geo", "Geo Job")
+	p.Countries = []string{"us"}
+	p.Regions = []string{"us"}
+	first, err := ingestUpsert(ctx, q, p)
+	if err != nil {
+		t.Fatalf("upsert: %v", err)
+	}
+	if !reflect.DeepEqual(first.Countries, []string{"us"}) || !reflect.DeepEqual(first.Regions, []string{"us"}) {
+		t.Fatalf("countries=%v regions=%v, want [us]/[us]", first.Countries, first.Regions)
+	}
+
+	// Re-ingest with different geography: EXCLUDED.* refreshes the columns.
+	p2 := ingestParams("acme:geo", "Geo Job")
+	p2.Countries = []string{"gb"}
+	p2.Regions = []string{"uk"}
+	second, err := ingestUpsert(ctx, q, p2)
+	if err != nil {
+		t.Fatalf("re-upsert: %v", err)
+	}
+	if second.ID != first.ID {
+		t.Fatalf("re-ingest created a new row — dedup broken")
+	}
+	if !reflect.DeepEqual(second.Countries, []string{"gb"}) || !reflect.DeepEqual(second.Regions, []string{"uk"}) {
+		t.Errorf("after re-ingest countries=%v regions=%v, want [gb]/[uk]", second.Countries, second.Regions)
+	}
+
+	// A posting with no parsed geography (nil args) stores empty arrays via
+	// COALESCE, not NULL — and reads back as empty (emit_empty_slices), not nil.
+	nilJob, err := ingestUpsert(ctx, q, ingestParams("acme:nilgeo", "No Geo"))
+	if err != nil {
+		t.Fatalf("upsert nil geo: %v", err)
+	}
+	if len(nilJob.Countries) != 0 || len(nilJob.Regions) != 0 {
+		t.Errorf("countries=%v regions=%v, want empty arrays for unresolved location", nilJob.Countries, nilJob.Regions)
+	}
+}
+
+func TestUpdateJobDerivedBackfillsAllColumns(t *testing.T) {
+	pool := startPostgres(t)
+	q := New(pool)
+	ctx := context.Background()
+	truncate(t, pool)
+
+	job, err := ingestUpsert(ctx, q, ingestParams("acme:backfill", "Backfill Job"))
+	if err != nil {
+		t.Fatalf("upsert: %v", err)
+	}
+	if len(job.Countries) != 0 {
+		t.Fatalf("precondition: want empty geography, got %v", job.Countries)
+	}
+
+	// Carry the row's existing slugs/fingerprint through so this facet-focused
+	// assertion does not blank the columns UpdateJobDerived also owns.
+	if err := q.UpdateJobDerived(ctx, UpdateJobDerivedParams{
+		ID:              job.ID,
+		Countries:       []string{"de"},
+		Regions:         []string{"eu"},
+		WorkMode:        "remote",
+		Skills:          []string{"go"},
+		Seniority:       "senior",
+		Category:        "backend",
+		RoleFingerprint: job.RoleFingerprint,
+		PublicSlug:      job.PublicSlug,
+		CompanySlug:     job.CompanySlug,
+	}); err != nil {
+		t.Fatalf("update derived: %v", err)
+	}
+
+	got, err := q.GetJob(ctx, job.ID)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if !reflect.DeepEqual(got.Countries, []string{"de"}) || !reflect.DeepEqual(got.Regions, []string{"eu"}) {
+		t.Errorf("after backfill countries=%v regions=%v, want [de]/[eu]", got.Countries, got.Regions)
+	}
+	if got.WorkMode != "remote" || got.Seniority != "senior" || got.Category != "backend" {
+		t.Errorf("scalars = {%q %q %q}, want {remote senior backend}", got.WorkMode, got.Seniority, got.Category)
+	}
+	if !reflect.DeepEqual(got.Skills, []string{"go"}) {
+		t.Errorf("skills = %v, want [go]", got.Skills)
+	}
+}
+
+func TestListJobsOrdersByNewestAdded(t *testing.T) {
+	pool := startPostgres(t)
+	q := New(pool)
+	ctx := context.Background()
+	truncate(t, pool)
+
+	// "older" is ingested first but carries a NEWER platform posted_at than
+	// "newer" — under posted_at ordering it would wrongly stay on top.
+	older := ingestParams("order-a", "Older addition")
+	older.PostedAt = pgtype.Timestamptz{Time: time.Now(), Valid: true}
+	if _, err := ingestUpsert(ctx, q, older); err != nil {
+		t.Fatal(err)
+	}
+	newer := ingestParams("order-b", "Newer addition")
+	newer.PostedAt = pgtype.Timestamptz{Time: time.Now().Add(-30 * 24 * time.Hour), Valid: true}
+	if _, err := ingestUpsert(ctx, q, newer); err != nil {
+		t.Fatal(err)
+	}
+
+	jobs, err := q.ListJobs(ctx, ListJobsParams{Limit: 10, Offset: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(jobs) != 2 {
+		t.Fatalf("jobs = %d, want 2", len(jobs))
+	}
+	if jobs[0].ExternalID != "order-b" || jobs[1].ExternalID != "order-a" {
+		t.Errorf("order = [%s, %s], want newest-added first [order-b, order-a]",
+			jobs[0].ExternalID, jobs[1].ExternalID)
+	}
+}
+
+// TestListJobsOpenOnlyAndEstimate covers the DB-backed /jobs list contract after
+// the index+estimate change: ListJobs returns only open jobs (closed_at IS NULL)
+// newest-added first, and EstimateOpenJobs returns a non-negative approximate
+// open-job total (the Postgres planner estimate, meaningful once stats exist).
+func TestListJobsOpenOnlyAndEstimate(t *testing.T) {
+	pool := startPostgres(t)
+	q := New(pool)
+	ctx := context.Background()
+	truncate(t, pool)
+
+	// Three open jobs, ingested oldest-first so newest-added is est-c.
+	for _, id := range []string{"est-a", "est-b", "est-c"} {
+		if _, err := ingestUpsert(ctx, q, ingestParams(id, "Title "+id)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// One closed job: it must be excluded from both the list and the estimate.
+	closed, err := ingestUpsert(ctx, q, ingestParams("est-closed", "Closed one"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, "UPDATE jobs SET closed_at = now() WHERE id = $1", closed.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	jobs, err := q.ListJobs(ctx, ListJobsParams{Limit: 10, Offset: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// len 3 of 4 total (3 open + 1 closed) proves the closed job is excluded.
+	if len(jobs) != 3 {
+		t.Fatalf("ListJobs len = %d, want 3 (closed excluded)", len(jobs))
+	}
+	if jobs[0].ExternalID != "est-c" || jobs[2].ExternalID != "est-a" {
+		t.Errorf("order = [%s..%s], want newest-added first (est-c..est-a)",
+			jobs[0].ExternalID, jobs[2].ExternalID)
+	}
+
+	// The planner estimate is only meaningful once the table has statistics.
+	if _, err := pool.Exec(ctx, "ANALYZE jobs"); err != nil {
+		t.Fatal(err)
+	}
+	est, err := q.EstimateOpenJobs(ctx)
+	if err != nil {
+		t.Fatalf("EstimateOpenJobs: %v", err)
+	}
+	if est < 1 {
+		t.Errorf("EstimateOpenJobs = %d, want >= 1 (open jobs present)", est)
+	}
+}
+
+// TestListJobsExcludesPrivateJobs covers the jd-tailor-intake gate: a private job (see
+// jobs.is_private) is open (closed_at IS NULL) and not a repost, yet must never appear in
+// the public DB-backed list or its total — it is visible only to its creator, through a
+// different read path (GetJobBySlug, gated in the handler layer).
+func TestListJobsExcludesPrivateJobs(t *testing.T) {
+	pool := startPostgres(t)
+	q := New(pool)
+	ctx := context.Background()
+	truncate(t, pool)
+
+	if _, err := ingestUpsert(ctx, q, ingestParams("priv-public", "A public job")); err != nil {
+		t.Fatal(err)
+	}
+	private, err := ingestUpsert(ctx, q, ingestParams("priv-private", "A private job"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, "UPDATE jobs SET is_private = true WHERE id = $1", private.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	jobs, err := q.ListJobs(ctx, ListJobsParams{Limit: 10, Offset: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(jobs) != 1 || jobs[0].ExternalID != "priv-public" {
+		t.Fatalf("ListJobs = %+v, want only the public job", jobs)
+	}
+
+	if _, err := pool.Exec(ctx, "ANALYZE jobs"); err != nil {
+		t.Fatal(err)
+	}
+	est, err := q.EstimateOpenJobs(ctx)
+	if err != nil {
+		t.Fatalf("EstimateOpenJobs: %v", err)
+	}
+	// A loose bound, like the planner-estimate check above: without the fix, both the
+	// public and the private row are open and count toward the estimate (>= 2); the
+	// meaningful assertion is that the private row was excluded, not an exact total.
+	if est >= 2 {
+		t.Errorf("EstimateOpenJobs = %d, want < 2 (the private job excluded from the estimate)", est)
+	}
+}
+
+func TestListJobIDsWithUSSubdivisionCollision(t *testing.T) {
+	pool := startPostgres(t)
+	q := New(pool)
+	ctx := context.Background()
+	truncate(t, pool)
+
+	// A real US-state collision (freehire#3113): location trails ", IN" and the
+	// currently stored countries facet (pre-fix) wrongly carries "in".
+	collision := ingestParams("acme:collision", "Collision Job")
+	collision.Location = "Carmel, IN"
+	collision.Countries = []string{"in"}
+	collidingJob, err := ingestUpsert(ctx, q, collision)
+	if err != nil {
+		t.Fatalf("upsert colliding job: %v", err)
+	}
+
+	// A genuine India posting written the same "City, CC" way: the broad regex also
+	// matches it, by design — the candidate list is over-inclusive, and the recompute
+	// in the caller is what decides.
+	genuine := ingestParams("acme:genuine", "Genuine India Job")
+	genuine.Location = "Bangalore, IN"
+	genuine.Countries = []string{"in"}
+	genuineJob, err := ingestUpsert(ctx, q, genuine)
+	if err != nil {
+		t.Fatalf("upsert genuine india job: %v", err)
+	}
+
+	// An unrelated US posting: no colliding code in the location, must not appear.
+	unrelated := ingestParams("acme:unrelated", "Unrelated Job")
+	unrelated.Location = "Austin, TX"
+	unrelated.Countries = []string{"us"}
+	if _, err := ingestUpsert(ctx, q, unrelated); err != nil {
+		t.Fatalf("upsert unrelated job: %v", err)
+	}
+
+	ids, err := q.ListJobIDsWithUSSubdivisionCollision(ctx)
+	if err != nil {
+		t.Fatalf("ListJobIDsWithUSSubdivisionCollision: %v", err)
+	}
+
+	want := map[int64]bool{collidingJob.ID: true, genuineJob.ID: true}
+	got := map[int64]bool{}
+	for _, id := range ids {
+		got[id] = true
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("candidate ids = %v, want exactly %v (the unrelated US job must be excluded)", got, want)
+	}
+}

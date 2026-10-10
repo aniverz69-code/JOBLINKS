@@ -1,0 +1,120 @@
+//go:build integration
+
+// Integration test for GET /api/v1/me/tracking/analyses: lists the caller's analysed
+// jobs (newest first, including closed ones) with the fit-analysis quota in meta.
+// Run with: go test -tags=integration ./internal/api/handler/
+package handler
+
+import (
+	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+	"time"
+
+	"github.com/gofiber/fiber/v2"
+
+	"github.com/strelov1/freehire/internal/ai/plan"
+	"github.com/strelov1/freehire/internal/candidate/fitanalysis"
+	"github.com/strelov1/freehire/internal/candidate/matchanalysis"
+	"github.com/strelov1/freehire/internal/candidate/resume"
+	"github.com/strelov1/freehire/internal/identity/auth"
+	"github.com/strelov1/freehire/internal/identity/userprofile"
+	"github.com/strelov1/freehire/internal/platform/db"
+)
+
+func TestListMyAnalysesEndpoint(t *testing.T) {
+	pool := startPostgres(t)
+	ctx := context.Background()
+	queries := db.New(pool)
+
+	var userID int64
+	if err := pool.QueryRow(ctx,
+		`INSERT INTO users (email) VALUES ('analyses@example.test') RETURNING id`).Scan(&userID); err != nil {
+		t.Fatalf("seed user: %v", err)
+	}
+	seedJob := func(slug string, closed bool) int64 {
+		var id int64
+		closedAt := "NULL"
+		if closed {
+			closedAt = "now()"
+		}
+		if err := pool.QueryRow(ctx,
+			`INSERT INTO jobs (source, external_id, url, title, description, company, public_slug, content_hash, closed_at)
+			 VALUES ('test',$1,'http://e.test','Role '||$1,'desc','Acme',$1,'h', `+closedAt+`) RETURNING id`,
+			slug).Scan(&id); err != nil {
+			t.Fatalf("seed job %s: %v", slug, err)
+		}
+		return id
+	}
+	seedAnalysis := func(jobID int64, score int, verdict string, age time.Duration) {
+		blob, _ := json.Marshal(&matchanalysis.Analysis{OverallScore: score, Verdict: verdict})
+		if _, err := pool.Exec(ctx,
+			`INSERT INTO user_job_analysis (user_id, job_id, analysis, model, created_at)
+			 VALUES ($1,$2,$3,'model-x', now() - $4::interval)`,
+			userID, jobID, blob, age.String()); err != nil {
+			t.Fatalf("seed analysis: %v", err)
+		}
+	}
+
+	openID := seedJob("open-role", false)
+	closedID := seedJob("closed-role", true)
+	seedAnalysis(openID, 82, "Strong Fit", time.Hour)    // newer
+	seedAnalysis(closedID, 44, "Weak Fit", 48*time.Hour) // older
+
+	iss := auth.NewIssuer("test-secret", time.Hour)
+	token, _ := iss.Issue(userID, testTokenVersion)
+
+	store := resume.New(newFakeResumeBlobs(), &fakeResumeRepo{})
+	if _, err := store.Put(ctx, userID, "text/plain", []byte("5y Go.")); err != nil {
+		t.Fatalf("seed CV: %v", err)
+	}
+
+	an := matchanalysis.NewAnalyzer(nil)
+	h := &matchHandlers{
+		queries:     queries,
+		userProfile: userprofile.New(ownedProfile()),
+		resume:      store, matchAnalysis: an,
+		fit: fitanalysis.New(queries,
+			plan.NewStore(queries, pool, plan.DefaultConfig().Enforcing()), an),
+	}
+	app := fiber.New(fiber.Config{ErrorHandler: RenderError})
+	app.Get("/api/v1/me/tracking/analyses", auth.RequireAuth(iss, testVersions), h.ListMyAnalyses)
+
+	req := httptest.NewRequest(fiber.MethodGet, "/api/v1/me/tracking/analyses", nil)
+	req.AddCookie(&http.Cookie{Name: auth.CookieName, Value: token})
+	resp, err := app.Test(req)
+	if err != nil {
+		t.Fatalf("request: %v", err)
+	}
+	defer resp.Body.Close()
+
+	var body struct {
+		Data []myAnalysisItem `json:"data"`
+		Meta struct {
+			Allowance *allowanceView `json:"allowance"`
+		} `json:"meta"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.StatusCode != fiber.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	if len(body.Data) != 2 {
+		t.Fatalf("got %d items, want 2", len(body.Data))
+	}
+	// Newest first: the open role (analysed 1h ago) precedes the closed one (48h ago).
+	if body.Data[0].Slug != "open-role" || body.Data[0].OverallScore != 82 || body.Data[0].Verdict != "Strong Fit" || body.Data[0].Closed {
+		t.Errorf("item0 = %+v, want open-role/82/Strong Fit/open", body.Data[0])
+	}
+	if body.Data[1].Slug != "closed-role" || !body.Data[1].Closed {
+		t.Errorf("item1 = %+v, want closed-role with Closed=true", body.Data[1])
+	}
+	// The two seeded analyses were inserted directly (nothing consumed), so the day's
+	// allowance reads untouched in meta.
+	if body.Meta.Allowance == nil || body.Meta.Allowance.Used != 0 {
+		t.Errorf("allowance = %+v, want nothing used today", body.Meta.Allowance)
+	}
+}

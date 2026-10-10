@@ -1,0 +1,342 @@
+package main
+
+import (
+	"context"
+	"errors"
+	"reflect"
+	"slices"
+	"testing"
+	"time"
+
+	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgtype"
+
+	"github.com/strelov1/freehire/internal/platform/db"
+	"github.com/strelov1/freehire/internal/search/search"
+)
+
+// The reindex feed deliberately includes closed jobs: open ones are upserted as
+// documents, closed ones become deletions so they leave the index (job-search
+// spec: the index contains only open jobs).
+func TestSplitJobs_OpenBecomeDocsClosedBecomeDeletions(t *testing.T) {
+	open := db.Job{ID: 1, Title: "Open", PublicSlug: "open-x", Category: "backend", Description: "<p>Build things.</p>"}
+	closed := db.Job{ID: 2, Title: "Closed", PublicSlug: "closed-x",
+		ClosedAt: pgtype.Timestamptz{Time: open.CreatedAt.Time, Valid: true}}
+
+	docs, deleteIDs, err := splitJobs([]db.Job{open, closed}, nil, nil, time.Now())
+	if err != nil {
+		t.Fatalf("splitJobs: %v", err)
+	}
+	if len(docs) != 1 || docs[0].ID != 1 {
+		t.Fatalf("docs = %+v, want only the open job", docs)
+	}
+	if len(deleteIDs) != 1 || deleteIDs[0] != 2 {
+		t.Fatalf("deleteIDs = %v, want [2]", deleteIDs)
+	}
+}
+
+// A non-canonical repost (duplicate_of set) must not be indexed, and is deleted from
+// the index so a previously-canonical row that got demoted leaves search.
+func TestSplitJobs_RepostsDeletedNotIndexed(t *testing.T) {
+	canon := db.Job{ID: 1, Title: "Canon", PublicSlug: "canon-x", Category: "backend", Description: "<p>Build things.</p>"}
+	repost := db.Job{ID: 2, Title: "Repost", PublicSlug: "repost-x",
+		DuplicateOf: pgtype.Int8{Int64: 1, Valid: true}}
+
+	docs, deleteIDs, err := splitJobs([]db.Job{canon, repost}, nil, nil, time.Now())
+	if err != nil {
+		t.Fatalf("splitJobs: %v", err)
+	}
+	if len(docs) != 1 || docs[0].ID != 1 {
+		t.Fatalf("docs = %+v, want only the canon", docs)
+	}
+	if len(deleteIDs) != 1 || deleteIDs[0] != 2 {
+		t.Fatalf("deleteIDs = %v, want [2] (repost removed)", deleteIDs)
+	}
+}
+
+// A private job (the jd-tailor-intake path: pasted text or an unrecognized-URL scrape)
+// must never become a search document, whatever its open/closed state — see the job-search
+// capability delta in openspec/changes/jd-tailor-intake.
+func TestSplitJobs_PrivateJobsAreDeletedNotIndexed(t *testing.T) {
+	public := db.Job{ID: 1, Title: "Public", PublicSlug: "public-x", Category: "backend", Description: "<p>Build things.</p>"}
+	private := db.Job{ID: 2, Title: "Private", PublicSlug: "private-x", IsPrivate: true}
+
+	docs, deleteIDs, err := splitJobs([]db.Job{public, private}, nil, nil, time.Now())
+	if err != nil {
+		t.Fatalf("splitJobs: %v", err)
+	}
+	if len(docs) != 1 || docs[0].ID != 1 {
+		t.Fatalf("docs = %+v, want only the public job", docs)
+	}
+	if len(deleteIDs) != 1 || deleteIDs[0] != 2 {
+		t.Fatalf("deleteIDs = %v, want [2] (private job removed)", deleteIDs)
+	}
+}
+
+// A job whose category neither the title dictionary nor the LLM ever resolved must not
+// be indexed, and is deleted so a stale pre-rule copy leaves the index (see
+// search.CategoryUnresolved and internal/search/AGENTS.md).
+func TestSplitJobs_CategoryUnresolvedDeletedNotIndexed(t *testing.T) {
+	categorized := db.Job{ID: 1, Title: "Backend Engineer", PublicSlug: "backend-x", Category: "backend", Description: "<p>Build things.</p>"}
+	unresolved := db.Job{ID: 2, Title: "Overnight Stocking", PublicSlug: "stocking-x"}
+	llmOther := db.Job{ID: 3, Title: "Mystery Role", PublicSlug: "mystery-x",
+		Enrichment: []byte(`{"category":"other"}`)}
+
+	docs, deleteIDs, err := splitJobs([]db.Job{categorized, unresolved, llmOther}, nil, nil, time.Now())
+	if err != nil {
+		t.Fatalf("splitJobs: %v", err)
+	}
+	if len(docs) != 1 || docs[0].ID != 1 {
+		t.Fatalf("docs = %+v, want only the categorized job", docs)
+	}
+	if got, want := deleteIDs, []int64{2, 3}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("deleteIDs = %v, want %v", got, want)
+	}
+}
+
+// A posting whose detail fetch never landed carries a title and nothing under it. It is a
+// legitimate row (a later crawl can still hydrate it) but not a listing anyone can read, so it
+// is kept out of the index and deleted from it — and re-enters by itself once the body arrives.
+// Markup with no words in it counts as empty. freehire#1866.
+func TestSplitJobs_BodylessJobsDeletedNotIndexed(t *testing.T) {
+	readable := db.Job{ID: 1, Title: "Backend Engineer", PublicSlug: "backend-x",
+		Category: "backend", Description: "<p>Build things.</p>"}
+	bodyless := db.Job{ID: 2, Title: "Backend Engineer", PublicSlug: "bodyless-x", Category: "backend"}
+	markupOnly := db.Job{ID: 3, Title: "Backend Engineer", PublicSlug: "markup-x",
+		Category: "backend", Description: "<p>&nbsp;</p>"}
+
+	docs, deleteIDs, err := splitJobs([]db.Job{readable, bodyless, markupOnly}, nil, nil, time.Now())
+	if err != nil {
+		t.Fatalf("splitJobs: %v", err)
+	}
+	if len(docs) != 1 || docs[0].ID != 1 {
+		t.Fatalf("docs = %+v, want only the job with a body", docs)
+	}
+	if got, want := deleteIDs, []int64{2, 3}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("deleteIDs = %v, want %v", got, want)
+	}
+}
+
+// A canonical row's document is widened with the geography of every open row it REPRESENTS —
+// its duplicate closure — so a collapsed multi-country role stays findable by every country the
+// rows it hides are open in.
+//
+// The lookup is keyed by job id alone. That is the fix for issue #2225: keyed by
+// (company_slug, role_fingerprint) it could only ever see the exact role pass's clusters, and
+// the two passes that suppress rows with DIFFERING fingerprints contributed nothing. This
+// fixture therefore carries NO fingerprint, and the union still arrives.
+func TestSplitJobs_CanonGetsClosureGeoUnion(t *testing.T) {
+	canon := db.Job{
+		ID: 1, Title: "Senior Engineer", PublicSlug: "senior-engineer-acme-x",
+		CompanySlug: "acme",
+		Countries:   []string{"de"}, Regions: []string{"eu"}, Cities: []string{"München"},
+		Category: "backend", Description: "<p>Build things.</p>",
+	}
+	geo := func(ownerID int64) ([]string, []string, []string) {
+		if ownerID == 1 {
+			return []string{"at", "de", "pl"}, []string{"eu"}, []string{"München", "Wien"}
+		}
+		return nil, nil, nil
+	}
+
+	docs, _, err := splitJobs([]db.Job{canon}, nil, geo, time.Now())
+	if err != nil {
+		t.Fatalf("splitJobs: %v", err)
+	}
+	if len(docs) != 1 {
+		t.Fatalf("docs = %+v, want one canon", docs)
+	}
+	if got, want := docs[0].Countries, []string{"at", "de", "pl"}; !reflect.DeepEqual(got, want) {
+		t.Errorf("countries = %v, want closure union %v", got, want)
+	}
+	if got, want := docs[0].Cities, []string{"München", "Wien"}; !reflect.DeepEqual(got, want) {
+		t.Errorf("cities = %v, want closure union %v", got, want)
+	}
+}
+
+// A row the closure query left out (it represents nobody) keeps its own geography. The lookup
+// miss must be a no-op, never a narrowing: the push carries all three facets, so a writer that
+// treated "absent" as "empty" would REPLACE a widened canon with its own values.
+func TestSplitJobs_ClosureMissLeavesGeographyAlone(t *testing.T) {
+	solo := db.Job{
+		ID: 7, Title: "Solo Engineer", PublicSlug: "solo-engineer-acme-x",
+		CompanySlug: "acme",
+		Countries:   []string{"de"}, Regions: []string{"eu"}, Cities: []string{"München"},
+		Category: "backend", Description: "<p>Build things.</p>",
+	}
+	geo := func(int64) ([]string, []string, []string) { return nil, nil, nil }
+
+	docs, _, err := splitJobs([]db.Job{solo}, nil, geo, time.Now())
+	if err != nil {
+		t.Fatalf("splitJobs: %v", err)
+	}
+	if len(docs) != 1 {
+		t.Fatalf("docs = %+v, want one row", docs)
+	}
+	if got, want := docs[0].Countries, []string{"de"}; !reflect.DeepEqual(got, want) {
+		t.Errorf("countries = %v, want its own %v", got, want)
+	}
+	if got, want := docs[0].Cities, []string{"München"}; !reflect.DeepEqual(got, want) {
+		t.Errorf("cities = %v, want its own %v", got, want)
+	}
+}
+
+// fakeRebuilder records the sequence of rebuilder calls and the ids of every
+// pushed batch, so a unit test can pin the full-rebuild orchestration without a
+// real Meilisearch.
+type fakeRebuilder struct {
+	calls   []string
+	pushed  [][]int64
+	pushErr error // when set, Push returns it after recording — simulates a mid-build abort
+}
+
+func (f *fakeRebuilder) Prepare(context.Context) error {
+	f.calls = append(f.calls, "prepare")
+	return nil
+}
+
+func (f *fakeRebuilder) Push(_ context.Context, docs []search.JobDocument) error {
+	f.calls = append(f.calls, "push")
+	ids := make([]int64, len(docs))
+	for i, d := range docs {
+		ids[i] = d.ID
+	}
+	f.pushed = append(f.pushed, ids)
+	return f.pushErr
+}
+
+func (f *fakeRebuilder) Promote(context.Context) error {
+	f.calls = append(f.calls, "promote")
+	return nil
+}
+
+func (f *fakeRebuilder) Cleanup(context.Context) error {
+	f.calls = append(f.calls, "cleanup")
+	return nil
+}
+
+// A full rebuild streams ONLY open jobs into a fresh index (closed jobs are
+// simply absent — the fresh index never held them, so there is nothing to
+// delete), then promotes exactly once at the end.
+func TestReindexFull_PushesOpenDocsThenPromotes(t *testing.T) {
+	open1 := db.Job{ID: 1, Title: "A", PublicSlug: "a", Category: "backend", Description: "<p>Build things.</p>"}
+	closed := db.Job{ID: 2, Title: "B", PublicSlug: "b",
+		ClosedAt: pgtype.Timestamptz{Time: time.Unix(1, 0), Valid: true}}
+	open3 := db.Job{ID: 3, Title: "C", PublicSlug: "c", Category: "backend", Description: "<p>Build things.</p>"}
+	page := []db.Job{open1, closed, open3}
+
+	reader := &fakePageReader{pages: map[int64][]db.Job{0: page}}
+
+	f := &fakeRebuilder{}
+	indexed, skipped, err := reindexFull(context.Background(), reader, f, nil, nil, time.Now())
+	if err != nil {
+		t.Fatalf("reindexFull: %v", err)
+	}
+	if indexed != 2 {
+		t.Errorf("indexed = %d, want 2 (open jobs only)", indexed)
+	}
+	if skipped != 0 {
+		t.Errorf("skipped = %d, want 0", skipped)
+	}
+	wantCalls := []string{"prepare", "push", "promote"}
+	if !reflect.DeepEqual(f.calls, wantCalls) {
+		t.Errorf("calls = %v, want %v", f.calls, wantCalls)
+	}
+	if len(f.pushed) != 1 || !reflect.DeepEqual(f.pushed[0], []int64{1, 3}) {
+		t.Errorf("pushed = %v, want [[1 3]] (closed job 2 skipped)", f.pushed)
+	}
+}
+
+// An aborted rebuild (Push fails mid-build, so Promote's swap-and-drop never runs)
+// must drop its half-built rebuild index via the deferred Cleanup — otherwise the
+// orphan index eats disk until the next run's Prepare clears it.
+func TestReindexFull_CleansUpOnAbort(t *testing.T) {
+	reader := &fakePageReader{pages: map[int64][]db.Job{0: {{ID: 1, Title: "A", PublicSlug: "a", Category: "backend", Description: "<p>Build things.</p>"}}}}
+	f := &fakeRebuilder{pushErr: errors.New("push boom")}
+
+	_, _, err := reindexFull(context.Background(), reader, f, nil, nil, time.Now())
+	if err == nil {
+		t.Fatal("expected reindexFull to return the push error")
+	}
+	if !slices.Contains(f.calls, "cleanup") {
+		t.Errorf("expected cleanup after abort, calls = %v", f.calls)
+	}
+	if slices.Contains(f.calls, "promote") {
+		t.Errorf("promote must not run after a push abort, calls = %v", f.calls)
+	}
+}
+
+// A successful rebuild swaps-and-drops in Promote, so the deferred Cleanup must NOT
+// run — a second drop of the (already-swapped) rebuild uid is pointless work.
+func TestReindexFull_NoCleanupOnSuccess(t *testing.T) {
+	reader := &fakePageReader{pages: map[int64][]db.Job{0: {{ID: 1, Title: "A", PublicSlug: "a", Category: "backend", Description: "<p>Build things.</p>"}}}}
+	f := &fakeRebuilder{}
+
+	if _, _, err := reindexFull(context.Background(), reader, f, nil, nil, time.Now()); err != nil {
+		t.Fatalf("reindexFull: %v", err)
+	}
+	if slices.Contains(f.calls, "cleanup") {
+		t.Errorf("cleanup must not run on success, calls = %v", f.calls)
+	}
+}
+
+// A corrupted row (its Batch read faults with XX001) must not abort the rebuild:
+// ResilientPage degrades to per-row reads, the corrupted row is skipped, the rest
+// are indexed, and the fresh index still promotes.
+func TestReindexFull_SkipsCorruptedRowAndPromotes(t *testing.T) {
+	reader := &fakePageReader{
+		corruptAfter: map[int64]bool{0: true},
+		idPages:      map[int64][]int64{0: {1, 2, 3}},
+		rows: map[int64]db.Job{
+			1: {ID: 1, Title: "A", PublicSlug: "a", Category: "backend", Description: "<p>Build things.</p>"},
+			3: {ID: 3, Title: "C", PublicSlug: "c", Category: "backend", Description: "<p>Build things.</p>"},
+		},
+		rowCorrupt: map[int64]bool{2: true},
+	}
+
+	f := &fakeRebuilder{}
+	indexed, skipped, err := reindexFull(context.Background(), reader, f, nil, nil, time.Now())
+	if err != nil {
+		t.Fatalf("reindexFull: %v", err)
+	}
+	if indexed != 2 || skipped != 1 {
+		t.Errorf("indexed=%d skipped=%d, want indexed=2 skipped=1", indexed, skipped)
+	}
+	if len(f.pushed) == 0 || !reflect.DeepEqual(f.pushed[0], []int64{1, 3}) {
+		t.Errorf("pushed = %v, want [[1 3]] (corrupted row 2 skipped)", f.pushed)
+	}
+	if f.calls[len(f.calls)-1] != "promote" {
+		t.Errorf("expected promote at the end, calls = %v", f.calls)
+	}
+}
+
+// fakePageReader implements worker.PageReader. Batch returns pages[afterID], or
+// faults with XX001 when corruptAfter[afterID] is set (driving the degrade path,
+// which then reads idPages[afterID] and rows[id], faulting on rowCorrupt[id]).
+type fakePageReader struct {
+	pages        map[int64][]db.Job
+	corruptAfter map[int64]bool
+	idPages      map[int64][]int64
+	rows         map[int64]db.Job
+	rowCorrupt   map[int64]bool
+}
+
+func xx001() error { return &pgconn.PgError{Code: "XX001"} }
+
+func (f *fakePageReader) Batch(_ context.Context, afterID int64, _ int32) ([]db.Job, error) {
+	if f.corruptAfter[afterID] {
+		return nil, xx001()
+	}
+	return f.pages[afterID], nil
+}
+
+func (f *fakePageReader) IDs(_ context.Context, afterID int64, _ int32) ([]int64, error) {
+	return f.idPages[afterID], nil
+}
+
+func (f *fakePageReader) Row(_ context.Context, id int64) (db.Job, error) {
+	if f.rowCorrupt[id] {
+		return db.Job{}, xx001()
+	}
+	return f.rows[id], nil
+}

@@ -1,0 +1,210 @@
+import { describe, it, expect } from 'vitest';
+import {
+  accountSteps,
+  outstandingOf,
+  stepLeadsSomewhere,
+  type CompletenessInput,
+} from './accountCompleteness';
+import type { UserProfile } from './types';
+
+// What the account card measures. The predicates are the whole point of the module, so
+// they are asserted one at a time: a step that silently reads as done is a funnel that
+// tells someone they have finished when they have not.
+
+const profile = (patch: Partial<UserProfile> = {}): UserProfile =>
+  ({
+    specializations: [],
+    skills: [],
+    seniorities: [],
+    excluded_skills: [],
+    location_preferences: null,
+    derived_location: null,
+    cv: null,
+    created_at: null,
+    updated_at: null,
+    ...patch,
+  }) as UserProfile;
+
+const empty: CompletenessInput = { hasCv: false, profile: null, alertCount: 0 };
+
+const doneIds = (input: CompletenessInput) =>
+  accountSteps(input)
+    .filter((s) => s.done)
+    .map((s) => s.id);
+
+describe('accountSteps', () => {
+  it('reports every step outstanding for a fresh account', () => {
+    const steps = accountSteps(empty);
+    expect(steps.length).toBeGreaterThan(0);
+    expect(steps.every((s) => !s.done)).toBe(true);
+    expect(outstandingOf(steps)).toHaveLength(steps.length);
+  });
+
+  it('gives every step a label and a link to where it is done', () => {
+    for (const step of accountSteps(empty)) {
+      expect(step.label.trim()).not.toBe('');
+      expect(step.href.startsWith('/')).toBe(true);
+    }
+  });
+
+  // skills and location are their own routes under /my/profile; cv and role are both on
+  // its default section, and alerts points at another page entirely. Notably NOT /my/cvs
+  // for the CV step — that route is the per-vacancy builder and takes no upload.
+  it('links each step straight to the route it is done on', () => {
+    const hrefById = Object.fromEntries(accountSteps(empty).map((s) => [s.id, s.href]));
+    expect(hrefById).toEqual({
+      cv: '/my/profile',
+      role: '/my/profile',
+      skills: '/my/profile/skills',
+      location: '/my/profile/location',
+      alerts: '/my/searches',
+    });
+  });
+
+  // /my/profile's default section holds three blocks and only one is the step, so both
+  // steps landing there name which. The other three routes ARE their step, so an anchor
+  // would only point at the top of what is already the whole page.
+  it('anchors the two steps that share the crowded default section', () => {
+    const byId = Object.fromEntries(accountSteps(empty).map((s) => [s.id, s.anchorId]));
+    expect(byId.cv).toBe('account-cv');
+    expect(byId.role).toBe('account-role');
+    expect(byId.skills).toBeUndefined();
+    expect(byId.location).toBeUndefined();
+    expect(byId.alerts).toBeUndefined();
+  });
+
+  // Belt to the type's braces: `DefaultSectionStep` already makes the anchor mandatory at
+  // compile time, so this only catches someone loosening that type back to optional.
+  it('leaves no step pointing at /my/profile without an anchor', () => {
+    for (const step of accountSteps(empty)) {
+      if (step.href === '/my/profile') expect(step.anchorId).toBeTruthy();
+    }
+  });
+});
+
+// The whole class of bug this card was reported for: the card is mounted in /my/profile's
+// LAYOUT, so it is on screen for every profile section, and a step must never be offered
+// as a link to the page the reader is already looking at.
+describe('stepLeadsSomewhere', () => {
+  const byId = (id: string) => {
+    const step = accountSteps(empty).find((s) => s.id === id);
+    if (!step) throw new Error(`no step ${id}`);
+    return step;
+  };
+
+  it('sends an anchored step onward even from the page it lives on', () => {
+    expect(stepLeadsSomewhere(byId('cv'), '/my/profile', '/my/profile')).toBe(true);
+    expect(stepLeadsSomewhere(byId('role'), '/my/profile', '/my/profile')).toBe(true);
+  });
+
+  it('refuses an unanchored step whose route is the one on screen', () => {
+    expect(stepLeadsSomewhere(byId('skills'), '/my/profile/skills', '/my/profile/skills')).toBe(false);
+    expect(stepLeadsSomewhere(byId('location'), '/my/profile/location', '/my/profile/location')).toBe(false);
+  });
+
+  it('sends every step onward from a section that is not its own', () => {
+    for (const step of accountSteps(empty)) {
+      expect(stepLeadsSomewhere(step, step.href, '/my/profile/settings')).toBe(true);
+    }
+  });
+
+  // The card passes the RESOLVED href, so both sides carry any base path and the comparison
+  // stays honest. Were only one side resolved, every step would read as the current one.
+  it('compares the two paths as given, base and all', () => {
+    const skills = byId('skills');
+    expect(stepLeadsSomewhere(skills, '/app/my/profile/skills', '/app/my/profile/skills')).toBe(false);
+    expect(stepLeadsSomewhere(skills, '/app/my/profile/skills', '/app/my/profile')).toBe(true);
+  });
+
+  it('counts a CV once one is stored', () => {
+    expect(doneIds({ ...empty, hasCv: true })).toEqual(['cv']);
+  });
+
+  it('wants both a specialization and a seniority before the role step is done', () => {
+    expect(doneIds({ ...empty, profile: profile({ specializations: ['backend'] }) })).toEqual([]);
+    expect(doneIds({ ...empty, profile: profile({ seniorities: ['senior'] }) })).toEqual([]);
+    expect(
+      doneIds({ ...empty, profile: profile({ specializations: ['backend'], seniorities: ['senior'] }) }),
+    ).toEqual(['role']);
+  });
+
+  it('counts skills once the profile names any', () => {
+    expect(doneIds({ ...empty, profile: profile({ skills: ['go'] }) })).toEqual(['skills']);
+  });
+
+  // An empty preferences object is what the API returns for a user who opened the step
+  // and saved nothing, so its mere presence must not read as an answer.
+  it('does not count an empty location block as a stated preference', () => {
+    expect(
+      doneIds({
+        ...empty,
+        profile: profile({
+          location_preferences: { remote: {}, base: {}, relocation: { open: false } },
+        }),
+      }),
+    ).toEqual([]);
+  });
+
+  it('counts location from a work mode, a base or a remote reach', () => {
+    const stated = (patch: Partial<UserProfile['location_preferences'] & object>) =>
+      doneIds({
+        ...empty,
+        profile: profile({
+          location_preferences: { remote: {}, base: {}, relocation: { open: false }, ...patch },
+        }),
+      });
+    expect(stated({ work_modes: ['remote'] })).toEqual(['location']);
+    expect(stated({ base: { country: 'PT' } })).toEqual(['location']);
+    expect(stated({ remote: { countries: ['PT'] } })).toEqual(['location']);
+  });
+
+  it('counts an alert once a subscription exists', () => {
+    expect(doneIds({ ...empty, alertCount: 1 })).toEqual(['alerts']);
+  });
+
+  it('reports a fully set-up account as having nothing outstanding', () => {
+    const full: CompletenessInput = {
+      hasCv: true,
+      profile: profile({
+        specializations: ['backend'],
+        seniorities: ['senior'],
+        skills: ['go'],
+        location_preferences: { work_modes: ['remote'], remote: {}, base: {}, relocation: { open: false } },
+      }),
+      alertCount: 2,
+    };
+    expect(outstandingOf(accountSteps(full))).toEqual([]);
+    expect(accountSteps(full).every((s) => s.done)).toBe(true);
+  });
+
+  // Someone who is not job-hunting right now must be able to say so, rather than being
+  // told forever that one step remains. Dismissal drops the step entirely rather than
+  // marking it done — a done step still counts toward the total, and a step nobody asked
+  // to complete must not inflate it.
+  it('drops the alerts step entirely once dismissed, rather than counting it done', () => {
+    const steps = accountSteps({ ...empty, alertsDismissed: true });
+    expect(steps.map((s) => s.id)).not.toContain('alerts');
+    expect(steps).toHaveLength(4);
+  });
+
+  it('ignores the dismissal once an alert actually exists', () => {
+    expect(doneIds({ ...empty, alertCount: 1, alertsDismissed: true })).toEqual(['alerts']);
+  });
+
+  it('reports a dismissed-but-otherwise-complete account as having nothing outstanding', () => {
+    const full: CompletenessInput = {
+      hasCv: true,
+      profile: profile({
+        specializations: ['backend'],
+        seniorities: ['senior'],
+        skills: ['go'],
+        location_preferences: { work_modes: ['remote'], remote: {}, base: {}, relocation: { open: false } },
+      }),
+      alertCount: 0,
+      alertsDismissed: true,
+    };
+    const steps = accountSteps(full);
+    expect(steps).toHaveLength(4);
+    expect(outstandingOf(steps)).toEqual([]);
+  });
+});

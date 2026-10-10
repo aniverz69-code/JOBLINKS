@@ -1,0 +1,358 @@
+// Package vocab holds the controlled vocabularies that pin down the allowed
+// values of every enum-shaped job facet. It is a neutral, dependency-free home
+// shared by the enrichment contract (internal/ai/enrich), the deterministic
+// dictionaries (internal/dict/classify, internal/dict/location, internal/dict/skilltag's
+// consumers), the source parsers (internal/ingest/sources), and the read side — so an
+// ingest-layer package never has to import the AI-enrichment layer just to
+// reference a canonical value.
+//
+// Keeping the vocabularies here as one definition prevents value fragmentation
+// (e.g. "senior" vs "Senior" vs "sr") across those layers. ISO-standard fields
+// (countries, salary_currency, posting_language) and the open skills field have
+// no bundled closed vocabulary here.
+package vocab
+
+import "regexp"
+
+// Controlled vocabularies. Each is the ordered, canonical list of allowed
+// values for one enum field. They are exported so the enrichment prompt, the
+// deterministic dictionaries, and the facet config reference the same lists.
+var (
+	WorkModeValues = []string{"remote", "hybrid", "onsite"}
+	// RegionValues is the geographic-area vocabulary: a single, consistent macro
+	// level (continents/macro-regions, plus `global` and the distinct `uk` area).
+	// Country codes are NOT regions — country-level filtering lives in the separate
+	// `countries` facet, so the US collapses into `north_america` and Russia into
+	// `cis`. `cis` covers the whole post-Soviet space (Russia, Belarus, Moldova,
+	// the Caucasus, and the five Central Asian republics) that dominates the
+	// Telegram sources.
+	RegionValues = []string{
+		"global", "north_america", "latam", "eu", "uk",
+		"mena", "africa", "apac", "cis",
+	}
+	EmploymentTypeValues = []string{"full_time", "part_time", "contract", "internship", "fellowship"}
+	RelocationValues     = []string{"not_supported", "supported", "required"}
+	SalaryPeriodValues   = []string{"year", "month", "day", "hour"}
+	SeniorityValues      = []string{"intern", "junior", "middle", "senior", "lead", "staff", "principal", "c_level"}
+	// RoleTypeValues answers "does this role manage people?" — an axis none of the
+	// other vocabularies covers. It holds ONE value on purpose. The management side
+	// is legible from a title (`head of`, `director`, a craft-qualified manager);
+	// the individual-contributor side is not, and treating the absence of a marker
+	// as proof of the opposite is exactly the inference the dictionaries in this
+	// repo are forbidden to make. An unresolved posting means "no marker found",
+	// never "individual contributor" — see internal/dict/roletype.
+	RoleTypeValues       = []string{"people_manager"}
+	EnglishLevelValues   = []string{"none", "a1", "a2", "b1", "b2", "c1", "c2", "native"}
+	EducationLevelValues = []string{"none", "bachelor", "master", "phd"}
+	CategoryValues       = []string{
+		// "software_engineering" is the generic bucket for a title the dictionary
+		// confirms is software/IT work (feeds is_tech via classify.IsTech's
+		// techTitleTerms) but that names no sub-discipline to resolve to — a bare
+		// "Software Engineer" or "Java Developer" does not say backend vs frontend
+		// vs fullstack, and classify never guesses. Before this category existed
+		// that population sat at `category = ""` forever (~110k open postings on
+		// prod at introduction) despite being fully enriched; this gives it a home
+		// instead of leaving it unfilterable.
+		"software_engineering",
+		"backend", "frontend", "fullstack", "mobile", "devops", "sre",
+		"network_engineering",
+		"data_engineering", "data_science", "data_analytics", "ml_ai", "ai_engineering",
+		"qa", "security", "hardware", "embedded", "blockchain", "architecture",
+		// "creative" is media production — video, animation, art, audio and
+		// photography. It is a sibling of `design`, not a slice of it: the titles
+		// it claims resolved to NO category before it existed, apart from the
+		// audio designers who sat in `design` for no reason beyond the word
+		// "designer" in the title. Product, motion, graphic, visual and brand
+		// design stay where they are.
+		// "industrial_engineering" is the engineering seat a factory, plant, utility
+		// or field-service organisation staffs — manufacturing, process, quality,
+		// maintenance, controls, commissioning, reliability, field service. It is a
+		// sibling of `engineering_design`, not a slice of it: draughting is drawing
+		// the thing, this is making and running it, and a Quality Engineer is not a
+		// draughtsman. Half the population it names is Russian (`Инженер`,
+		// `Инженер-технолог`, `Инженер ПТО`) and carried no English alias at all.
+		"design", "creative", "engineering_design", "industrial_engineering",
+		// "occupational_safety" is the health, safety and environment seat — the
+		// profession that spells itself HSE, EHS, HSSE, QHSE, HSEQ, SHE, SHEQ and
+		// SHES. It is a sibling of `industrial_engineering`, not a slice of it: that
+		// category is the seat a plant staffs to make and run the thing, this is the
+		// compliance and controls function that audits it, and an HSE Manager is not
+		// a process engineer. Both national occupational classifications place it
+		// this way — SOC minor group 19-5000, under Life/Physical/Social Science, and
+		// ISCO-08 unit group 2263, under Other Health Professionals — and neither
+		// files it under engineering.
+		//
+		// Measured on prod 2026-09-24: the acronyms alone matched 6,254 live
+		// postings, 4,515 of them with no category at all (unreachable from every
+		// facet) and 1,454 sitting in `management` because the bare `manager`
+		// fall-through outranked a block that did not exist.
+		"occupational_safety",
+		"product", "project_management", "management",
+		// The consumer industries a broad multi-industry ATS crawl carries in with the
+		// boards it wants. They are here to be FILTERABLE — a facet excludes as well as
+		// it selects, and 225k unfilterable postings are worse than four options no IT
+		// candidate will choose. Deliberately NOT members of NonTechCraftCategories:
+		// unlike the two engineering categories, these are exactly the non-technical
+		// business cmd/prune's rule exists to remove, and leaving them out is what
+		// keeps categorising them behaviour-neutral.
+		"healthcare", "skilled_trades", "retail", "hospitality",
+		// The service sectors: moving goods, teaching, the front desk, and the
+		// personal and facility services. Same placement as the four above — non-
+		// technical, and deliberately NOT craft-protected.
+		"logistics", "education", "personal_services", "administration",
+		"marketing", "sales", "support",
+		// IT-company roles added by expand-role-taxonomy (4 technical, 6 business)
+		"business_analysis", "solutions_engineering", "developer_relations", "technical_writing",
+		"recruiting", "hr", "finance", "legal", "operations", "customer_success",
+		"other",
+	}
+	// NonTechCategories are the CategoryValues for confidently non-technical roles: a
+	// member feeds `jobderive.deriveIsTech` to `is_tech = false`, and the enrichment
+	// enqueue gate (`internal/platform/db/queries/jobs.sql`'s EnqueueJobEnrichment /
+	// `enrichment.sql`'s EnqueuePendingJobs) reads `is_tech IS TRUE`, so a confirmed
+	// non-tech role never consumes LLM budget. That gate is stricter than this list
+	// alone: it ALSO excludes `is_tech IS NULL` — a category the title dictionary and
+	// description left unresolved in either direction — which used to enqueue by
+	// default (the reasoning then: "never silently skip a tech job the dictionary
+	// missed"). Measured at catalogue scale that unresolved bucket was ~65% of the
+	// open catalogue and enrichment returned nothing useful for ~91% of it (broad
+	// multi-industry ATS crawls), so the coverage it bought no longer justified the
+	// spend — see the enqueue queries' comments for the full reasoning. The back-office
+	// IT-company roles (recruiting/hr/finance/legal/operations/customer_success) join
+	// this set: surfaced as facets but kept out of the LLM enrich budget, like
+	// marketing/sales.
+	// `engineering_design` — mechanical, electrical, civil and architectural draughting
+	// — joins them for the same reason: it is engineering, but not the IT work this
+	// catalogue serves, so it is filterable without spending LLM or embedding budget on
+	// it. Note that two DELETE paths read TechCategories as a veto over the non-tech
+	// title dictionary; `classify.ConfirmedNonTech` and `prune`'s business rule spare
+	// this category explicitly, so membership here does not make its postings
+	// removable.
+	NonTechCategories = []string{
+		"marketing", "sales", "support", "management",
+		"recruiting", "hr", "finance", "legal", "operations", "customer_success",
+		"engineering_design", "industrial_engineering", "occupational_safety",
+		"healthcare", "skilled_trades", "retail", "hospitality",
+		"logistics", "education", "personal_services", "administration",
+	}
+	// NonTechCraftCategories are the NonTechCategories members that are non-technical
+	// because the CRAFT sits outside IT — not because the posting is back-office or
+	// go-to-market work at a software employer. The distinction is not decorative:
+	// `cmd/prune`'s business rule deletes non-technical categories at a company with no
+	// technical history, and applied to these it would take out an engineering
+	// employer's entire catalogue the moment its board was retired. That rule
+	// SUBTRACTS this set.
+	//
+	// It lives here rather than in prune because it states what a category MEANS, and
+	// because the alternative has already been tried: the exception was one category
+	// named inline at the rule, which meant the second craft category could be added to
+	// the vocabulary — by someone with no reason to open cmd/prune — and become
+	// deletable in silence. A test asserts every member is also a NonTechCategories
+	// member, so the two cannot drift.
+	// `occupational_safety` is a member for the same reason, arrived at from the other
+	// direction: an oil & gas, mining or construction employer's HSE department is the
+	// whole non-technical staff it posts, so the business rule applied to it would take
+	// out that employer's catalogue the moment its board was retired.
+	NonTechCraftCategories = []string{"engineering_design", "industrial_engineering", "occupational_safety"}
+	// TechCategories are the CategoryValues for recognized technical roles: every
+	// category that is neither a NonTechCategories member nor the residual "other".
+	// It is the single source of truth for "is this a technical category?" that the
+	// is_tech derivation reads, so the tech/non-tech/other split stays in one place;
+	// a test asserts the three sets partition CategoryValues exactly. Product/design/
+	// project_management — and the IT-product-adjacent business_analysis/
+	// solutions_engineering/developer_relations/technical_writing — count as technical
+	// here (IT-industry roles), so they are enriched; the back-office roles are not.
+	// TechCategories are the categories a TECH COMPANY staffs, which is not the same
+	// question as "is this a technical craft" — and reading it as the second is a trap
+	// with a measurement attached. It carries `product`, `project_management`, `design`,
+	// `creative` and `business_analysis`, correct on a software employer's board and
+	// wrong anywhere the population is not software: an adapter that used it to decide
+	// whether to STORE a posting from a general-population job board took in 23 project
+	// managers (construction, manufacturing, HR payroll), 13 business analysts, 11
+	// product managers and 13 artists and designers out of 159 — plus 45 that came
+	// through the bare `analyst` alias under `data_analytics`, which on a finance board
+	// is VAT, credit control and valuation. Of the same 159, `classify.IsTech` accepted
+	// 17. See internal/ingest/sources/profession.go.
+	//
+	// For "is the CRAFT technical", reach for `classify.IsTech` (strict, software-anchored,
+	// never guesses) and treat this list as the facet vocabulary it is.
+	TechCategories = []string{
+		"software_engineering",
+		"backend", "frontend", "fullstack", "mobile", "devops", "sre",
+		"network_engineering",
+		"data_engineering", "data_science", "data_analytics", "ml_ai", "ai_engineering",
+		"qa", "security", "hardware", "embedded", "blockchain", "architecture",
+		"design", "creative", "product", "project_management",
+		"business_analysis", "solutions_engineering", "developer_relations", "technical_writing",
+	}
+	// DomainValues is the industry/vertical of the company or product behind a job
+	// (what the company does), an LLM-emitted multi-value enum glossed per-value in the
+	// enrichment prompt. Each value names a vertical, never a business model — "saas"
+	// was dropped for that reason (it overlaps every vertical); its coverage moved to
+	// "devtools" and the functional verticals. Synonyms fold into one canonical
+	// (web3->crypto, insurtech->fintech, martech->adtech, social/dating->media,
+	// biotech->healthcare, retail->ecommerce, greentech->climatetech).
+	DomainValues = []string{
+		"fintech", "crypto", "ecommerce", "gambling", "gamedev", "media", "travel",
+		"healthcare", "edtech", "govtech",
+		"devtools", "cybersecurity", "ai", "hrtech", "adtech", "proptech",
+		"logistics", "mobility", "climatetech", "other",
+	}
+	// DomainGloss is the one-line definition of each domain, supplied to the enrichment
+	// LLM so it classifies on what the company does rather than guessing from a bare
+	// name. Every DomainValues entry has a gloss (asserted by a test). "ai" is scoped to
+	// core-product AI so it does not swallow every company that merely uses AI.
+	DomainGloss = map[string]string{
+		"fintech":       "payments, banking, lending, wealth/trading, insurtech, regtech (traditional financial rails)",
+		"crypto":        "blockchain, web3, DeFi, tokens/NFTs, exchanges, on-chain infra",
+		"ecommerce":     "online retail, marketplaces, D2C, retail/checkout/fulfillment tech",
+		"gambling":      "betting, casino/iGaming, sportsbook, lottery",
+		"gamedev":       "video-game development, publishing, game engines/infra",
+		"media":         "content, publishing, streaming, entertainment, social networks, dating, creator economy",
+		"travel":        "travel, hospitality, tourism, booking",
+		"healthcare":    "health-tech, medtech, digital health, biotech, pharma, wellness",
+		"edtech":        "education, e-learning, training, LMS",
+		"govtech":       "government, public sector, civic tech",
+		"devtools":      "developer tools, cloud infra, databases, DevOps, APIs, IT infrastructure",
+		"cybersecurity": "security software, identity, threat detection, appsec, privacy, fraud",
+		"ai":            "company whose CORE PRODUCT is AI/ML (model providers, AI/ML platforms, applied-AI) — NOT merely \"uses AI\"",
+		"hrtech":        "recruiting, HR, payroll, people-ops, staffing software",
+		"adtech":        "advertising and marketing technology (ad serving, attribution, CRM, marketing automation)",
+		"proptech":      "real-estate and construction technology",
+		"logistics":     "supply chain, freight, delivery, fleet, warehousing (goods)",
+		"mobility":      "automotive, autonomous vehicles, ride-hailing, transport of people",
+		"climatetech":   "climate, clean/renewable energy, sustainability",
+		"other":         "none of the above (incl. generic horizontal productivity/CRM SaaS with no vertical)",
+	}
+	CompanyTypeValues = []string{"product", "startup", "outsource", "outstaff", "agency", "inhouse", "government"}
+	// CompanyTypeGloss is the one-line definition of each company_type value, supplied
+	// to the enrichment LLM so it distinguishes them by BUSINESS MODEL rather than
+	// guessing from a bare label — outsource vs outstaff in particular collapse to the
+	// same intuition ("body shop for hire") without an explicit contrast on who manages
+	// the day-to-day work. Every CompanyTypeValues entry has a gloss (asserted by a test).
+	CompanyTypeGloss = map[string]string{
+		"product":    "builds and sells its OWN software product(s) directly to customers — the software is the business itself",
+		"startup":    "early-stage company (a funding/maturity stage, not a service model) — small team, still finding product-market fit",
+		"outsource":  "builds custom software FOR OTHER companies under contract — the vendor's own team manages and delivers whole projects/products for external clients",
+		"outstaff":   "staff augmentation — places its own engineers to work EMBEDDED inside a client's team, day-to-day managed by the CLIENT (contrast with outsource, where the vendor manages delivery)",
+		"agency":     "work-for-hire studio delivering marketing, design, branding, or creative services for clients — the non-engineering-delivery counterpart of outsource",
+		"inhouse":    "an internal engineering/IT team inside a company whose core business is NOT software — builds tools for the company's own operations, not to sell",
+		"government": "a government or public-sector body/agency",
+	}
+	// CompanyFeedbackTypeValues is the closed category vocabulary for a company
+	// feedback/review entry (internal/engage/companyfeedback) — what aspect of the
+	// experience the review is about, Glassdoor-style.
+	CompanyFeedbackTypeValues = []string{
+		"interview", "culture", "compensation", "management",
+		"work_life_balance", "career_growth", "other",
+	}
+	// CompanyFeedbackReportReasonValues is the closed reason vocabulary for
+	// flagging a specific company feedback entry (internal/engage/companyfeedback) —
+	// deliberately smaller than internal/engage/report's job-reasons, since a review
+	// report has no "no longer relevant" or "no response" equivalent.
+	CompanyFeedbackReportReasonValues = []string{"spam", "offensive", "false_information", "other"}
+	// CompanyProcessReportKindValues is the closed vocabulary of candidate-reported
+	// facts about how a company hires (internal/engage/processreport). Unlike a
+	// feedback entry it carries no rating and no text: each value is a statement that
+	// is either true of an employer or not, which is why one reporter is enough to
+	// show it and why there is nothing here for a moderator to decide.
+	//
+	// It is mirrored by a CHECK constraint in migration 0156, and it decides what the
+	// badge renders and what the search facet declares — so a new value is a code
+	// change and a migration, never configuration. Each value additionally needs its
+	// own counter column, which is what keeps the cost of another one visible.
+	CompanyProcessReportKindValues = []string{"ai_interview"}
+	CompanySizeValues              = []string{"1-10", "11-50", "51-200", "201-500", "501-1000", "1000+"}
+	// AIArchetypeValues is the six AI skill-signature archetype slugs
+	// internal/ai/aiarchetype's rule table can derive, in priority order. Kept here
+	// (rather than only inside internal/ai/aiarchetype) so cmd/gen-contracts can emit
+	// it into the web contracts without importing the AI-enrichment layer; a test
+	// in internal/ai/aiarchetype cross-checks this list against the rule table itself.
+	AIArchetypeValues = []string{
+		"rag_app_builder", "agent_builder", "cloud_ml_platform_engineer",
+		"ml_trainer_researcher", "fullstack_ai_engineer", "devops_infra_engineer",
+	}
+	// JobSearchStageValues is how far along the candidate says they are, asked once in
+	// onboarding (internal/candidate/survey). Ordered by commitment rather than by
+	// urgency: `exploring` sits last because someone who says the search is not a
+	// priority is the least engaged, not the earliest — the earliest is `not_started`,
+	// who has decided to start and has not yet.
+	//
+	// This is about the candidate, not about a posting, so unlike every vocabulary above
+	// it reaches no facet, no filter and no enrichment prompt. It lives here anyway for
+	// the reason the package exists: one definition, so the Go validator and the wizard's
+	// option list cannot drift into two spellings of the same answer.
+	JobSearchStageValues = []string{"not_started", "searching", "employed_looking", "exploring"}
+	// JobChallengeValues is the single biggest thing the candidate says is in their way.
+	// Single-valued by design — see the column comment in migration 0134.
+	//
+	// `other` is load-bearing, not filler: it is the ONLY value a free-text note may
+	// accompany, so the survey can collect an unanticipated answer without letting a note
+	// contradict a coded one. TestJobChallengeHasOther locks it.
+	JobChallengeValues = []string{
+		"english", "recruiter_contact", "working_abroad", "technical_interviews",
+		JobChallengeOther,
+	}
+)
+
+// JobChallengeOther is the JobChallengeValues member that admits a written note. Named
+// rather than spelled inline because two places depend on the exact string — the survey's
+// note gate and the vocabulary itself — and a literal in both is a silent drift waiting
+// to happen.
+const JobChallengeOther = "other"
+
+// currencyRE matches a well-formed ISO 4217 currency code.
+var currencyRE = regexp.MustCompile(`^[A-Z]{3}$`)
+
+// IsCurrencyCode reports whether s is a well-formed ISO 4217 code. Shape only: this
+// package documents salary_currency as a deliberately open ISO-standard field, with no
+// closed dictionary to check membership against, so format is the only guarantee
+// available — and callers must not read a true here as "this currency exists".
+//
+// It lives here rather than beside its first caller because it now has two, in blocks
+// that cannot import each other (internal/ingest/screeninganswers holds the desired
+// salary, internal/candidate/survey the current income). The alternative was a second
+// regexp literal, which is how this repository ended up with four disagreeing copies of
+// the legal-form vocabulary.
+func IsCurrencyCode(s string) bool { return currencyRE.MatchString(s) }
+
+// MaxExperienceYears is the largest years-of-experience figure believed to be a
+// statement about the CANDIDATE. It lives here rather than beside any one parser
+// because THREE independent producers write this facet and each could exceed it on
+// its own: a source adapter's structured field, the description parse in
+// internal/job/jobfacts, and the enrichment model in internal/ai/enrich.
+//
+// The failure it bounds is not hallucination. "N years of experience" in a posting can
+// describe the candidate, the employer, or the product, and the three are syntactically
+// identical — only the subject separates them, and no producer is told whose number to
+// take. Measured on prod 2026-09-05: a KLA listing reading "With over 40 years of
+// semiconductor process control experience, chipmakers around the world rely on KLA"
+// stored 40 (the COMPANY's age), and seven smartrecruiters postings stored 84 from a
+// structured field whose descriptions contain no such number at all.
+//
+// A figure past this is DROPPED, never clamped: a clamp would state a requirement the
+// posting never made, while an absent field correctly says "not stated".
+//
+// 25 is where the evidence puts the line, and both sides of it were checked against
+// prod rather than guessed.
+//
+// At and below it, postings really do say this about the candidate: "18+ years of
+// progressively responsible experience", "Minimum of 25 years progressively senior
+// experience" (a Programme Director), "25+ years of investment management experience"
+// (a Senior Portfolio Manager).
+//
+// At and above 30, they do not. Every sampled row at exactly 30 — and there are 19,145
+// of them — is the EMPLOYER's age: "for the past 30 years our long-term commitment to
+// team members has been unsurpassed", "With over 30 years of expertise across Private
+// Equity", "maintained an A+ rating ... for over 30 years". Two of those postings are a
+// Dining Room Server and a Driver.
+//
+// The round-number shape of the whole tail says the same thing: 30 (19,145), 40
+// (12,043), 50 (9,437), 35 (3,194), 45 (2,446). Careers are not round; anniversaries
+// are.
+//
+// An earlier draft of this constant said 30 and cited the same 25-year postings as its
+// reason for being generous. That was measured on the enrichment BLOB, which holds the
+// model's value — 29 rows. The served facet is the COLUMN, written by two other
+// producers, and it carried 28,864. Measure the field a reader actually sees.
+const MaxExperienceYears = 25

@@ -1,0 +1,121 @@
+name: contributors
+
+# Refreshes web/src/lib/data/contributors.json — the snapshot the /contributors pages
+# read. Runs here rather than at request time because the pages need per-person pull
+# request lists, and assembling those needs roughly thirty API calls: far past the 60
+# an unauthenticated IP gets in an hour, a budget the site already spends on the header
+# star badge and /open.
+#
+# IT OPENS A PULL REQUEST; IT DOES NOT PUSH TO MAIN. The first version pushed, and the
+# first real run is what said otherwise: main requires three green checks and enforces
+# them on admins too, so a direct push is rejected for everyone, workflow or human.
+#
+# Which is also why this cannot use the workflow's own GITHUB_TOKEN. A branch pushed
+# with it triggers no workflows — GitHub blocks that to stop a workflow looping on
+# itself — so the pull request would sit with its three required checks forever
+# "expected", unmergeable by anyone. CONTRIBUTORS_TOKEN is a fine-grained personal
+# access token scoped to this repository (contents + pull-requests, write), and a push
+# carrying it runs CI like any other.
+#
+# ONE BRANCH, REUSED. A dated branch per run would leave a trail of stale pull requests
+# every time a day's collection changed nothing anyone merged. Pushing the same branch
+# updates the open pull request in place instead.
+#
+# A run that could not finish its collection fails instead of committing what it has:
+# the script exits non-zero on any API error and refuses outright to write a snapshot
+# with no humans in it. The committed file then keeps serving, which is the right
+# outcome — a stale list of real people beats a fresh empty one.
+#
+# WITHOUT THE SECRET THIS IS A CLEAN NO-OP. A fork, or this repository before the token
+# is created, skips the whole job rather than failing a scheduled run every night with
+# an error nobody can act on.
+
+# THE SCHEDULE IS OFF UNTIL CONTRIBUTORS_TOKEN CAN WRITE. It is not off because the
+# cadence was wrong — 04:20 UTC is deliberate, clear of the nightly pg_dump window that
+# starts at 03:00, so a deploy this triggers does not queue behind it. Restoring it is
+# uncommenting these two lines.
+#
+# It is off because the token in the secret currently has read access only, so every
+# nightly run would fail and mail a failure nobody can act on except by fixing the
+# token. A job that fails every night stops being read, and then it is not a signal at
+# all — which costs more than the days of staleness this saves.
+#
+# The preflight check below reports the token's real state in one API call, so the way
+# to find out whether this can come back is to run it by hand and read the first step.
+on:
+  # schedule:
+  #   - cron: '20 4 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: contributors
+  cancel-in-progress: false
+
+env:
+  BRANCH: chore/refresh-contributors
+  SNAPSHOT: web/src/lib/data/contributors.json
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check the token is configured
+        id: token
+        env:
+          CONTRIBUTORS_TOKEN: ${{ secrets.CONTRIBUTORS_TOKEN }}
+        run: '[ -n "$CONTRIBUTORS_TOKEN" ] && echo "present=true" >> "$GITHUB_OUTPUT" || echo "present=false" >> "$GITHUB_OUTPUT"'
+
+      - name: Checkout
+        if: steps.token.outputs.present == 'true'
+        uses: actions/checkout@v7
+        with:
+          # The token the later push carries. Without it the push would go out as
+          # GITHUB_TOKEN and the pull request would never get its checks.
+          token: ${{ secrets.CONTRIBUTORS_TOKEN }}
+
+      # Before anything else, because everything that can go wrong with this job is a
+      # credential and the failure it replaces named the user rather than the missing
+      # permission. Cheap: one API call, no work done yet, nothing to undo.
+      - name: Check the token can write
+        if: steps.token.outputs.present == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.CONTRIBUTORS_TOKEN }}
+        run: .github/scripts/check-contributors-token.sh
+
+      - name: Set up Node
+        if: steps.token.outputs.present == 'true'
+        uses: actions/setup-node@v7
+        with:
+          node-version: 22
+
+      # No install step: the collector uses only Node built-ins, which is why it is a
+      # plain .mjs rather than TypeScript. Its assembly is unit-tested in the web
+      # package (scripts/build-contributors.test.mjs); what runs here is the fetching.
+      - name: Collect contributors
+        if: steps.token.outputs.present == 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: node web/scripts/build-contributors.mjs
+
+      - name: Stop here when nothing changed
+        if: steps.token.outputs.present == 'true'
+        id: changed
+        run: 'git diff --quiet -- "$SNAPSHOT" && echo "any=false" >> "$GITHUB_OUTPUT" || echo "any=true" >> "$GITHUB_OUTPUT"'
+
+      - name: Commit the refreshed snapshot
+        if: steps.changed.outputs.any == 'true'
+        run: .github/scripts/commit-contributors.sh
+
+      # `gh pr create` fails when one is already open for the branch, which is the
+      # ordinary case on a second change before the first merged — so the branch is
+      # asked about first and the pull request is only opened when there is none.
+      # Auto-merge does the rest: the three required checks run because the push
+      # carried a real token, and a green run merges it without anyone looking.
+      - name: Open or update the pull request
+        if: steps.changed.outputs.any == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.CONTRIBUTORS_TOKEN }}
+        run: .github/scripts/open-contributors-pr.sh

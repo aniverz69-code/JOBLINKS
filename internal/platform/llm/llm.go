@@ -1,0 +1,487 @@
+// Package llm wraps an OpenAI-compatible chat endpoint behind a tiny, provider-
+// agnostic surface shared by the enrichment and telegram-extraction workers. It
+// owns only the langchaingo client construction, the per-call timeout + generate
+// + empty-choices guard, and the markdown-fence cleanup some models add despite
+// JSON mode. Callers keep their own prompts and typed-contract parsing.
+//
+// A call may additionally constrain its response to a JSON schema (WithSchema, and
+// internal/platform/llmschema for deriving one from a contract type), which forecloses the
+// type and vocabulary drift callers' decoders otherwise absorb. It is a first line,
+// never a proof: a gateway that stops honouring a schema answers 200 with ordinary
+// JSON, so every caller-side sanitiser and validator stays exactly where it was.
+package llm
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"log"
+	"net/http"
+	"strings"
+	"time"
+
+	"github.com/tmc/langchaingo/llms"
+	"github.com/tmc/langchaingo/llms/openai"
+)
+
+// DefaultTimeout bounds a single LLM call. Without it a stalled gateway hangs a
+// run-once worker indefinitely, holding its cron flock open and stalling the
+// whole queue. The caller's lease/retry machinery then reclaims the work.
+const DefaultTimeout = 90 * time.Second
+
+// tracerShutdownTimeout bounds the final trace flush so a stuck Langfuse endpoint
+// cannot hold a shutting-down process open.
+const tracerShutdownTimeout = 15 * time.Second
+
+// Client is a thin wrapper over a langchaingo model with a per-call timeout. An
+// optional tracer observes each call; modelID and source label those observations.
+type Client struct {
+	model   llms.Model
+	modelID string
+	timeout time.Duration
+	tracer  Tracer
+	source  string
+
+	// baseURL and apiKey are retained so a schema-bound model can be built against
+	// the same endpoint: langchaingo binds the response format to the client, not to
+	// the call, so one model can carry at most one schema. Both are empty when the
+	// model was injected (NewWithModel), which is the tests-only seam.
+	baseURL string
+	apiKey  string
+
+	// schemaMode is how this gateway wants a schema asked for. Empty is strict mode,
+	// so a client built without an opinion behaves as every client did before this
+	// existed. Carried on the Client rather than passed per call because it
+	// describes the endpoint, and because it is part of the schema-bound model's
+	// cache key by way of the rendered format.
+	schemaMode SchemaMode
+
+	// dims label each call for the gateway's per-feature spend rollup, one header per
+	// dimension. Set by As and empty otherwise, so a client nobody re-credentialed sends
+	// exactly what it always did.
+	dims []Dimension
+
+	// fallbackKey and onRefused belong to a client bound to a per-user credential: the
+	// credential to retry on when the gateway no longer knows that user's, and how to
+	// report that it should be replaced. Both empty on every other client.
+	fallbackKey string
+	onRefused   func()
+
+	// schemaModels is held by pointer so WithTimeout can keep cloning the Client: a
+	// mutex embedded by value would be copied along with it. As is the one clone that
+	// must NOT share it — see the comment there.
+	schemaModels *modelCache
+}
+
+// ModelID returns the configured model id, so a caller can record which model
+// produced a result (e.g. a cached analysis's provenance). Empty on a nil client.
+func (c *Client) ModelID() string {
+	if c == nil {
+		return ""
+	}
+	return c.modelID
+}
+
+// Timeout reports the per-call bound this client was built with, so a caller that varies it
+// per call site can derive the new one FROM the configured value rather than restating it.
+// A second copy of the number in a second package is a second answer, free to drift from the
+// one the entrypoint actually chose. Zero on a nil client.
+func (c *Client) Timeout() time.Duration {
+	if c == nil {
+		return 0
+	}
+	return c.timeout
+}
+
+// WithTimeout returns a shallow copy of the client with a different per-call timeout,
+// so a slow use case (a reasoning-heavy multi-stage analysis) can allow longer calls
+// without raising the shared client's default for everyone. Nil-safe.
+func (c *Client) WithTimeout(d time.Duration) *Client {
+	if c == nil {
+		return nil
+	}
+	clone := *c
+	clone.timeout = d
+	return &clone
+}
+
+// Option configures a Client at construction. Options keep tracing opt-in without
+// changing the constructors' required parameters, so existing call sites compile
+// unchanged.
+type Option func(*Client)
+
+// WithSchemaMode sets how WithSchema asks for its shape on this endpoint. The zero
+// value (strict mode) is what every caller got before this option existed, so a
+// client built without it is unchanged.
+func WithSchemaMode(mode SchemaMode) Option {
+	return func(c *Client) {
+		c.schemaMode = mode
+	}
+}
+
+// WithTracer attaches a tracer and the source label recorded on each observation.
+// A nil tracer is fine — the client simply performs no tracing.
+func WithTracer(t Tracer, source string) Option {
+	return func(c *Client) {
+		c.tracer = t
+		c.source = source
+	}
+}
+
+// New builds a Client against an OpenAI-compatible endpoint. baseURL points at
+// the gateway/provider, apiKey is the bearer credential, model is the model id.
+// No provider is hard-coded — any OpenAI-compatible backend works.
+func New(baseURL, apiKey, model string, opts ...Option) (*Client, error) {
+	c := &Client{
+		modelID:      model,
+		timeout:      DefaultTimeout,
+		baseURL:      baseURL,
+		apiKey:       apiKey,
+		schemaModels: newModelCache(),
+	}
+	for _, o := range opts {
+		o(c)
+	}
+	// The model is built AFTER the options, because the transport it travels on is the
+	// client's own (see transport): a base client needs it for the same reason a bound one
+	// does — a per-call rewrite has to reach a client nobody has bound.
+	m, err := openai.New(
+		openai.WithBaseURL(baseURL),
+		openai.WithToken(apiKey),
+		openai.WithModel(model),
+		openai.WithHTTPClient(&http.Client{Transport: c.transport()}),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("llm: build client: %w", err)
+	}
+	c.model = m
+
+	return c, nil
+}
+
+// Settings is the full configuration to build a (optionally traced) LLM client: the
+// OpenAI-compatible endpoint plus optional Langfuse credentials. It is the one shape
+// every entrypoint (the HTTP server and both LLM workers) maps its env config into,
+// so client construction and tracing live in exactly one place.
+type Settings struct {
+	BaseURL string
+	APIKey  string
+	Model   string
+
+	// SchemaMode is how WithSchema asks for its shape. The zero value is strict
+	// mode, so a caller that says nothing keeps sending exactly what it sent
+	// before — the same rule GenOption follows.
+	SchemaMode SchemaMode
+
+	// Langfuse tracing is optional: all three set ⇒ every call is traced under the
+	// caller's source label; otherwise the client runs untraced.
+	LangfuseBaseURL   string
+	LangfusePublicKey string
+	LangfuseSecretKey string
+}
+
+// Enabled reports whether an LLM client can be built (all three core fields set).
+func (s Settings) Enabled() bool {
+	return s.BaseURL != "" && s.APIKey != "" && s.Model != ""
+}
+
+// NewClient is the single construction path for an LLM client. It builds the client
+// from s and, when the Langfuse fields are set, attaches a tracer labelled source
+// ("verdict"/"enrich"/"telegram"). It returns a flush func that drains buffered
+// traces — always defer it (a no-op when tracing is off). When the LLM is
+// unconfigured (!s.Enabled()) it returns (nil, no-op, nil) so callers degrade
+// uniformly. Because every caller goes through here, no entrypoint can build a
+// client and forget to wire tracing.
+func NewClient(s Settings, source string) (*Client, func(), error) {
+	noop := func() {}
+	if !s.Enabled() {
+		return nil, noop, nil
+	}
+	opts := []Option{WithSchemaMode(s.SchemaMode)}
+	flush := noop
+	if tracer := NewTracer(s.LangfuseBaseURL, s.LangfusePublicKey, s.LangfuseSecretKey); tracer != nil {
+		opts = append(opts, WithTracer(tracer, source))
+		flush = func() {
+			ctx, cancel := context.WithTimeout(context.Background(), tracerShutdownTimeout)
+			defer cancel()
+			if err := tracer.Shutdown(ctx); err != nil {
+				log.Printf("llm: tracer shutdown: %v", err)
+			}
+		}
+	}
+	c, err := New(s.BaseURL, s.APIKey, s.Model, opts...)
+	if err != nil {
+		flush() // don't leak the tracer goroutine when the client fails to build
+		return nil, noop, err
+	}
+	return c, flush, nil
+}
+
+// NewWithModel wraps an already-constructed langchaingo model with the default
+// timeout. It is the seam for callers' tests that inject a fake model instead of
+// dialing a real endpoint.
+func NewWithModel(m llms.Model, opts ...Option) *Client {
+	c := &Client{model: m, timeout: DefaultTimeout, schemaModels: newModelCache()}
+	for _, o := range opts {
+		o(c)
+	}
+	return c
+}
+
+// GenerateJSON sends a system+user prompt in JSON mode and returns the model's
+// raw response content with any markdown code fence stripped. The call is bounded
+// by the client timeout. The returned string is unparsed — the caller unmarshals
+// it into its own contract type.
+//
+// Given WithSchema the response is additionally constrained to that schema, which
+// forecloses the type and vocabulary drift the callers' decoders otherwise absorb.
+// It is not a guarantee: a gateway that stops honouring a schema reports success, so
+// every existing validation stays where it is.
+func (c *Client) GenerateJSON(ctx context.Context, system, user string, opts ...GenOption) (string, error) {
+	cfg := newGenConfig(opts)
+	model, err := c.modelFor(cfg)
+	if err != nil {
+		return "", err
+	}
+	// The reasoning effort travels on the context because langchaingo's request builder
+	// cannot carry it; the transport reads it back off. See WithReasoning.
+	ctx = withReasoning(ctx, cfg.reasoning)
+
+	if c.timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, c.timeout)
+		defer cancel()
+	}
+	messages := []llms.MessageContent{
+		llms.TextParts(llms.ChatMessageTypeSystem, system),
+		llms.TextParts(llms.ChatMessageTypeHuman, user),
+	}
+
+	start := time.Now()
+	// gen builds an observation with the fields common to every outcome, stamping
+	// the end time at call. The caller fills in output/usage or the error.
+	gen := func() Generation {
+		return Generation{Model: c.modelID, System: system, User: user, Start: start, End: time.Now(), Source: c.source}
+	}
+
+	resp, err := model.GenerateContent(ctx, messages, llms.WithJSONMode())
+	if err != nil {
+		wrapped := fmt.Errorf("llm: generate: %w", err)
+		g := gen()
+		g.Err = wrapped
+		c.observe(g)
+		return "", wrapped
+	}
+	if len(resp.Choices) == 0 {
+		err := errors.New("llm: model returned no choices")
+		g := gen()
+		g.Err = err
+		c.observe(g)
+		return "", err
+	}
+
+	out := StripJSONFence(resp.Choices[0].Content)
+	g := gen()
+	g.Output = out
+	g.Usage = UsageFrom(resp.Choices[0])
+	c.observe(g)
+	return out, nil
+}
+
+// contextOverrules replaces a provider's claim of success with our own context's
+// error, when that context had already expired.
+//
+// A gateway that stops emitting when our deadline fires can hand back whatever it
+// accumulated and call it success — production logged exactly that as `dur=3m0.018s
+// err=<nil>`, and the truncated JSON then failed downstream as "unexpected end of JSON
+// input", naming neither the deadline nor the stage. Our context is the authority on
+// whether the call had time to finish, so it overrules the provider.
+//
+// Both streaming entry points run this. Chat's truncation is quieter than the JSON
+// path's and worse: half a sentence is valid prose, so it was stored as the
+// assistant's finished answer and replayed to the model for the rest of the session,
+// and a round's tool calls were run with the `{}` arguments healToolArguments makes
+// of a half-written call — with the observation in the tracer marked successful.
+func contextOverrules(ctx context.Context, err error) error {
+	if err == nil && ctx.Err() != nil {
+		return ctx.Err()
+	}
+	return err
+}
+
+// GenerateJSONStream is the streaming sibling of GenerateJSON: it sends the same
+// system+user prompt in JSON mode but streams the response. Content tokens accumulate
+// into the returned JSON string (the caller parses it exactly as with GenerateJSON);
+// reasoning ("thinking") tokens are forwarded to onThinking as they arrive, when the
+// provider surfaces them (best-effort — a model that emits none simply never calls it).
+// The raw partial JSON is never surfaced. Bounded by the client timeout and observed
+// like GenerateJSON.
+func (c *Client) GenerateJSONStream(
+	ctx context.Context,
+	system, user string,
+	onThinking func(string),
+	opts ...GenOption,
+) (string, error) {
+	cfg := newGenConfig(opts)
+	model, err := c.modelFor(cfg)
+	if err != nil {
+		return "", err
+	}
+	// Same as GenerateJSON: the effort rides the context to the transport. A caller that
+	// asks a streaming call not to deliberate is asking for less to arrive on onThinking,
+	// which is the point.
+	ctx = withReasoning(ctx, cfg.reasoning)
+
+	if c.timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, c.timeout)
+		defer cancel()
+	}
+	messages := []llms.MessageContent{
+		llms.TextParts(llms.ChatMessageTypeSystem, system),
+		llms.TextParts(llms.ChatMessageTypeHuman, user),
+	}
+
+	start := time.Now()
+	gen := func() Generation {
+		return Generation{Model: c.modelID, System: system, User: user, Start: start, End: time.Now(), Source: c.source}
+	}
+
+	// Reasoning deltas go to onThinking; content deltas are ignored here (the full
+	// content is read from the final response, matching GenerateJSON's fence-stripping).
+	stream := llms.WithStreamingReasoningFunc(func(_ context.Context, reasoningChunk, _ []byte) error {
+		if onThinking != nil && len(reasoningChunk) > 0 {
+			onThinking(string(reasoningChunk))
+		}
+		return nil
+	})
+
+	resp, err := model.GenerateContent(ctx, messages, llms.WithJSONMode(), stream)
+	err = contextOverrules(ctx, err)
+	// The fit model is slow (tens of seconds per call); log the duration so per-stage
+	// cost stays observable without a tracer.
+	log.Printf("llm: stream model=%s dur=%s err=%v", c.modelID, time.Since(start).Round(time.Millisecond), err)
+	if err != nil {
+		wrapped := fmt.Errorf("llm: generate stream: %w", err)
+		g := gen()
+		g.Err = wrapped
+		c.observe(g)
+		return "", wrapped
+	}
+	if len(resp.Choices) == 0 {
+		err := errors.New("llm: model returned no choices")
+		g := gen()
+		g.Err = err
+		c.observe(g)
+		return "", err
+	}
+
+	out := StripJSONFence(resp.Choices[0].Content)
+	g := gen()
+	g.Output = out
+	g.Usage = UsageFrom(resp.Choices[0])
+	c.observe(g)
+	return out, nil
+}
+
+// observe reports a generation when a tracer is attached; a nil tracer makes this
+// a no-op, so an unconfigured client is unchanged.
+func (c *Client) observe(g Generation) {
+	if c.tracer == nil {
+		return
+	}
+	c.tracer.Observe(g)
+}
+
+// UsageFrom pulls token counts out of langchaingo's per-choice GenerationInfo.
+// Providers vary, so it reads defensively and returns nil when no counts are
+// present — an absent usage is reported as absent, never as zeros. Exported so a
+// caller that streams a conversation reports the same counts the tracer records,
+// from the same reading of the same map.
+func UsageFrom(choice *llms.ContentChoice) *Usage {
+	in, ok1 := intFrom(choice.GenerationInfo["PromptTokens"])
+	out, ok2 := intFrom(choice.GenerationInfo["CompletionTokens"])
+	total, ok3 := intFrom(choice.GenerationInfo["TotalTokens"])
+	if !ok1 && !ok2 && !ok3 {
+		return nil
+	}
+	// The cached count never decides whether there is a usage to report: a provider
+	// that named it and nothing else told us nothing about the call's size, and a
+	// zero Input invented from it would read as a free request.
+	cached, _ := intFrom(choice.GenerationInfo["PromptCachedTokens"])
+
+	return &Usage{Input: in, Output: out, CachedInput: cached, Total: total}
+}
+
+// intFrom coerces a GenerationInfo value (int, int64, or float64 depending on the
+// provider/serialization) to an int.
+func intFrom(v any) (int, bool) {
+	switch n := v.(type) {
+	case int:
+		return n, true
+	case int64:
+		return int(n), true
+	case float64:
+		return int(n), true
+	}
+	return 0, false
+}
+
+// StripJSONFence recovers a single JSON value from model output that wrapped it
+// in a markdown fence, left an extra trailing tick, or added a short preamble.
+// Haiku in particular returns ```json … ``` plus occasional trailer backticks
+// that the old prefix/suffix trim left behind as "invalid character '`' after
+// top-level value".
+func StripJSONFence(raw string) string {
+	s := strings.TrimSpace(raw)
+	if strings.HasPrefix(s, "```") {
+		if nl := strings.IndexByte(s, '\n'); nl >= 0 {
+			s = s[nl+1:]
+		} else {
+			s = strings.TrimPrefix(s, "```")
+		}
+		s = strings.TrimSpace(s)
+	}
+	if i := strings.LastIndex(s, "\n```"); i >= 0 {
+		s = strings.TrimSpace(s[:i])
+	} else {
+		s = strings.TrimSpace(strings.TrimSuffix(s, "```"))
+	}
+	if cut := firstJSONValue(s); cut != "" {
+		return cut
+	}
+	return s
+}
+
+// firstJSONValue returns the first top-level JSON object or array in s, ignoring
+// any trailing junk a model left after it. Empty when none decodes.
+func firstJSONValue(s string) string {
+	start := strings.IndexAny(s, "{[")
+	if start < 0 {
+		return ""
+	}
+	dec := json.NewDecoder(strings.NewReader(s[start:]))
+	var raw json.RawMessage
+	if err := dec.Decode(&raw); err != nil {
+		return ""
+	}
+	return string(raw)
+}
+
+// TruncateRunes returns s clamped to at most limit runes, never splitting a rune.
+func TruncateRunes(s string, limit int) string {
+	r := []rune(s)
+	if len(r) <= limit {
+		return s
+	}
+	return string(r[:limit])
+}
+
+// TrimTruncateRunes trims surrounding whitespace, clamps s to at most limit runes,
+// and trims again so a mid-word cut never leaves trailing whitespace. It is the one
+// "trim + truncate by runes" helper for bounding untrusted/model text before it is
+// served or sent to a model.
+func TrimTruncateRunes(s string, limit int) string {
+	return strings.TrimSpace(TruncateRunes(strings.TrimSpace(s), limit))
+}

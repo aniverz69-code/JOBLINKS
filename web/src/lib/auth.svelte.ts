@@ -1,0 +1,73 @@
+// Auth controller. The session lives in an httpOnly cookie the browser manages,
+// so there is no token here. The current user is resolved server-side in the
+// root layout load and exposed via `page.data.user` (SSR-safe, per-request — a
+// module-level `$state` singleton would leak one request's user into another's
+// SSR). Reads go through `currentUser()`/`isAuthenticated()`; the mutations call
+// the API and then `invalidateAll()` so the layout re-resolves the user and the
+// UI updates.
+
+import { invalidateAll } from '$app/navigation';
+import { page } from '$app/state';
+import { api } from '$lib/api';
+import { forgetRecentAuthExpiry } from '$lib/recentAuth';
+import type { User } from '$lib/types';
+
+/** The current signed-in user, or null. Reactive: reads `page.data.user`. */
+export function currentUser(): User | null {
+  return page.data.user ?? null;
+}
+
+/** True once a session is resolved. Reactive (reads `page.data.user`). */
+export function isAuthenticated(): boolean {
+  return currentUser() !== null;
+}
+
+export async function login(email: string, password: string) {
+  await api.login(email, password);
+  await invalidateAll();
+}
+
+export async function register(email: string, password: string) {
+  await api.register(email, password);
+  await invalidateAll();
+}
+
+/** Sets the account's IANA timezone and re-resolves the session so
+ *  `currentUser()` reflects it everywhere (the notification-settings hint,
+ *  a future re-render of this same field). */
+export async function updateTimezone(timezone: string) {
+  await api.updateTimezone(timezone);
+  await invalidateAll();
+}
+
+/** Sets the account's preferred interface language and re-resolves the session
+ *  so `currentUser()` reflects it everywhere. */
+export async function updateLanguage(language: string) {
+  await api.updateLanguage(language);
+  await invalidateAll();
+}
+
+/** Records that this account has been through the onboarding wizard and re-resolves the
+ *  session, so `currentUser().onboarding_completed_at` — which IS the layout's routing gate
+ *  — reflects it immediately. Without the re-resolve the gate would keep reading a stale
+ *  null and depend entirely on `onboardingGate.dismissed` to avoid re-capturing the user,
+ *  which only holds for the current visit. */
+export async function completeOnboarding() {
+  await api.completeOnboarding();
+  await invalidateAll();
+}
+
+export async function logout() {
+  // Best-effort: still re-resolve (to signed-out) even if the network call fails.
+  try {
+    await api.logout();
+  } catch {
+    // ignore
+  }
+  // The recent-auth proof belonged to the session that just ended. The hint recording when
+  // it expires is per-TAB, so signing in as somebody else in the same tab would otherwise
+  // meet a standing "identity confirmed" for a session holding no proof. It self-heals on
+  // the next 428, but between here and there it is simply wrong.
+  forgetRecentAuthExpiry();
+  await invalidateAll();
+}

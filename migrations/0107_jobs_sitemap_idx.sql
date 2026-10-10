@@ -1,0 +1,41 @@
+-- The covering index the job sitemap pages by: id order, the two columns a URL
+-- needs, and the whole predicate it filters on — so the sitemap reads never touch
+-- the jobs heap.
+--
+-- Why the sitemap was capped at 15k rows without it: jobs_open_id_idx (0001) is
+-- `(id) WHERE closed_at IS NULL`. It carries neither `duplicate_of IS NULL` nor
+-- public_slug/updated_at, so every candidate row was fetched from a 2.5M-row heap
+-- to test the predicate and read its columns — the "heap-bound scan" the query's
+-- own comment describes. 50k measured 30-40s on prod and 25k twice hit 57s against
+-- nginx's 60s ceiling, so the cap was the margin that band needed rather than the
+-- coverage anyone wanted (see internal/handler/sitemap.go).
+--
+-- With this index a chunk is a bounded index-only range scan, which is what lets
+-- the sitemap page the whole open catalogue by cursor instead of shipping only its
+-- freshest slice. Partial on exactly the rows the sitemap lists, so it stays
+-- proportional to the open, non-duplicate set (~1.1M of 2.5M) rather than the table.
+--
+-- INCLUDE rather than a composite key: public_slug and updated_at are payload, never
+-- searched or ordered by, so they ride in the leaf pages without widening the tree.
+--
+-- HOW THIS GETS APPLIED: host-2 has no migration runner — numbered migrations are
+-- applied BY HAND before the blue/green flip, as the `hire` role (see freehire-ops
+-- README, "Schema migrations"; connecting as postgres leaves objects postgres-owned
+-- and the API 500s on them).
+--
+-- Build it CONCURRENTLY. A plain CREATE INDEX holds a SHARE lock on jobs for as long
+-- as a ~1.1M-row partial index takes, and what that blocks is the ingest's upserts —
+-- the one workload on this box that must not stall. IF NOT EXISTS then makes the
+-- migration file a no-op afterwards:
+--
+--   CREATE INDEX CONCURRENTLY IF NOT EXISTS jobs_sitemap_idx
+--       ON public.jobs (id DESC) INCLUDE (public_slug, updated_at)
+--       WHERE closed_at IS NULL AND duplicate_of IS NULL;
+--
+-- Run it from a file (psql -f) under systemd-run, never `psql -c` over ssh: a dropped
+-- connection aborts CONCURRENTLY and leaves an INVALID index behind, which the planner
+-- ignores while it still costs writes. Check with:
+--   SELECT indisvalid FROM pg_index WHERE indexrelid = 'jobs_sitemap_idx'::regclass;
+CREATE INDEX IF NOT EXISTS jobs_sitemap_idx
+    ON public.jobs (id DESC) INCLUDE (public_slug, updated_at)
+    WHERE closed_at IS NULL AND duplicate_of IS NULL;

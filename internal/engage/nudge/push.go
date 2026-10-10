@@ -1,0 +1,115 @@
+package nudge
+
+import (
+	"context"
+	"fmt"
+	"strconv"
+
+	"github.com/strelov1/freehire/internal/engage/pushnotify"
+	"github.com/strelov1/freehire/internal/platform/db"
+)
+
+// Compile-time proof PushNotifier satisfies the engine's Notifier seam.
+var _ Notifier = (*PushNotifier)(nil)
+
+// PushTokenLister lists a user's registered push devices. *db.Queries
+// satisfies it via its generated ListPushTokensForUser method.
+type PushTokenLister interface {
+	ListPushTokensForUser(ctx context.Context, userID int64) ([]db.UserPushToken, error)
+}
+
+// PushNotifier delivers a nudge as a mobile push, fanning out to every device
+// registered for the account (unlike Telegram/email, which have exactly one
+// destination) via pushnotify.SendToDevices.
+type PushNotifier struct {
+	tokens    PushTokenLister
+	transport pushnotify.Notifier
+}
+
+// NewPushNotifier builds a PushNotifier listing devices through tokens and
+// sending through transport.
+func NewPushNotifier(tokens PushTokenLister, transport pushnotify.Notifier) *PushNotifier {
+	return &PushNotifier{tokens: tokens, transport: transport}
+}
+
+// Send resolves dest as a user id, lists that user's registered devices, and fans
+// ONE notification for the whole batch out to all of them. The channel argument is
+// ignored — this notifier only serves the push channel.
+func (n *PushNotifier) Send(ctx context.Context, _ string, dest, kind string, ms []Message) error {
+	if len(ms) == 0 {
+		return nil
+	}
+	userID, err := strconv.ParseInt(dest, 10, 64)
+	if err != nil {
+		return fmt.Errorf("nudge: invalid push user id %q: %w", dest, err)
+	}
+	devices, err := n.tokens.ListPushTokensForUser(ctx, userID)
+	if err != nil {
+		return fmt.Errorf("nudge: list push tokens for user %d: %w", userID, err)
+	}
+	tokens := make([]string, len(devices))
+	for i, d := range devices {
+		tokens[i] = d.Token
+	}
+
+	title, body := renderNudgeBatch(kind, ms)
+	// The deep link needs one destination, so it is carried only when the batch
+	// names one job.
+	var data map[string]string
+	if len(ms) == 1 {
+		data = map[string]string{"slug": ms[0].Slug}
+	}
+	return pushnotify.SendToDevices(ctx, n.transport, tokens, title, body, data)
+}
+
+// renderNudgeBatch is the shared title/body copy for one (account, kind) batch,
+// used by both the push channel (Send, above) and the notification-center record
+// written by Runner.deliverBatch in nudge.go — one rendering, two readers, so the
+// in-app record never drifts from what push already shows.
+//
+// The default arm is not reachable today — application_nudges.kind is CHECKed
+// against exactly the three above — but it is the copy a fourth kind would ship
+// with until someone gave it its own, so it says what the notification is about
+// rather than naming the product.
+func renderNudgeBatch(kind string, ms []Message) (title, body string) {
+	if len(ms) == 1 {
+		return renderNudge(ms[0])
+	}
+	switch kind {
+	case KindFollowUp:
+		return "👋 Follow up?", fmt.Sprintf("%d of your applications have gone quiet.", len(ms))
+	case KindInterviewPrep:
+		return "🎯 Interviews coming up", fmt.Sprintf("You're interviewing for %d roles.", len(ms))
+	case KindJobClosed:
+		return "📪 Jobs closed", fmt.Sprintf("%d jobs you were tracking were closed.", len(ms))
+	case KindAutoApplySubmitted:
+		return "🎉 Applications submitted", fmt.Sprintf("Auto-apply submitted %d applications for you.", len(ms))
+	case KindAutoApplyBlocked:
+		return "⚠️ Needs your attention", fmt.Sprintf("Auto-apply couldn't finish %d applications — a required question needs your own answer.", len(ms))
+	case KindAutoApplyFailed:
+		return "Auto-apply couldn't submit", fmt.Sprintf("Auto-apply couldn't submit %d applications, and won't try again.", len(ms))
+	default:
+		return "🔔 Jobs you're tracking", fmt.Sprintf("%d updates on jobs you are tracking.", len(ms))
+	}
+}
+
+// renderNudge is the single-nudge wording, kept as its own function because it is
+// the one a batch of one must be indistinguishable from.
+func renderNudge(m Message) (title, body string) {
+	switch m.Kind {
+	case KindFollowUp:
+		return "👋 Follow up?", fmt.Sprintf("It's been %d days since anything moved on %s at %s.", m.DaysSilent, m.JobTitle, m.Company)
+	case KindInterviewPrep:
+		return "🎯 Interview coming up", fmt.Sprintf("You're interviewing for %s at %s.", m.JobTitle, m.Company)
+	case KindJobClosed:
+		return "📪 Job closed", fmt.Sprintf("%s at %s was closed.", m.JobTitle, m.Company)
+	case KindAutoApplySubmitted:
+		return "🎉 Application submitted", fmt.Sprintf("Auto-apply submitted your application to %s at %s.", m.JobTitle, m.Company)
+	case KindAutoApplyBlocked:
+		return "⚠️ Needs your attention", fmt.Sprintf("Auto-apply couldn't finish %s at %s — a required question needs your own answer.", m.JobTitle, m.Company)
+	case KindAutoApplyFailed:
+		return "Auto-apply couldn't submit", fmt.Sprintf("Auto-apply couldn't submit %s at %s, and won't try again.", m.JobTitle, m.Company)
+	default:
+		return "🔔 A job you're tracking", fmt.Sprintf("%s at %s", m.JobTitle, m.Company)
+	}
+}

@@ -1,0 +1,59 @@
+package appevent
+
+import "testing"
+
+func TestOnlyObservedSourcesAreTrustedForDayMath(t *testing.T) {
+	trusted := map[string]bool{
+		SourceMailGmail:      true,
+		SourceMailHosted:     true,
+		SourceMailExternal:   true,
+		SourceCalendarGoogle: true,
+		SourceUser:           false,
+		SourceAssistant:      false,
+		SourceSystem:         false,
+		// Auto-apply's own timestamp is precise and real-time, but it is the platform
+		// acting on the candidate's behalf, not an employer-side or calendar-observed
+		// timing fact — same category as SourceSystem, not the mail/calendar pair.
+		SourceAutoApply: false,
+	}
+	if len(trusted) != len(Sources) {
+		t.Fatalf("the vocabulary has %d sources but this test pins %d — a new source needs a verdict here", len(Sources), len(trusted))
+	}
+	for src, want := range trusted {
+		if got := TrustedForDayMath(src); got != want {
+			t.Errorf("TrustedForDayMath(%q) = %v, want %v", src, got, want)
+		}
+	}
+}
+
+func TestAnUnknownSourceIsNotTrusted(t *testing.T) {
+	if TrustedForDayMath("mail_carrier_pigeon") {
+		t.Error("an unrecognised source was trusted for day math; unknown provenance must not read as observed")
+	}
+}
+
+func TestSourceForMailMapsTheInboxVocabulary(t *testing.T) {
+	cases := map[string]string{
+		"gmail":    SourceMailGmail,
+		"hosted":   SourceMailHosted,
+		"external": SourceMailExternal,
+	}
+	for in, want := range cases {
+		got, err := SourceForMail(in)
+		if err != nil {
+			t.Errorf("SourceForMail(%q) returned error %v", in, err)
+			continue
+		}
+		if got != want {
+			t.Errorf("SourceForMail(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+// Defaulting an unrecognised mail source to a mail-derived event would stamp unknown
+// provenance as observed and admit it to timings. The caller must handle the error.
+func TestSourceForMailRefusesAnUnknownStore(t *testing.T) {
+	if _, err := SourceForMail("imap"); err == nil {
+		t.Error("SourceForMail(\"imap\") returned no error; an unknown store must not default to a trusted source")
+	}
+}

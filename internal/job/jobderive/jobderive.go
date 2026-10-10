@@ -1,0 +1,416 @@
+// Package jobderive computes the deterministic, dictionary-derived facets of a job
+// from its raw content fields: the company and public slugs, the geography
+// (countries/regions/work-mode), and the skill tags. It is the single home for the
+// derivation shared by the ingest pipeline and the moderator write path, so both
+// produce identical facets from the same inputs.
+package jobderive
+
+import (
+	"slices"
+
+	"github.com/strelov1/freehire/internal/dict/classify"
+	"github.com/strelov1/freehire/internal/dict/lang"
+	"github.com/strelov1/freehire/internal/dict/location"
+	"github.com/strelov1/freehire/internal/dict/normalize"
+	"github.com/strelov1/freehire/internal/dict/skilltag"
+	"github.com/strelov1/freehire/internal/dict/vocab"
+	"github.com/strelov1/freehire/internal/job/jobfacts"
+	"github.com/strelov1/freehire/internal/platform/stringset"
+)
+
+// Input is the raw job content the derivation reads. Source and ExternalID are the
+// already-resolved storage identity (the caller decides how to namespace them); they
+// feed the public slug so it is stable with the dedup key.
+//
+// WorkMode, Seniority, Category, Skills, and ExperienceYearsMin are the caller's
+// STRUCTURED signals — values the source states explicitly (an enum, a grade, a tag
+// list, a numeric field), already mapped into freehire's vocabularies. Each takes
+// precedence over the dictionary derivation: the scalar signals win when present and
+// the dictionary fills only when they are empty/nil; the multi-valued Skills are
+// unioned with the dictionary skills. They carry structured signal only, never a
+// heuristic an adapter inferred from free text; an adapter with no signal leaves them
+// empty/nil so the dictionary decides.
+//
+// Countries, Regions and Cities are the caller's structured GEOGRAPHY signal (a country
+// code the platform states directly, macro-region codes, and city names the
+// submitter/moderator stated by hand). Unlike the scalars they fully replace the
+// location-dictionary derivation for that facet when present — an explicit place is
+// authoritative, not a hint the dictionary refines — and when empty the dictionary
+// derives as before.
+type Input struct {
+	Title              string
+	Company            string
+	Source             string
+	ExternalID         string
+	Location           string
+	Description        string
+	WorkMode           string
+	Countries          []string
+	Regions            []string
+	Cities             []string
+	Seniority          string
+	Category           string
+	EmploymentType     string
+	Skills             []string
+	ExperienceYearsMin *int
+	// EducationLevel and EnglishLevel are the caller's structured signal for the two
+	// facets a platform states as a picklist rather than in prose (Profession.hu
+	// publishes both, on every posting). They obey the same contract as the scalars
+	// above — a member of vocab.EducationLevelValues / vocab.EnglishLevelValues, set
+	// only from a stated field and never from an adapter's own reading of the text,
+	// so an adapter with nothing to say leaves them empty and the matchers decide.
+	EducationLevel string
+	EnglishLevel   string
+	// SalaryMin/SalaryMax/SalaryCurrency/SalaryPeriod are the caller's structured
+	// salary signal — an adapter sets them only when the ATS states a salary in its
+	// own structured field (never a description-text guess: unlike the scalars
+	// above, there is no dictionary fallback for salary, so this is pure passthrough).
+	SalaryMin      *int
+	SalaryMax      *int
+	SalaryCurrency string
+	SalaryPeriod   string
+	// IsTechHint is the caller's structured signal that a posting is confirmed
+	// technical — e.g. a source that crawls only a platform's own dedicated IT
+	// category board, rather than a general-population board the title
+	// dictionary must judge on its own. Unlike Category it asserts IT-ness
+	// without naming a subcategory, so it feeds is_tech directly. It obeys the
+	// same contract as the scalars above: a fact the source states, never a
+	// heuristic an adapter infers from free text. When true it takes
+	// precedence over BOTH the tech and non-tech title/category evidence
+	// below — a source that crawled a posting specifically because it filed
+	// it as IT is more authoritative than a generic dictionary.
+	IsTechHint bool
+}
+
+// Derived is the set of facets computed from an Input.
+type Derived struct {
+	CompanySlug string
+	PublicSlug  string
+	Countries   []string
+	Regions     []string
+	Cities      []string
+	WorkMode    string
+	Skills      []string
+	Seniority   string
+	Category    string
+	// IsTech is the tri-state technical/non-technical signal: non-nil true when the
+	// derived category is a recognized technical category, non-nil false when it is a
+	// known non-technical category or the title states a confident non-tech role, and
+	// nil when neither resolves (unknown — never coerced, so the coverage gap stays
+	// measurable).
+	IsTech *bool
+	// RequiresClearance marks a posting that states a government security-clearance
+	// requirement (internal/dict/location). Tri-state in shape but only ever true or
+	// nil: the dictionary cannot tell a posting that promises no clearance from one
+	// that is silent, so a denial produces the absence of a true, not a false.
+	RequiresClearance *bool
+	// Synthetic enrichment facets (category B): deterministic stand-ins for fields
+	// the LLM also emits, served dict-only like the facets above. ExperienceYearsMin
+	// is nil when the description states no figure.
+	PostingLanguage    string
+	EmploymentType     string
+	EducationLevel     string
+	EnglishLevel       string
+	ExperienceYearsMin *int
+	// SalaryMin/SalaryMax/SalaryCurrency/SalaryPeriod pass Input's structured salary
+	// signal through unchanged — see Input's doc for why there is no dictionary
+	// fallback here.
+	SalaryMin      *int
+	SalaryMax      *int
+	SalaryCurrency string
+	SalaryPeriod   string
+}
+
+// Derive computes the slugs and dictionary facets for a job. Geography, skills, and the
+// title classification (seniority/category) come from the curated dictionaries (which
+// emit nothing for what they cannot resolve). A structured signal supplied on the Input
+// takes precedence over the dictionary for the facets that carry one: work-mode
+// (structured → location hint → description), seniority (structured → title →
+// description), category (structured → title), experience (structured → description),
+// and skills (structured ∪ dictionary).
+func Derive(in Input) Derived {
+	geo := location.Parse(in.Location)
+	// Geography precedence: the location dictionary → a title-embedded restriction
+	// marker → an eligibility signal in the description → an explicit region-scoping
+	// statement in the description. When the location left the geography unpinned (no
+	// country, and either no region or only an explicit open-anywhere marker's global
+	// bucket), each lower source is tried in turn and only fills what every higher
+	// source left blank — a resolved place, from the location or from a higher
+	// source in this chain, is never overridden. This is the same shape the
+	// work-mode fallback below uses.
+	countries, regions := geo.Countries, geo.Regions
+	if geoUnpinned(countries, regions) {
+		// A title-embedded restriction marker ("[Remote-US]", "(Location - Australia
+		// or New Zealand)") is a more literal, ATS-authored signal than prose, so it
+		// is tried before the description-based rescues below.
+		if c, r := location.RestrictionFromTitle(in.Title); len(r) > 0 {
+			countries, regions = c, r
+		}
+	}
+	if geoUnpinned(countries, regions) {
+		if c, r := location.EligibilityFromDescription(in.Description); len(r) > 0 {
+			countries, regions = c, r
+		}
+	}
+	if geoUnpinned(countries, regions) {
+		// An explicit "based/located/hiring in <place list>" restriction statement,
+		// additive to (and checked after) the citizenship-phrase rescue above — see
+		// location.RegionScopeFromDescription.
+		if c, r := location.RegionScopeFromDescription(in.Description); len(r) > 0 {
+			countries, regions = c, r
+		}
+	}
+	// An explicit country signal is authoritative: it fully replaces the derived/US-override
+	// countries, the same way a stated work mode replaces the hint — and pulls its region
+	// along with it (the same pairing Parse itself does for a country it resolves), so a
+	// structured country with no separate region statement still lands under the right
+	// region facet instead of falling back to whatever the free-text location parsed.
+	if len(in.Countries) > 0 {
+		countries = in.Countries
+		regions = regionsForCountries(in.Countries)
+	}
+	// An explicit region signal is authoritative: it fully replaces the derived regions
+	// (and the country-derived regions above), the same way a stated work mode replaces
+	// the hint.
+	if len(in.Regions) > 0 {
+		regions = in.Regions
+	}
+	// An explicit city signal likewise replaces the dictionary's cities outright.
+	cities := geo.Cities
+	if len(in.Cities) > 0 {
+		cities = in.Cities
+	}
+	// Work-mode precedence: structured (ATS) → location marker → description phrase.
+	// Each lower source only fills a value the higher ones left empty.
+	workMode := in.WorkMode
+	if workMode == "" {
+		workMode = geo.WorkMode
+	}
+	if workMode == "" {
+		workMode = location.WorkModeFromDescription(in.Description)
+	}
+	// A description may CONTRADICT the result of that chain, not merely fill its gaps. It is
+	// the one place prose outranks a structured signal, and only for this one question: an ATS
+	// "remote" is routinely a requisition's location bucket rather than a work arrangement —
+	// NVIDIA publishes a whole "US, TX, Remote" location with remoteType unset, for a role its
+	// body calls 100% on-site (freehire#2555) — while a sentence denying remote work is the
+	// employer writing about the arrangement itself. Only "remote" is ever overruled, and only
+	// to "onsite": a denial of remote says nothing against hybrid, and location.RemoteContradicted
+	// deliberately answers that one question rather than proposing a mode of its own.
+	if workMode == "remote" && location.RemoteContradicted(in.Description) {
+		workMode = "onsite"
+	}
+	class := classify.Parse(in.Title)
+	// Seniority precedence: structured source signal → title dictionary → description
+	// phrase. Each lower source only fills a grade the higher ones left empty.
+	seniority := in.Seniority
+	if seniority == "" {
+		seniority = class.Seniority
+	}
+	if seniority == "" {
+		seniority = classify.SeniorityFromDescription(in.Description)
+	}
+	// Category precedence: structured source signal → title dictionary → a
+	// non-tech match in the description (NonTechFromDescription resolves only
+	// non-technical categories, feeding the enrichment cost gate; a title-silent
+	// tech job stays empty). Each lower source only fills what the higher left empty.
+	category := in.Category
+	if category == "" {
+		category = class.Category
+	}
+	if category == "" {
+		category = classify.NonTechFromDescription(in.Description)
+	}
+	isTech := deriveIsTech(category, in.Title, in.IsTechHint)
+	// Employment-type precedence: structured source signal (an ATS timeType /
+	// typeOfEmployment enum) → free-text description parse. The source's own value wins.
+	employmentType := in.EmploymentType
+	if employmentType == "" {
+		employmentType = jobfacts.EmploymentType(in.Title, in.Description)
+	}
+	// Experience precedence: structured source signal → description text parse.
+	//
+	// The ceiling is applied AFTER the choice, to whichever source won, because both
+	// can overshoot and for different reasons: the text parse cannot tell a candidate's
+	// years from an employer's ("With over 40 years of … experience, chipmakers rely on
+	// KLA" — the company's age), and a structured field can carry a unit nobody
+	// declared (seven smartrecruiters postings stored 84, a number their descriptions
+	// never contain). One bound after the merge catches both; a bound inside either
+	// parser would leave the other open. See vocab.MaxExperienceYears.
+	experience := in.ExperienceYearsMin
+	if experience == nil {
+		experience = jobfacts.ExperienceYearsMin(in.Description)
+	}
+	experience = believableExperience(experience)
+	// Education and English precedence: structured source signal → description text
+	// parse. Both matchers read English prose only, so on a posting written in another
+	// language they are the weaker source by a wide margin, not merely the later one.
+	educationLevel := in.EducationLevel
+	if educationLevel == "" {
+		educationLevel = jobfacts.EducationLevel(in.Description)
+	}
+	englishLevel := in.EnglishLevel
+	if englishLevel == "" {
+		englishLevel = jobfacts.EnglishLevel(in.Description)
+	}
+	return Derived{
+		CompanySlug: normalize.CompanySlug(in.Company),
+		PublicSlug:  normalize.JobSlug(in.Title, in.Company, in.Source, in.ExternalID),
+		Countries:   countries,
+		Regions:     regions,
+		Cities:      cities,
+		WorkMode:    workMode,
+		// Skills is a set: the structured source skills are unioned with the
+		// dictionary skills, neither replacing the other. The category-scoped
+		// acronym tier (e.g. RAG on an ai_engineering/ml_ai job) takes the
+		// resolved local `category` — NOT in.Category — so it also fires when the
+		// title dictionary supplied the category, the common case since most
+		// sources carry no structured category signal.
+		Skills:             unionSkills(in.Skills, skilltag.Parse(in.Description, skilltag.WithAcronymCategory(category))),
+		Seniority:          seniority,
+		Category:           category,
+		IsTech:             isTech,
+		RequiresClearance:  deriveRequiresClearance(in.Description),
+		PostingLanguage:    lang.Detect(in.Description),
+		EmploymentType:     employmentType,
+		EducationLevel:     educationLevel,
+		EnglishLevel:       englishLevel,
+		ExperienceYearsMin: experience,
+		SalaryMin:          in.SalaryMin,
+		SalaryMax:          in.SalaryMax,
+		SalaryCurrency:     in.SalaryCurrency,
+		SalaryPeriod:       in.SalaryPeriod,
+	}
+}
+
+// deriveRequiresClearance lifts the dictionary's boolean into the column's tri-state.
+// Only a positive is asserted: a description the dictionary does not mark yields nil
+// (unknown), never false. The dictionary reports "not stated", and storing that as a
+// false would read as "stated to be unnecessary", which is a different claim and one
+// the catalogue almost never makes.
+func deriveRequiresClearance(desc string) *bool {
+	if !location.RequiresClearanceFromDescription(desc) {
+		return nil
+	}
+	required := true
+	return &required
+}
+
+// deriveIsTech computes the tri-state is_tech signal from the already-resolved
+// category, the raw title, and an optional structured source hint. The hint,
+// when true, wins outright — ahead of both the tech and non-tech evidence below
+// — since it is a fact the source stated about its own crawl scope, not a
+// heuristic. Absent a hint, technical evidence wins and is checked first: a
+// recognized technical category OR a confident software/IT title (classify.IsTech)
+// yields true; otherwise a known non-technical category or a confident non-tech
+// title yields false; otherwise the signal is unknown (nil), never coerced, so the
+// unclassified mass stays measurable. The tech title detector is the symmetric
+// counterpart to IsNonTech — it rescues generic software titles ("Software
+// Engineer", "COBOL Programmer") that resolve no sub-category. A non-software
+// "…Engineer" matches the non-tech detector only where its discipline is named
+// outright — "mechanical engineer", "civil engineer" and the rest of that anchored
+// family — so "Drainage Engineer" still matches neither detector and stays unknown.
+//
+// The two kinds of technical evidence are NOT weighed the same, and that is the whole
+// of what this function decides. A technical TITLE (classify.IsTech) wins outright, as
+// it always has: it speaks for the whole role, so "Backend Engineer — Teller Systems"
+// stays technical despite its accidental "teller". A technical CATEGORY does not — it
+// is resolved from a SUBSTRING, and a substring can be about something else entirely.
+// "Quality Assurance Nurse Manager" resolves to `qa`, "Registered Nurse Intensive Mobile
+// Team" to `mobile`, "инспектор по охране труда" to `security`. In each the title
+// dictionary already says non-technical outright, and before this it was never asked:
+// the category alone asserted true and nothing later could take it back.
+//
+// Measured over the 3 000 commonest titles currently flagged technical (197 916 open
+// postings), letting the non-tech TITLE outvote a category-only signal changes 22 titles
+// and 2 067 postings, every one of them a correction — nurses, HVAC project managers,
+// mobile mechanics and phlebotomists, occupational-safety inspectors, a policeman, a
+// school safety teacher, a QA lab technician. Nothing moves the other way: the positive
+// branch is strictly narrower than before, so this can only ever withdraw a true.
+//
+// TechEvidence itself is deliberately UNCHANGED. It is also the veto the ingest filter
+// and the prune rule read, where the cost of getting this wrong is a deleted posting
+// rather than a mislabelled facet — see its own comment.
+func deriveIsTech(category, title string, sourceHint bool) *bool {
+	if sourceHint || classify.IsTech(title) {
+		t := true
+		return &t
+	}
+	nonTech := slices.Contains(vocab.NonTechCategories, category) || classify.IsNonTech(title)
+	if slices.Contains(vocab.TechCategories, category) && !nonTech {
+		t := true
+		return &t
+	}
+	if nonTech {
+		f := false
+		return &f
+	}
+	return nil
+}
+
+// TechEvidence reports whether a job's category or title states a confidently technical
+// role. It is the positive half of the is_tech derivation, exposed because the ordering
+// it enforces — technical evidence before the non-tech dictionary — is load-bearing
+// outside this package too: the ingest filter and the prune rule both delete on the
+// non-tech dictionary, and that dictionary matches anywhere in a title, so without this
+// veto "Backend Engineer — Teller Systems" is removed on its accidental match.
+func TechEvidence(category, title string) bool {
+	return slices.Contains(vocab.TechCategories, category) || classify.IsTech(title)
+}
+
+// regionsForCountries derives the region codes for a set of already-resolved country
+// codes via the same country→region grouping Parse itself consults (location.CountryToRegion),
+// so a structured country signal with no separate region statement still lands under its
+// region facet. A country outside the curated ~133-country set silently contributes no
+// region — the same never-guess contract the location dictionary follows.
+func regionsForCountries(countries []string) []string {
+	countryToRegion := location.CountryToRegion()
+	set := make(map[string]struct{}, len(countries))
+	for _, c := range countries {
+		if r, ok := countryToRegion[c]; ok {
+			set[r] = struct{}{}
+		}
+	}
+	return stringset.Sorted(set)
+}
+
+// geoUnpinned reports whether the location dictionary left a job's geography unpinned —
+// no country resolved, and either no region or only the global bucket an explicit
+// open-anywhere marker resolves to. It is the gate for the eligibility override in
+// Derive: a resolved country or a specific region (e.g. "eu" from "Europe") is left
+// untouched, so the override only rescues a bare or "open anywhere" posting that also
+// carries a stated eligibility requirement.
+func geoUnpinned(countries, regions []string) bool {
+	if len(countries) != 0 {
+		return false
+	}
+	return len(regions) == 0 || (len(regions) == 1 && regions[0] == "global")
+}
+
+// unionSkills merges the structured source skills with the dictionary skills into a
+// deduped, sorted set. Both inputs are already canonical skill names; the result is
+// nil when both are empty (the dictionary's empty-not-nil contract is preserved by
+// callers that read Skills, which treat nil and empty alike).
+func unionSkills(source, dict []string) []string {
+	if len(source) == 0 {
+		return dict
+	}
+	set := make(map[string]struct{}, len(source)+len(dict))
+	for _, s := range source {
+		set[s] = struct{}{}
+	}
+	for _, s := range dict {
+		set[s] = struct{}{}
+	}
+	return stringset.Sorted(set)
+}
+
+// believableExperience drops a years-of-experience figure outside the range a posting
+// is believed to be stating about the candidate, leaving the facet unstated rather than
+// clamped: a clamp would assert a requirement the posting never made.
+func believableExperience(n *int) *int {
+	if n == nil || (*n >= 0 && *n <= vocab.MaxExperienceYears) {
+		return n
+	}
+	return nil
+}

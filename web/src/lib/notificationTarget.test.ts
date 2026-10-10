@@ -1,0 +1,90 @@
+import { describe, it, expect } from 'vitest';
+import { notificationTarget } from './notificationTarget';
+
+describe('notificationTarget', () => {
+  it('sends a reminder to its job', () => {
+    expect(notificationTarget({ kind: 'reminder', public_slug: 'acme-go-engineer' })).toEqual({
+      kind: 'job',
+      slug: 'acme-go-engineer',
+    });
+  });
+
+  it('sends a job-closed nudge to its job', () => {
+    expect(notificationTarget({ kind: 'nudge_job_closed', public_slug: 'acme-go-engineer' })).toEqual({
+      kind: 'job',
+      slug: 'acme-go-engineer',
+    });
+  });
+
+  it('sends a single-job subscription digest to its job', () => {
+    expect(notificationTarget({ kind: 'subscription_digest', public_slug: 'acme-go-engineer' })).toEqual({
+      kind: 'job',
+      slug: 'acme-go-engineer',
+    });
+  });
+
+  it('sends a multi-job digest to its own jobs-list page', () => {
+    expect(
+      notificationTarget({
+        id: 42,
+        kind: 'subscription_digest',
+        public_slug: null,
+        jobs: [{ title: 'A', company: 'Acme', slug: 'a' }],
+      }),
+    ).toEqual({ kind: 'digest', id: 42 });
+  });
+
+  it('sends a digest with neither a slug nor a jobs snapshot nowhere (defensive)', () => {
+    expect(notificationTarget({ id: 42, kind: 'subscription_digest', public_slug: null, jobs: null })).toEqual({
+      kind: 'none',
+    });
+  });
+
+  // The two nudge kinds the tracking board itself is about — even though the row
+  // still carries the job's slug (design.md decision 5), web links to the board.
+  it('sends a follow-up nudge to the tracking board, not the job', () => {
+    expect(notificationTarget({ kind: 'nudge_follow_up', public_slug: 'acme-go-engineer' })).toEqual({
+      kind: 'tracking',
+    });
+  });
+
+  it('sends an interview-prep nudge to the tracking board, not the job', () => {
+    expect(notificationTarget({ kind: 'nudge_interview_prep', public_slug: 'acme-go-engineer' })).toEqual({
+      kind: 'tracking',
+    });
+  });
+
+  // The three auto-apply outcome kinds now deep-link to the specific application's
+  // drawer, like auto_apply_ready_for_review already does — unlike follow-up/
+  // interview-prep above, which stay on the bare board.
+  it.each(['nudge_auto_apply_submitted', 'nudge_auto_apply_blocked', 'nudge_auto_apply_failed'] as const)(
+    'sends a %s nudge to the specific application',
+    (kind) => {
+      expect(notificationTarget({ kind, public_slug: 'acme-go-engineer' })).toEqual({
+        kind: 'tracking',
+        slug: 'acme-go-engineer',
+      });
+    },
+  );
+
+  // A nudge always carries a slug in practice, but the function is slug-first: no
+  // slug means nothing to open, even for a kind that would otherwise route to the
+  // tracking board.
+  it('sends nowhere when a nudge kind somehow has no slug', () => {
+    expect(notificationTarget({ kind: 'nudge_follow_up', public_slug: null })).toEqual({ kind: 'none' });
+  });
+
+  it('sends a tailored-CV-ready notification to the tailoring workspace, not the job page', () => {
+    expect(notificationTarget({ kind: 'auto_apply_tailor_ready', public_slug: 'acme-go-engineer' })).toEqual({
+      kind: 'tailor',
+      slug: 'acme-go-engineer',
+    });
+  });
+
+  it('sends an auto-apply ready-for-review notification to the tracking board, deep-linked to the job', () => {
+    expect(notificationTarget({ kind: 'auto_apply_ready_for_review', public_slug: 'acme-go-engineer' })).toEqual({
+      kind: 'tracking',
+      slug: 'acme-go-engineer',
+    });
+  });
+});

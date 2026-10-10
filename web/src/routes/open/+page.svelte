@@ -1,0 +1,436 @@
+<script lang="ts">
+  import { page } from '$app/state';
+  import { resolve } from '$app/paths';
+  import Seo from '$lib/components/Seo.svelte';
+  import ActivityBars from '$lib/components/ActivityBars.svelte';
+  import GrowthArea from '$lib/components/GrowthArea.svelte';
+  import SignupsBars from '$lib/components/SignupsBars.svelte';
+  import { OPEN_FAQ } from '$lib/openFaq';
+  import { breadcrumbJsonLd, datasetJsonLd, faqPageJsonLd, jsonLdScript } from '$lib/seo';
+  import { SENIORITY_LABELS, WORK_MODE_LABELS } from '$lib/labels';
+  import type { PageData } from './$types';
+
+  let { data }: { data: PageData } = $props();
+
+  const origin = $derived(page.url.origin);
+  const canonical = $derived(`${origin}/open`);
+  const description =
+    "The open startup page for freehire: live catalogue scale, daily job movement, what's inside, member growth, and open-source stats. Every figure comes straight from the public API.";
+  // llms.txt points AI engines here for the live figures ("cite that page rather
+  // than these floors"), so the page has to be readable as data, not just prose: a
+  // Dataset naming the public JSON endpoints each number is read from, plus a
+  // breadcrumb. The distributions mirror the per-stat source links below.
+  const jsonLd = $derived(
+    jsonLdScript([
+      datasetJsonLd("freehire's live catalogue and platform figures", description, canonical, origin, [
+        { name: 'Jobs API', contentUrl: `${origin}/api/v1/jobs` },
+        { name: 'Companies API', contentUrl: `${origin}/api/v1/companies` },
+      ]),
+      faqPageJsonLd(OPEN_FAQ),
+      breadcrumbJsonLd([
+        { name: 'freehire', url: `${origin}/` },
+        { name: 'Open', url: canonical },
+      ]),
+    ])
+  );
+
+  const nf = new Intl.NumberFormat('en');
+  const compactNf = new Intl.NumberFormat('en', { notation: 'compact', maximumFractionDigits: 1 });
+  // A null fallback means "omit this stat entirely". This is the transparency page: a
+  // figure it cannot source should disappear from the strip rather than fall back to a
+  // number baked in at build time, which is exactly the habit this page exists to break.
+  const fmt = <F extends string | null>(n: number | null, fallback: F) =>
+    n == null ? fallback : compactNf.format(n);
+
+  // "2026-09-04" → "since Sep 4, 2026", for the one figure that is not all-time.
+  //
+  // Formatted in UTC, not the reader's zone: a date-only ISO string parses as UTC
+  // midnight, so rendering it locally shows the day BEFORE for every visitor west of
+  // UTC — and this note exists to be precise about a window, which makes being off by
+  // a day the one error it cannot afford. A null (nothing rolled up yet) or an
+  // unparseable value drops the note rather than printing "Invalid Date".
+  const sinceFmt = new Intl.DateTimeFormat('en', {
+    timeZone: 'UTC',
+    year: 'numeric',
+    month: 'short',
+    day: 'numeric',
+  });
+  function sinceNote(day: string | null): string | undefined {
+    if (!day) return undefined;
+    const d = new Date(`${day}T00:00:00Z`);
+    if (Number.isNaN(d.getTime())) return undefined;
+    return `since ${sinceFmt.format(d)}`;
+  }
+
+  const regionNames = new Intl.DisplayNames(['en'], { type: 'region' });
+  function countryName(code: string): string {
+    try {
+      return regionNames.of(code.toUpperCase()) ?? code.toUpperCase();
+    } catch {
+      return code.toUpperCase();
+    }
+  }
+  // Skills are an open vocabulary with no shared map, so they keep the local
+  // sentence-cased fallback. Seniority and work mode are closed vocabularies that
+  // labels.ts already names — reading it here is what stops this page printing
+  // "C level" and "Onsite" while the rest of the app prints "C-level" and "On-site".
+  const sentenceCase = (s: string) => s.charAt(0).toUpperCase() + s.slice(1).replace(/_/g, ' ');
+  const labelled = (map: Record<string, string>) => (code: string) =>
+    map[code] ?? sentenceCase(code);
+
+  type Bar = { label: string; count: number };
+  function top(facet: Record<string, number> | undefined, n: number, label: (k: string) => string): Bar[] {
+    if (!facet) return [];
+    return Object.entries(facet)
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, n)
+      .map(([k, count]) => ({ label: label(k), count }));
+  }
+
+  const facets = $derived(data.facets);
+  const countries = $derived(top(facets?.countries, 8, countryName));
+  const skills = $derived(top(facets?.skills, 8, sentenceCase));
+  const seniority = $derived(top(facets?.seniority, 6, labelled(SENIORITY_LABELS)));
+  const workMode = $derived(top(facets?.work_mode, 3, labelled(WORK_MODE_LABELS)));
+
+  // The snapshot endpoint always returns the four facet keys (empty maps before the
+  // daily rollup's first run), so `facets` is truthy even when there's nothing to
+  // show. Gate the section on actual values so a not-yet-populated snapshot — or a
+  // failed load — falls back to the "unavailable" message instead of empty headings.
+  const hasFacets = $derived(
+    countries.length > 0 || skills.length > 0 || seniority.length > 0 || workMode.length > 0,
+  );
+
+  // Remote share across the resolved work-mode buckets.
+  const remoteShare = $derived.by(() => {
+    const wm = facets?.work_mode;
+    if (!wm) return null;
+    const total = Object.values(wm).reduce((a, b) => a + b, 0);
+    if (total === 0) return null;
+    return Math.round(((wm.remote ?? 0) / total) * 100);
+  });
+
+  // Every figure here comes from the one catalogue-scale snapshot, so the strip cannot
+  // show numbers measured at different moments. The platform and channel counts used to
+  // be constants in this file and went stale between deploys; they are now derived from
+  // the source registry and the crawled channel config.
+  //
+  // A degraded snapshot (no published measurement yet, or Redis unreachable) carries
+  // only the approximate job count and the registry figures — the counts that exist
+  // solely in the database come back zero, and a zero is dropped rather than rendered as
+  // a real "0 companies".
+  const stats = $derived(
+    [
+      { value: fmt(data.scale.jobs, null), label: 'postings tracked', href: '/api/v1/jobs' },
+      {
+        value: fmt(data.scale.browsableJobs, null),
+        label: 'unique jobs to browse',
+        href: resolve('/jobs'),
+      },
+      { value: fmt(data.scale.companies, null), label: 'companies', href: '/api/v1/companies' },
+      { value: fmt(data.scale.sources, null), label: 'sources', href: '/api/v1/stats/catalog' },
+      {
+        value: fmt(data.scale.telegramChannels, null),
+        label: 'Telegram channels',
+        href: '/api/v1/stats/catalog',
+      },
+    ].filter((s) => s.value !== null),
+  );
+
+  const gh = $derived(data.github);
+  const members = $derived.by(() => {
+    const last = data.growth[data.growth.length - 1];
+    return last ? last.total : null;
+  });
+
+  // Two rows of four on desktop: the first is finding and tracking work, the second
+  // is what people build on top of it (CV, AI read, mail). Order carries that
+  // grouping, so keep the halves intact when adding a counter.
+  //
+  // The first cell is the one exception in the grid, twice over, and its LABEL has to
+  // carry both: every other counter is signed-in members and all-time, while `viewed`
+  // is job-page opens by every visitor (three orders of magnitude larger by
+  // construction) measured only from the day the rollup began recording the
+  // bot-filtered column. The prose below is not enough for either — this grid gets
+  // screenshotted on its own, and read that way "jobs viewed 5.4M" beside "jobs saved
+  // 1,460" looks like a broken ratio rather than two different populations, and reads
+  // as the life of the site rather than a fortnight.
+  //
+  // The window comes from the API, never from a date written here: the API derives it
+  // from the data, so if the missing history is ever recovered the note widens on its
+  // own, and a hardcoded date would start lying the moment that happened.
+  //
+  // It is also the only cell rendered compactly ("5.4M"), like the catalogue strip
+  // above, while the other seven stay exact. Not a style inconsistency but the same
+  // split as everything else about this cell: a seven-digit figure is the only one that
+  // gains anything from being shortened, and compacting a neighbour would spend real
+  // precision to print "1.5K" where "1,460" already fit — beside a "506" that has no
+  // compact form at all, so the row would round some numbers and not others at a
+  // threshold nobody can see. Compact notation also BOUNDS the width for good ("1.2B"
+  // is four characters), which is what lets the figures keep the larger type below.
+  const engagement = $derived.by(() => {
+    const e = data.engagement;
+    if (!e) return null;
+    return [
+      {
+        value: compactNf.format(e.viewed),
+        label: 'job views, all visitors',
+        note: sinceNote(e.viewed_since),
+      },
+      { value: nf.format(e.saved), label: 'jobs saved' },
+      { value: nf.format(e.applied), label: 'applications' },
+      { value: nf.format(e.saved_searches), label: 'saved searches' },
+      { value: nf.format(e.cvs_uploaded), label: 'CVs uploaded' },
+      { value: nf.format(e.cvs_tailored), label: 'CVs tailored' },
+      { value: nf.format(e.match_analyses), label: 'matches analyzed' },
+      { value: nf.format(e.inboxes_connected), label: 'inboxes connected' },
+    ];
+  });
+</script>
+
+{#snippet distributionBars(items: Bar[])}
+  {@const peak = Math.max(1, ...items.map((i) => i.count))}
+  <div class="flex flex-col gap-2.5">
+    {#each items as it (it.label)}
+      <div class="flex items-center gap-3">
+        <div class="w-32 shrink-0 truncate text-sm" title={it.label}>{it.label}</div>
+        <div class="h-2.5 flex-1 overflow-hidden rounded-full bg-secondary">
+          <div class="h-full rounded-full bg-foreground" style="width: {(it.count / peak) * 100}%"></div>
+        </div>
+        <div class="w-16 shrink-0 text-right text-sm tabular-nums text-muted-foreground">
+          {compactNf.format(it.count)}
+        </div>
+      </div>
+    {/each}
+  </div>
+{/snippet}
+
+{#snippet sourceLink(href: string, label: string)}
+  <!-- eslint-disable svelte/no-navigation-without-resolve -- renders a caller-provided href (JSON API paths on /open), not an internal route -->
+  <a
+    {href}
+    class="font-mono text-xs text-muted-foreground underline-offset-4 hover:text-foreground hover:underline"
+  ><!-- eslint-enable svelte/no-navigation-without-resolve -->
+    {label} ↗
+  </a>
+{/snippet}
+
+<Seo
+  title="Open — freehire's numbers, live"
+  {description}
+  {canonical}
+  image={`${origin}/api/v1/og/open.png`}
+/>
+
+<svelte:head>
+  <!-- eslint-disable-next-line svelte/no-at-html-tags -- non-executable JSON-LD built by jsonLdScript, which escapes `<`; raw injection is the only way to emit a structured-data <script> -->
+  {@html jsonLd}
+</svelte:head>
+
+<div class="mx-auto w-full max-w-4xl px-4 py-10 sm:py-14">
+  <!-- Intro -->
+  <header class="dot-grid -mx-4 mb-12 px-4 pb-8 pt-4">
+    <p class="font-mono text-xs uppercase tracking-[0.2em] text-muted-foreground">// open startup</p>
+    <h1 class="mt-4 text-4xl font-semibold tracking-tighter sm:text-5xl">All our numbers, live.</h1>
+    <p class="mt-4 max-w-2xl text-lg leading-relaxed text-muted-foreground">
+      freehire is an open, free search engine for jobs — so our metrics are open too. Every figure
+      below is pulled live from the same public API anyone (or any AI agent) can query. No dashboards
+      behind a login, no vanity rounding.
+    </p>
+  </header>
+
+  <!-- A. Catalogue scale -->
+  <section class="mb-14">
+    <p class="font-mono text-xs uppercase tracking-[0.2em] text-muted-foreground">// the catalogue</p>
+    <!-- Wrapping flex, not a fixed grid: the strip holds five figures and drops any the
+         snapshot could not measure, so a fixed column count leaves a hole in the last row
+         — and with the separators drawn by the container's own colour showing through a
+         one-pixel gap, that hole rendered as a grey block. Here the last row's tiles grow
+         to fill the width instead. The tiles' own borders draw the separators, and the
+         negative margin pushes the outermost ones under the container's clipped edge. -->
+    <div class="mt-6 overflow-hidden rounded-xl border border-border">
+      <dl class="-mb-px -mr-px flex flex-wrap">
+        {#each stats as s (s.label)}
+          <!-- A two-line label must not push its figure down: the tile is a column and the
+               figure is pinned to its bottom, so every figure in a row shares one baseline. -->
+          <div class="flex min-w-36 flex-1 flex-col border-b border-r border-border p-5 sm:p-6">
+            <dt class="font-mono text-xs uppercase tracking-wide text-balance text-muted-foreground">{s.label}</dt>
+            <dd class="mt-auto pt-2 text-3xl font-semibold tracking-tight tabular-nums sm:text-4xl">
+              {#if s.href}
+                <!-- eslint-disable-next-line svelte/no-navigation-without-resolve -- links to the JSON API endpoint, not a SvelteKit route -->
+                <a href={s.href} class="hover:underline">{s.value}</a>
+              {:else}
+                {s.value}
+              {/if}
+            </dd>
+          </div>
+        {/each}
+      </dl>
+    </div>
+  </section>
+
+  <!-- B. Catalogue movement -->
+  <section class="mb-14">
+    <div class="flex items-baseline justify-between">
+      <p class="font-mono text-xs uppercase tracking-[0.2em] text-muted-foreground">// daily movement</p>
+      {@render sourceLink('/api/v1/stats/jobs-activity', '/stats/jobs-activity')}
+    </div>
+    <h2 class="mt-3 text-xl font-semibold tracking-tight">Jobs added vs. removed</h2>
+    <p class="mb-6 mt-1 text-sm text-muted-foreground">
+      New vacancies crawled in versus postings we detected as closed, per day.
+    </p>
+    <ActivityBars points={data.activity} />
+  </section>
+
+  <!-- F. Member growth -->
+  <section class="mb-14">
+    <div class="flex items-baseline justify-between">
+      <p class="font-mono text-xs uppercase tracking-[0.2em] text-muted-foreground">// members</p>
+      {@render sourceLink('/api/v1/stats/user-growth', '/stats/user-growth')}
+    </div>
+    <h2 class="mt-3 text-xl font-semibold tracking-tight">
+      {members == null ? 'People on freehire' : `${nf.format(members)} people on freehire`}
+    </h2>
+    <p class="mb-6 mt-1 text-sm text-muted-foreground">
+      Cumulative registered members over time. Early days — and that's the point of showing it.
+    </p>
+    <GrowthArea points={data.growth} />
+    <h3 class="mt-8 text-base font-semibold tracking-tight">New members per day</h3>
+    <p class="mb-6 mt-1 text-sm text-muted-foreground">
+      Same series, not cumulative — how many people signed up on each day.
+    </p>
+    <SignupsBars points={data.growth} />
+  </section>
+
+  <!-- Engagement -->
+  <section class="mb-14">
+    <div class="flex items-baseline justify-between">
+      <p class="font-mono text-xs uppercase tracking-[0.2em] text-muted-foreground">// engagement</p>
+      {@render sourceLink('/api/v1/stats/engagement', '/stats/engagement')}
+    </div>
+    <h2 class="mt-3 text-xl font-semibold tracking-tight">What people do here</h2>
+    <p class="mb-6 mt-1 text-sm text-muted-foreground">
+      Job pages opened by every visitor, signed in or not, and bot-filtered — counted only from the
+      day we started filtering, which is why that one carries a date. Then the signed-in interactions
+      on top, all-time: postings tracked, CVs written and tailored to a vacancy, matches analyzed
+      against a CV, and inboxes wired up for application mail.
+    </p>
+    {#if engagement}
+      <dl class="grid grid-cols-2 gap-px overflow-hidden rounded-xl border border-border bg-border sm:grid-cols-4">
+        {#each engagement as e (e.label)}
+          <div class="flex flex-col bg-background p-5 sm:p-6">
+            <!-- The window rides in the LABEL, above the figure, not under it: the
+                 numbers are bottom-aligned across the row by `mt-auto`, so a caption
+                 below one of them would lift that cell's number out of line with its
+                 seven neighbours. -->
+            <dt class="font-mono text-xs uppercase tracking-wide text-balance text-muted-foreground">
+              {e.label}{#if e.note}<span class="block normal-case opacity-70">{e.note}</span>{/if}
+            </dt>
+            <!-- This type size is safe only because the view count is rendered compactly:
+                 spelled out, its seven digits overflowed a 1/4-width cell into the
+                 neighbour, and no font size fits a figure that keeps growing. Compact
+                 notation is what bounds it ("1.2B" is four characters), so a figure that
+                 goes exact again has to come back down to text-2xl/sm:text-3xl. -->
+            <dd class="mt-auto pt-2 text-3xl font-semibold tracking-tight tabular-nums sm:text-4xl">{e.value}</dd>
+          </div>
+        {/each}
+      </dl>
+    {:else}
+      <p class="text-sm text-muted-foreground">Engagement data is unavailable right now.</p>
+    {/if}
+  </section>
+
+  <!-- C. What's inside -->
+  <section class="mb-14">
+    <div class="flex items-baseline justify-between">
+      <p class="font-mono text-xs uppercase tracking-[0.2em] text-muted-foreground">// what's inside</p>
+      {@render sourceLink('/api/v1/stats/facets', '/stats/facets')}
+    </div>
+    {#if hasFacets}
+      <div class="mt-6 grid gap-x-10 gap-y-8 sm:grid-cols-2">
+        <div>
+          <h3 class="mb-4 text-sm font-semibold">Top countries</h3>
+          {@render distributionBars(countries)}
+        </div>
+        <div>
+          <h3 class="mb-4 text-sm font-semibold">Top skills</h3>
+          {@render distributionBars(skills)}
+        </div>
+        <div>
+          <h3 class="mb-4 text-sm font-semibold">Seniority</h3>
+          {@render distributionBars(seniority)}
+        </div>
+        <div>
+          <h3 class="mb-4 text-sm font-semibold">
+            Work mode{#if remoteShare != null}<span class="ml-2 font-normal text-muted-foreground">{remoteShare}% remote</span>{/if}
+          </h3>
+          {@render distributionBars(workMode)}
+        </div>
+      </div>
+    {:else}
+      <p class="mt-6 text-sm text-muted-foreground">Distribution data is unavailable right now.</p>
+    {/if}
+  </section>
+
+  <!-- D. Open source -->
+  <section class="mb-6">
+    <div class="flex items-baseline justify-between">
+      <p class="font-mono text-xs uppercase tracking-[0.2em] text-muted-foreground">// open source</p>
+      {@render sourceLink('https://github.com/strelov1/freehire', 'github.com/strelov1/freehire')}
+    </div>
+    <div class="mt-6 rounded-xl border border-border p-6 sm:p-8">
+      {#if gh}
+        <div class="flex flex-wrap gap-x-12 gap-y-6">
+          <div>
+            <div class="text-3xl font-semibold tabular-nums">{nf.format(gh.stars)}</div>
+            <div class="font-mono text-xs uppercase tracking-wide text-muted-foreground">stars</div>
+          </div>
+          <div>
+            <div class="text-3xl font-semibold tabular-nums">{nf.format(gh.forks)}</div>
+            <div class="font-mono text-xs uppercase tracking-wide text-muted-foreground">forks</div>
+          </div>
+          {#if gh.contributors != null}
+            <!-- The one figure here that is about people rather than the repository, so
+                 it leads to their pages on this site rather than to GitHub's graph.
+                 Guarded by the same `!= null` as before: a degraded GitHub leg drops the
+                 figure entirely rather than rendering a link with nothing behind it. -->
+            <a href={resolve('/contributors')} class="group">
+              <div class="text-3xl font-semibold tabular-nums group-hover:underline">
+                {nf.format(gh.contributors)}
+              </div>
+              <div class="font-mono text-xs uppercase tracking-wide text-muted-foreground">contributors</div>
+            </a>
+          {/if}
+          {#if gh.license}
+            <div>
+              <div class="text-3xl font-semibold">{gh.license}</div>
+              <div class="font-mono text-xs uppercase tracking-wide text-muted-foreground">license</div>
+            </div>
+          {/if}
+        </div>
+      {/if}
+      <p class="mt-6 max-w-xl text-sm leading-relaxed text-muted-foreground">
+        The whole pipeline is open source. Missing a job source you use? Adding it is usually one
+        small adapter — <a
+          href="https://github.com/strelov1/freehire"
+          class="font-medium text-foreground underline-offset-4 hover:underline">a PR is very welcome</a
+        >.
+      </p>
+    </div>
+  </section>
+
+  <!-- E. FAQ. Visible answers and the FAQPage JSON-LD share OPEN_FAQ; the schema is
+       only honest while this section renders. Kept last so the numbers stay the
+       page's opening subject. -->
+  <section class="mt-14">
+    <p class="font-mono text-xs uppercase tracking-[0.2em] text-muted-foreground">// about these numbers</p>
+    <dl class="mt-6 grid gap-px overflow-hidden rounded-xl border border-border bg-border sm:grid-cols-2">
+      {#each OPEN_FAQ as item (item.question)}
+        <div class="bg-background p-5 sm:p-6">
+          <dt class="text-base font-semibold tracking-tight">{item.question}</dt>
+          <dd class="mt-2 text-sm leading-relaxed text-muted-foreground">{item.answer}</dd>
+        </div>
+      {/each}
+    </dl>
+  </section>
+</div>

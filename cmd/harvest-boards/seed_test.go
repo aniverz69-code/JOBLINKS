@@ -1,0 +1,68 @@
+package main
+
+import (
+	"os"
+	"path/filepath"
+	"reflect"
+	"testing"
+)
+
+func TestChooseCompany(t *testing.T) {
+	// A real API name (different from the board id) always wins.
+	if got := chooseCompany("Acme Inc", "Role Co", "acme"); got != "Acme Inc" {
+		t.Errorf("api name should win, got %q", got)
+	}
+	// A platform that publishes no employer name reports "", and the seed's name fills in.
+	if got := chooseCompany("", "Acme From Role", "acme"); got != "Acme From Role" {
+		t.Errorf("seed name should fill empty, got %q", got)
+	}
+	// No usable name anywhere falls back to the board id.
+	if got := chooseCompany("", "", "acme"); got != "acme" {
+		t.Errorf("should fall back to board, got %q", got)
+	}
+}
+
+func TestLoadSeedItemsStringArray(t *testing.T) {
+	path := writeTemp(t, `["a", "b", "c"]`)
+	got, err := loadSeedItems(path)
+	if err != nil {
+		t.Fatalf("loadSeedItems: %v", err)
+	}
+	want := []seedItem{{Board: "a"}, {Board: "b"}, {Board: "c"}}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("got %v, want %v", got, want)
+	}
+}
+
+func TestLoadSeedItemsObjectArray(t *testing.T) {
+	path := writeTemp(t, `[{"board":"x","company":"X Corp"},{"board":"y"}]`)
+	got, err := loadSeedItems(path)
+	if err != nil {
+		t.Fatalf("loadSeedItems: %v", err)
+	}
+	want := []seedItem{{Board: "x", Company: "X Corp"}, {Board: "y"}}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("got %v, want %v", got, want)
+	}
+}
+
+func TestLoadSeedItemsExpectedPostingID(t *testing.T) {
+	path := writeTemp(t, `[{"board":"x","expect_id":"4698693006"},{"board":"y","company":"Y Co"}]`)
+	got, err := loadSeedItems(path)
+	if err != nil {
+		t.Fatalf("loadSeedItems: %v", err)
+	}
+	want := []seedItem{{Board: "x", ExpectID: "4698693006"}, {Board: "y", Company: "Y Co"}}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("got %v, want %v", got, want)
+	}
+}
+
+func writeTemp(t *testing.T, content string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "seed.json")
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}

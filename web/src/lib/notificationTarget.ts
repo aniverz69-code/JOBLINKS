@@ -1,0 +1,61 @@
+// Where tapping a notification card navigates — the pure decision behind design.md's
+// decision 5 (openspec/changes/add-notification-center), kept out of the component so
+// it can be tested without mounting Svelte.
+
+import type { NotificationItem } from './types';
+
+export type NotificationTarget =
+  | { kind: 'job'; slug: string }
+  | { kind: 'tracking'; slug?: string }
+  | { kind: 'digest'; id: number }
+  | { kind: 'tailor'; slug: string }
+  | { kind: 'none' };
+
+/** A card with no `public_slug` and no `jobs` snapshot has nothing to open.
+ *  `nudge_follow_up`/`nudge_interview_prep` point at the bare tracking board on
+ *  web — matching the existing Telegram/email link target for those two kinds —
+ *  even though the row itself always carries a slug: neither kind has a specific
+ *  drawer affordance worth deep-linking to today. The three auto-apply outcome
+ *  kinds (`nudge_auto_apply_submitted`/`blocked`/`failed`) used to follow that
+ *  same rule, but now deep-link to the specific application instead, like
+ *  `auto_apply_ready_for_review` below — internal/engage/nudge's
+ *  transports.go now builds a per-application link for these three kinds too,
+ *  and the drawer has a status banner for every live auto-apply state, so there
+ *  is always something worth jumping straight to. `auto_apply_tailor_ready` points
+ *  at the tailoring workspace, not the job page — `/tailor/[slug]` idempotently
+ *  resolves the same tailored CV a fresh tailoring bootstrap would (see
+ *  openspec/changes/auto-apply-tailored-resume), so no CV id needs to travel with
+ *  the notification. Historical rows only: auto-apply-review-tracking moved this
+ *  notification to fire later, as `auto_apply_ready_for_review`, which points at the
+ *  tracking board deep-linked to the job's own drawer (`tracking.slug`) — the
+ *  tailoring workspace has no approve/decline affordance and was never meant to be
+ *  one. Every other slug-bearing kind (reminder, nudge_job_closed, a single-job
+ *  subscription_digest) points at the job. A multi-job subscription digest carries
+ *  no slug but does carry `jobs` — it points at its own jobs-list page instead. */
+export function notificationTarget(
+  item: Pick<NotificationItem, 'kind' | 'public_slug'> & Partial<Pick<NotificationItem, 'id' | 'jobs'>>,
+): NotificationTarget {
+  if (item.public_slug) {
+    if (item.kind === 'nudge_follow_up' || item.kind === 'nudge_interview_prep') {
+      return { kind: 'tracking' };
+    }
+    if (
+      item.kind === 'nudge_auto_apply_submitted' ||
+      item.kind === 'nudge_auto_apply_blocked' ||
+      item.kind === 'nudge_auto_apply_failed'
+    ) {
+      return { kind: 'tracking', slug: item.public_slug };
+    }
+    if (item.kind === 'auto_apply_tailor_ready') {
+      return { kind: 'tailor', slug: item.public_slug };
+    }
+    if (item.kind === 'auto_apply_ready_for_review') {
+      return { kind: 'tracking', slug: item.public_slug };
+    }
+    return { kind: 'job', slug: item.public_slug };
+  }
+  if (item.kind === 'subscription_digest' && item.jobs && item.jobs.length > 0 && item.id != null) {
+    return { kind: 'digest', id: item.id };
+  }
+  return { kind: 'none' };
+}

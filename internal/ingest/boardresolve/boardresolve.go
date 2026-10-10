@@ -1,0 +1,108 @@
+// Package boardresolve is the network fallback for the paste-a-link contribution flow: when a
+// URL's host is not a recognized ATS (e.g. a company careers page on its own domain with an
+// embedded ATS — company.com/careers?gh_jid=…), it fetches the page and detects the embedded
+// board via internal/ingest/atsdetect. It satisfies contribution.Resolver.
+//
+// Only providers whose (provider, board) matches how the ingest pipeline namespaces
+// jobs.external_id are accepted, so the resolved board dedups correctly against the catalogue.
+// The fetch uses the SSRF-guarded sources client (it refuses internal/metadata targets), since
+// the URL is attacker-influenced.
+package boardresolve
+
+import (
+	"context"
+	"net/url"
+
+	"github.com/strelov1/freehire/internal/ingest/atsboard"
+	"github.com/strelov1/freehire/internal/ingest/atsdetect"
+	"github.com/strelov1/freehire/internal/ingest/sources"
+)
+
+// trusted lists the providers whose atsdetect (provider, board) equals the ingest
+// external_id namespace, so a resolved board is dedup-correct. These three embed the board
+// slug directly in the linked URL (verified against prod external_ids).
+//
+// It gates atsdetect's output only. atsdetect can also return icims/oracle/taleo/neogov/
+// paycom (via FromURL) and radancy/phenom/jibe/teamtailor (via the self-hosted markers);
+// those are deliberately NOT accepted here, because their board identity is a host or a
+// host+path that has not been checked against how ingest namespaces external_id. Widening
+// the set is a feature, and it needs that check first.
+//
+// Do not list a provider atsdetect cannot produce: the entry reads as coverage and is
+// unreachable. "workable" sat here doing exactly that — atsdetect's matcher table covers
+// greenhouse/lever/ashby, FromURL has no apply.workable.com case, and the self-hosted
+// markers explicitly exclude it.
+var trusted = map[string]bool{
+	"greenhouse": true,
+	"lever":      true,
+	"ashby":      true,
+}
+
+// textFetcher is the slice of the sources client this package needs (a raw, SSRF-guarded,
+// size-capped GET). *sources.Client satisfies it.
+type textFetcher interface {
+	GetText(ctx context.Context, url string) (string, error)
+}
+
+// Resolver fetches an unrecognized careers page and detects the embedded ATS board.
+type Resolver struct {
+	http textFetcher
+}
+
+// New builds a Resolver over the default SSRF-guarded sources client.
+func New() *Resolver { return &Resolver{http: sources.NewClient()} }
+
+// Resolve fetches rawURL and finds the ATS board it belongs to, returning the catalogue
+// (source, board) and a canonical URL to store. It looks two ways:
+//  1. the Greenhouse embed shape (script for=<board>) via atsdetect — which the URL recognizer
+//     can't parse, since the board is in the query param and the path holds only machinery;
+//  2. any supported ATS apply/board URL embedded in the page, run through the full
+//     atsboard.Recognize (all ~40 ATS, all modes) — this catches a company careers page
+//     that links to its recruitee/peopleforce/zoho/workday board;
+//  3. the platforms whose board IS the careers host (Radancy/Phenom/Jibe/Teamtailor), via
+//     atsdetect.DetectSelfHosted — a site that links to no ATS host because it is the ATS.
+//
+// ok=false when the fetch fails or no board is found.
+func (r *Resolver) Resolve(ctx context.Context, rawURL string) (source, board, canonical string, ok bool) {
+	html, err := r.http.GetText(ctx, rawURL)
+	if err != nil {
+		return "", "", "", false
+	}
+
+	// 1. Greenhouse embed (and atsdetect's own gh/lever/ashby URL scan). Trusted set only.
+	if provider, slug, ok := atsdetect.Detect(html); ok && trusted[provider] && slug != "" {
+		return provider, slug, stripTails(rawURL), true
+	}
+
+	// 2. Any supported ATS URL in the page, via the full recognizer. First recognized wins.
+	for _, u := range atsdetect.AbsURLRe.FindAllString(html, -1) {
+		if s, b, _, matched := atsboard.Recognize(u); matched {
+			return s, b, stripTails(rawURL), true
+		}
+	}
+
+	// 3. The host IS the board. Radancy, Phenom, Jibe and Teamtailor tenants serve from the
+	//    employer's own domain and need link out to no ATS host at all, so both steps above come
+	//    up empty however plainly the page is a career site. The platform's fingerprint in the
+	//    markup names the provider, and the fetched host is the board — which is exactly what
+	//    these adapters namespace jobs.external_id by, so it dedups against the catalogue.
+	if u, err := url.Parse(rawURL); err == nil {
+		if provider, board, ok := atsdetect.DetectSelfHosted(html, u.Hostname()); ok {
+			return provider, board, stripTails(rawURL), true
+		}
+	}
+	return "", "", "", false
+}
+
+// stripTails returns rawURL without its query string or fragment (the identifying part of a
+// vanity careers URL is the path; the board itself comes from the page). Falls back to the raw
+// string if it does not parse.
+func stripTails(rawURL string) string {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return rawURL
+	}
+	u.RawQuery = ""
+	u.Fragment = ""
+	return u.String()
+}

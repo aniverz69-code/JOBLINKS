@@ -1,0 +1,375 @@
+# web-ssr-seo Specification
+
+## Purpose
+TBD - created by archiving change web-sveltekit-ssr. Update Purpose after archive.
+## Requirements
+### Requirement: Public pages are server-rendered
+
+The frontend SHALL render the public read pages — the jobs list (`/jobs`), job
+detail (`/jobs/:slug`), companies list (`/companies`), and company detail
+(`/companies/:slug`) — on the server, so the initial HTML response contains the
+page's primary content (job titles/descriptions, company info) before any
+client JavaScript runs. The page SHALL then hydrate on the client to become
+interactive. The data needed for SSR SHALL be fetched server-side against the
+backend API, forwarding the incoming request's session cookie so an
+authenticated request renders the correct content.
+
+#### Scenario: Job detail content is in the initial HTML
+
+- **WHEN** a crawler or client requests `GET /jobs/:slug` for an existing job
+- **THEN** the returned HTML body already contains the job's title, company, and
+  description text (not an empty `<div id="app"></div>` shell)
+
+#### Scenario: Listing content is in the initial HTML
+
+- **WHEN** a crawler or client requests `GET /jobs` or `GET /companies`
+- **THEN** the returned HTML body already contains the first page of rendered
+  rows
+
+#### Scenario: A missing job server-renders an error state
+
+- **WHEN** the backend returns 404 for the requested slug
+- **THEN** the server responds with an error page (not a 200 empty shell), and
+  the response status reflects that the resource is not found
+
+### Requirement: Per-route document metadata
+
+Each server-rendered page SHALL emit route-specific document `<head>` metadata in
+its initial HTML: a descriptive `<title>`, a `<meta name="description">`, a
+canonical URL, and Open Graph / Twitter Card tags. The job-detail page's title
+and description SHALL derive from the job (e.g. title and company), replacing the
+single static `freehire` title used for every URL.
+
+The job-detail page SHALL additionally emit an `og:image` pointing at that job's
+preview image (`/jobs/:slug/og.png`) as an absolute URL, with its declared
+dimensions (1200×630) and an `og:image:alt`, and SHALL use the
+`summary_large_image` Twitter Card with a matching `twitter:image`. The metadata
+component SHALL treat the preview image as optional: routes that pass no image
+keep the prior `summary` Twitter Card behaviour and emit no `og:image`.
+
+#### Scenario: Job page has a job-specific title and canonical
+
+- **WHEN** `GET /jobs/:slug` is requested for an existing job
+- **THEN** the HTML `<head>` contains a `<title>` built from the job's title and
+  company, a `<meta name="description">`, a `<link rel="canonical">` to the
+  job's canonical URL, and Open Graph tags
+
+#### Scenario: Job page emits a large-image preview
+
+- **WHEN** `GET /jobs/:slug` is requested for an existing job
+- **THEN** the HTML `<head>` contains an `og:image` whose absolute URL ends in
+  `/jobs/:slug/og.png`, with `og:image:width` 1200 and `og:image:height` 630,
+  and a `twitter:card` of `summary_large_image`
+
+#### Scenario: List pages carry their own metadata
+
+- **WHEN** a public list page (`/jobs`, `/companies`) is requested
+- **THEN** its `<head>` carries a page-appropriate title, description, and
+  canonical URL distinct from the job-detail metadata, and — having no preview
+  image — keeps the `summary` Twitter Card with no `og:image`
+
+### Requirement: JobPosting structured data
+
+The job-detail page SHALL include a `JobPosting` JSON-LD `<script type="application/ld+json">`
+block in its server-rendered HTML, populated from the job's public fields
+(title, description, hiring organization, location/remote, posting date, and the
+application URL), so the posting is eligible for Google Jobs. The `JobPosting`
+SHALL additionally carry, each only when the underlying data is present: the
+hiring organization's `logo`, the job's `skills`, an `experienceRequirements`
+derived from the minimum years of experience, and an `educationRequirements`
+derived from the required education level. Company pages SHALL
+include `Organization` JSON-LD, and that `Organization` object SHALL carry every
+company-info fact the company row provides — its logo, description, homepage and
+LinkedIn links (as `sameAs`), founding year, employee count, and HQ country — so
+the company reads as a recognizable entity, while omitting any of those fields
+the company does not have.
+
+#### Scenario: Job page emits valid JobPosting JSON-LD
+
+- **WHEN** `GET /jobs/:slug` is requested for an existing job
+- **THEN** the HTML contains one `application/ld+json` script with `@type`
+  `JobPosting` whose `title`, `description`, `hiringOrganization`, and
+  `datePosted` reflect the job
+
+#### Scenario: A closed job reflects its status in structured data
+
+- **WHEN** the job carries a `closed_at`
+- **THEN** the `JobPosting` data conveys that the posting is no longer accepting
+  applications rather than presenting it as open
+
+#### Scenario: JobPosting carries logo, skills, and requirements when present
+
+- **WHEN** `GET /jobs/:slug` is requested for a job that has a company name,
+  dictionary skills, a positive minimum years of experience, and a degree-level
+  education requirement
+- **THEN** the `JobPosting` includes a `hiringOrganization.logo` URL, a `skills`
+  value listing those skills, an `experienceRequirements` of type
+  `OccupationalExperienceRequirements` whose `monthsOfExperience` equals the
+  minimum years × 12, and an `educationRequirements` of type
+  `EducationalOccupationalCredential` with a `credentialCategory`
+
+#### Scenario: Absent or signal-free enrichment fields are omitted
+
+- **WHEN** the job has no skills, a minimum experience of zero, and an education
+  level of `none`
+- **THEN** the `JobPosting` omits `skills`, `experienceRequirements`, and
+  `educationRequirements` entirely rather than emitting empty or zero values
+
+#### Scenario: Company Organization carries its known company-info facts
+
+- **WHEN** `GET /companies/:slug` is requested for a company whose `company_info`
+  provides a logo, description, homepage/LinkedIn links, founding year, employee
+  count, and HQ country
+- **THEN** the emitted `Organization` JSON-LD includes `logo`, `description`, a
+  `sameAs` array holding those links, `foundingDate`, `numberOfEmployees`, and an
+  `address` with the country code
+
+#### Scenario: Missing company-info facts are omitted, not emitted empty
+
+- **WHEN** the company has no `company_info` (or only some of its fields)
+- **THEN** the `Organization` JSON-LD still emits `name` and `url` and simply
+  omits every fact the company lacks (no empty strings, null values, or empty
+  arrays)
+
+### Requirement: Collection landing structured data
+
+The collection landing page (`GET /collections/:slug`) SHALL emit a
+`CollectionPage` JSON-LD block whose `mainEntity` is an `ItemList` of the
+first page of jobs already rendered on the page. Each `ItemList` entry SHALL be a
+summary `ListItem` carrying its 1-based `position`, the job `name`, and the
+absolute `url` of the job-detail page — never an embedded full `JobPosting`, so
+the list page presents the recommended summary shape rather than many nested
+postings.
+
+#### Scenario: Collection page emits CollectionPage with a job ItemList
+
+- **WHEN** `GET /collections/:slug` is requested for a collection that has jobs
+- **THEN** the HTML contains an `application/ld+json` script with `@type`
+  `CollectionPage` whose `mainEntity` is an `ItemList` whose `itemListElement`
+  entries each carry `position`, `name`, and a `url` pointing at `/jobs/:slug`
+
+#### Scenario: An empty collection emits an empty ItemList, not broken JSON-LD
+
+- **WHEN** `GET /collections/:slug` is requested for a collection with no jobs on
+  the first page
+- **THEN** the `CollectionPage` is still valid JSON-LD with an `ItemList` whose
+  `itemListElement` is an empty array
+
+### Requirement: robots.txt and sitemap
+
+The site SHALL serve a real `GET /robots.txt` (a valid robots file that allows
+crawling of public pages and references the sitemap) and a `GET /sitemap.xml`
+that is a valid **sitemap index** (`<sitemapindex>`) referencing sub-sitemaps for
+the static pages, the jobs, and the companies. Neither the index nor any
+sub-sitemap SHALL return the HTML application shell, and each SHALL be valid XML.
+Every sub-sitemap SHALL hold at most 50,000 URLs (the sitemap-protocol limit).
+Every company with at least one FINDABLE role (`/companies/:slug`) SHALL be
+enumerated across keyset-cursor-paged company sub-sitemaps, and a company with
+none SHALL NOT appear. "Findable" is the job search index's own scope — open,
+non-duplicate, non-private, categorized, with a body — because the company page's
+job list is served by that index, so a company outside it has a page that renders
+its name and "0 open jobs". The scope is carried by `companies.job_count`, which
+`RefreshCompanyFacets` computes under exactly those predicates.
+
+The jobs are carried by **two kinds of sub-sitemap, and the difference between them
+is the ordering guarantee**. The paged job sub-sitemaps SHALL enumerate the whole
+findable job catalogue across offset-addressed chunks, in **unspecified order**: they
+are drawn from the search index's document store, which can address any offset
+directly but cannot sort, and that is what let the sitemap stop asking Postgres to
+number millions of rows on every render. Separately, a **freshest-first job
+sub-sitemap** SHALL list open jobs ordered by creation time, newest first, bounded to
+a fixed recent window, and SHALL be listed in the index **ahead of** the paged
+chunks. Both draw on the same findable scope, so a job appears in both, which the
+sitemap protocol permits.
+
+The freshest-first file exists because a crawler's budget is finite and arbitrary
+order spends it on postings the crawler already holds. Measured on prod over
+2026-09-09..19: of 153,030 newly created findable jobs, OAI-SearchBot first fetched
+27,447 — 17.9% — while spending ~54k requests a day against a flow of ~11k eligible
+new postings a day. The ordering is the whole point of the file; a test that asserts
+only its shape would pass against the defect this requirement exists to prevent.
+
+An offset past the end of either kind SHALL return an empty `<urlset>`, never an
+error: a crawler holding a stale sitemap index must not be answered with a failure.
+
+`<lastmod>` is the job's last-modified time and SHALL be emitted whenever the index
+holds one. It is NOT the value either job sub-sitemap is ordered by — the freshest-first
+file is ordered by CREATION time, which no `<lastmod>` reports — so the ordering
+guarantee above cannot be checked by reading dates out of the XML, and a check that
+tried would pass against a wrongly-ordered file. A document indexed before the
+attribute joined the shape carries no `<lastmod>` and SHALL still be listed: the tag is
+optional in the protocol, and dropping the URL would cost a crawlable page to save an
+optional field.
+
+#### Scenario: robots.txt is a valid robots file
+
+- **WHEN** `GET /robots.txt` is requested
+- **THEN** the response is a `text/plain` robots file (not HTML) that references
+  the sitemap URL
+
+#### Scenario: sitemap.xml is a sitemap index
+
+- **WHEN** `GET /sitemap.xml` is requested
+- **THEN** the response is valid XML with a `<sitemapindex>` root listing
+  sub-sitemap `<loc>` URLs for the static pages, the freshest-first jobs, the paged
+  jobs, and every company chunk, and it does not contain job or company page `<url>`
+  entries directly
+
+#### Scenario: the job sub-sitemap lists the freshest open jobs
+
+- **WHEN** the freshest-first job sub-sitemap is requested at its first offset
+- **THEN** the response is a valid `<urlset>` of open-job (`/jobs/:slug`) URLs whose
+  entries are in non-increasing order of the job's CREATION time — the newest job in
+  the catalogue first — each carrying a `<lastmod>` when the index holds one
+
+#### Scenario: the freshest-first sub-sitemap is listed before the paged chunks
+
+- **WHEN** `GET /sitemap.xml` is requested
+- **THEN** every freshest-first job sub-sitemap `<loc>` appears in the index before
+  the first paged job sub-sitemap `<loc>`
+
+#### Scenario: the freshest-first window is bounded
+
+- **WHEN** the freshest-first job sub-sitemap is requested at an offset past the end
+  of its window
+- **THEN** the response is a valid, empty `<urlset>` and not an error
+
+#### Scenario: the paged job sub-sitemaps cover the whole findable catalogue
+
+- **WHEN** the index's paged job sub-sitemaps are followed in sequence by their
+  offsets
+- **THEN** every findable open job appears, each entry is a `/jobs/:slug` URL carrying
+  a `<lastmod>` when the index holds one, no closed job appears, and no sub-sitemap
+  exceeds the per-file limit
+
+#### Scenario: company sub-sitemaps cover every company worth crawling
+
+- **WHEN** the index's company sub-sitemaps are followed in sequence by their
+  slug cursors
+- **THEN** every company holding at least one findable role appears in exactly one
+  sub-sitemap, with no artificial cap
+
+#### Scenario: a company with nothing findable is not in the sitemap
+
+- **WHEN** a company's only open postings are private, body-less, or of a category
+  no dictionary resolved — so its page's job list renders empty
+- **THEN** no company sub-sitemap lists its `/companies/:slug` URL
+
+### Requirement: Collection landing pages are indexable
+
+The frontend SHALL serve a server-rendered landing page at `GET /collections/:slug`
+for each curated collection, so the collection's job feed and its curated copy are
+in the initial HTML. The page SHALL emit collection-specific document metadata: a
+`<title>` and `<meta name="description">` distinct from the generic `/jobs` list,
+a `<link rel="canonical">` pointing at its own `/collections/:slug` URL (never the
+bare `/jobs`), and a single visible `<h1>` naming the collection. The page SHALL
+render the collection's open jobs by pinning the collection's facet params (e.g.
+`collections=<slug>`, or `work_mode`/`regions`/`countries` for an attribute
+collection) as a fixed scope the visitor can further filter but cannot remove. An
+unrecognised slug SHALL return a 404 (not a 200 empty or unfiltered page). Each
+collection landing page SHALL be enumerated in the sitemap.
+
+#### Scenario: A collection has its own canonical landing page
+
+- **WHEN** `GET /collections/:slug` is requested for a known collection
+- **THEN** the HTML `<head>` contains a collection-specific `<title>`, a
+  `<meta name="description">`, and a `<link rel="canonical">` whose URL is that
+  same `/collections/:slug` (not `/jobs`)
+
+#### Scenario: The landing page shows the collection's jobs in the initial HTML
+
+- **WHEN** `GET /collections/:slug` is requested for a known collection with open jobs
+- **THEN** the returned HTML body contains a single `<h1>` naming the collection
+  and the first page of that collection's job rows (not an empty shell)
+
+#### Scenario: An unknown collection slug is a 404
+
+- **WHEN** `GET /collections/:slug` is requested for a slug that maps to no collection
+- **THEN** the server responds with a 404 status and an error page
+
+#### Scenario: Collection landing pages are in the sitemap
+
+- **WHEN** the sitemap's static-pages sub-sitemap is requested
+- **THEN** it lists a `<loc>` for the `/collections` hub and for each collection's
+  `/collections/:slug` landing page
+
+### Requirement: Public list pages carry a primary heading
+
+The public list pages (`/jobs` and `/companies`) SHALL each render exactly one visible `<h1>` describing the page's content, so the primary heading is present for search engines and assistive technology. Every API-reference endpoint page (`/docs/api/:group/:endpoint`) SHALL likewise carry one, taken from the endpoint's summary — the method and path are the identifier and already carry the `<title>`, while the summary is what the page is about.
+
+#### Scenario: The jobs list has a top-level heading
+
+- **WHEN** `GET /jobs` is requested
+- **THEN** the returned HTML body contains exactly one `<h1>` describing the jobs list
+
+#### Scenario: The companies list has a top-level heading
+
+- **WHEN** `GET /companies` is requested
+- **THEN** the returned HTML body contains exactly one `<h1>` describing the companies list
+
+### Requirement: A listing URL with nothing on it is not served as a page
+
+`parsePage` clamps `?page=N` to the deepest page the search window reaches rather
+than rejecting it, so every listing route hands out addresses for pages its results
+do not fill. Those SHALL NOT be served: a listing route (`/`, `/collections/:slug`,
+`/companies/:slug`) SHALL respond 404 when the requested page number is past the
+last page its matches populate. Page 1 SHALL always be served, whatever the result
+count — a listing that is empty today is a real landing page that refills.
+
+A company page SHALL emit `<meta name="robots" content="noindex, follow">` when its
+job list rendered zero results, because `companies.job_count` — which gates the
+sitemap — counts open, non-duplicate rows while the page lists what the JOB search
+index holds, which additionally excludes private jobs, jobs with no body, and jobs
+whose category no dictionary resolved. An employer hiring only for roles that fail
+the second test reaches the sitemap with nothing to show. The directive SHALL be
+omitted when the count is unknown: a failed search resolves to null so the header
+and facts still render, and that must not be spelled the same way as an empty
+company.
+
+#### Scenario: A page past the last populated one is a 404
+
+- **WHEN** `GET /collections/:slug?page=N` is requested with N greater than the
+  number of pages the collection's matches fill
+- **THEN** the server responds 404, rather than 200 with an empty feed under a
+  self-referencing canonical
+
+#### Scenario: An empty listing still serves its first page
+
+- **WHEN** `GET /collections/:slug` is requested for a collection with no open jobs
+- **THEN** the server responds 200 and renders the page's own empty state
+
+#### Scenario: A company with nothing findable asks not to be indexed
+
+- **WHEN** `GET /companies/:slug` is requested for a company whose job search
+  returns zero results
+- **THEN** the `<head>` contains `<meta name="robots" content="noindex, follow">`
+
+#### Scenario: A company with open roles stays indexable
+
+- **WHEN** `GET /companies/:slug` is requested for a company whose job search
+  returns results
+- **THEN** the `<head>` contains no `robots` meta tag
+
+#### Scenario: An API endpoint page has a top-level heading
+
+- **WHEN** `GET /docs/api/:group/:endpoint` is requested for a documented endpoint
+- **THEN** the returned HTML body contains exactly one `<h1>`, holding that
+  endpoint's summary
+
+### Requirement: Collection landing pages are linked from every page
+
+The site footer SHALL render the popular collections as real `<a href>` anchors to
+their `/collections/:slug` landing pages, in the server-rendered HTML. Collection
+landings are the site's programmatic-SEO surface, and their only internal links came
+from the `/collections` hub and the job-detail "see also" block — the homepage, the
+strongest page on the domain, linked twenty jobs, four feature pages and no
+collection at all. Every slug SHALL resolve through the same resolver the landing
+route and the sitemap use, and an unresolvable slug SHALL be dropped rather than
+linked: a footer is the worst place to advertise a 404.
+
+#### Scenario: Any page links the popular collections
+
+- **WHEN** any public page is requested
+- **THEN** its HTML contains `<a href>` anchors to several distinct
+  `/collections/:slug` landing pages
+

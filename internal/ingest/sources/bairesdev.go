@@ -1,0 +1,263 @@
+package sources
+
+import (
+	"context"
+	"encoding/base64"
+	"encoding/json"
+	"fmt"
+	"regexp"
+	"strings"
+)
+
+// bairesdev adapts BairesDev, a Latin-American software-outsourcing company. It has no crawlable
+// ATS board — its applicants portal's openings list is login-gated — but its public talent site
+// (talent.bairesdev.com) embeds the whole open-req list client-side in a Duda job widget's base64
+// config, each row carrying an apply link to applicants.bairesdev.com/job/<career>/<id>. So the
+// crawl reads that single page, dedups the country/city-template rows by the numeric job id (the
+// site lists one posting once per location under a shared id), and hydrates each distinct id from
+// the public per-job endpoint (/api/JobPosting?JobPostingId=<id>) — the same schema.org JSON-LD
+// the linksource adapter reads, giving a clean title, description, date, and remote flag.
+// Single-company (every posting is BairesDev) and boardless, so its config entry is a placeholder.
+//
+// Outbound links are attributable: BairesDev pays a bounty for a referred candidate who is
+// hired and stays, and it is earned only when the candidate arrives carrying a referrer code.
+// See applyURL.
+type bairesdev struct {
+	http bairesDevHTTP
+	// referral is the BairesDev referrer code outbound links are attributed to, from
+	// BAIRESDEV_REFERRER_CODE (see registry.go). Empty means unattributed: the URL stays the
+	// plain apply link, which is what an installation that is not a BairesDev referrer —
+	// including every fork of this repository — gets.
+	referral string
+}
+
+// bairesDevHTTP is the transport bairesdev needs: the talent site's raw HTML (to read the embedded
+// widget config) plus the JSON per-job endpoint.
+type bairesDevHTTP interface {
+	TextGetter
+	JSONGetter
+}
+
+const (
+	bairesDevListURL = "https://talent.bairesdev.com/"
+	// bairesDevJobPostingURL is the SEO JSON-LD endpoint: clean title, real posted date, and
+	// remote flag, but only a short teaser description.
+	bairesDevJobPostingURL = "https://applicants.bairesdev.com/api/JobPosting?JobPostingId=%s"
+	// bairesDevJobDetailURL is the apply-flow endpoint: it carries the FULL HTML description
+	// (JobPosting's is truncated to a blurb), but no date/location, so the two are merged.
+	bairesDevJobDetailURL = "https://applicants.bairesdev.com/api/Job?JobOfferId=%s"
+	bairesDevApplyURL     = "https://applicants.bairesdev.com/job/%s/%s/apply"
+)
+
+// NewBairesDev builds the BairesDev adapter over the given HTTP client, attributing outbound
+// links to the given referrer code (empty = unattributed, see bairesdev.referral).
+func NewBairesDev(c bairesDevHTTP, referral string) Source {
+	if !bairesDevReferrerCodePattern.MatchString(referral) {
+		referral = "" // absent or malformed: crawl unattributed rather than emit a broken link
+	}
+	return bairesdev{http: c, referral: referral}
+}
+
+// bairesDevReferrerCodePattern is the shape of a BairesDev referrer code: the opaque
+// alphanumeric token its share links carry. The code is interpolated into an outbound URL, so
+// anything else is rejected at construction rather than escaped — a code is copied from the
+// referral dashboard by hand, and a malformed one is a misconfiguration to notice.
+var bairesDevReferrerCodePattern = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
+
+// applyURL hangs the configured referrer code off the apply link, which is all BairesDev needs:
+// its apply flow keeps the parameter across the hop to the login/register step (verified live —
+// clicking Apply on a job carrying ?referrer=<code> lands on
+// /login?careerId=…&jobId=…&referrer=<code>), so a candidate who signs up from our link is
+// attributed. An unset code leaves the plain apply link alone.
+func (b bairesdev) applyURL(applyLink string) string {
+	if b.referral == "" {
+		return applyLink
+	}
+	return applyLink + "?referrer=" + b.referral
+}
+
+func (bairesdev) Provider() string { return "bairesdev" }
+
+// bairesdev has one global talent listing, so its config entry carries no board.
+func (bairesdev) boardless() {}
+
+// bairesDevRef is one distinct posting to hydrate: the career-site id and the job id parsed from a
+// listing row's apply link, plus the locations aggregated from every row that shares this job id
+// (the site lists the same posting once per location, so the union is where the role is open —
+// e.g. "Brazil, Colombia, Mexico, Latin America" for a LatAm role, "United States" for a US one).
+// The applicants JobPosting endpoint's applicantLocationRequirements is a generic 45-country
+// boilerplate identical across all postings, so the listing rows are the only per-job geography.
+type bairesDevRef struct {
+	careerID string
+	jobID    string
+	location string
+}
+
+// bairesDevWidgetConfig extracts the base64 Duda job-widget config from the talent site HTML.
+var bairesDevWidgetConfig = regexp.MustCompile(`data-widget-config="([A-Za-z0-9+/=]+)"`)
+
+// bairesDevApplyPath captures the career-site id and job id from an apply URL.
+var bairesDevApplyPath = regexp.MustCompile(`/job/(\d+)/(\d+)/apply`)
+
+func (b bairesdev) Fetch(ctx context.Context, _ CompanyEntry) ([]Job, error) {
+	page, err := b.http.GetText(ctx, bairesDevListURL)
+	if err != nil {
+		return nil, fmt.Errorf("bairesdev: fetch talent listing: %w", err)
+	}
+	refs, err := parseBairesDevListing(page)
+	if err != nil {
+		return nil, fmt.Errorf("bairesdev: %w", err)
+	}
+	// The listing carries only the apply id; the clean title, description, date, and remote flag
+	// come from the per-job endpoint, so each ref is hydrated (skipped on a per-job failure so one
+	// bad id never aborts the crawl).
+	return fetchDetails(refs, defaultDetailWorkers, func(r bairesDevRef) (Job, bool) {
+		return b.detail(ctx, r)
+	}), nil
+}
+
+// parseBairesDevListing decodes the talent site's embedded widget config and returns each distinct
+// posting, deduped by job id (the site lists the same posting once per country/city under a shared
+// id, so dedup collapses the location templates to the real openings).
+func parseBairesDevListing(page string) ([]bairesDevRef, error) {
+	m := bairesDevWidgetConfig.FindStringSubmatch(page)
+	if m == nil {
+		return nil, fmt.Errorf("no job widget on talent listing")
+	}
+	raw, err := base64.StdEncoding.DecodeString(m[1])
+	if err != nil {
+		return nil, fmt.Errorf("decode widget config: %w", err)
+	}
+	var cfg struct {
+		JobList []struct {
+			URL   string `json:"page_item_url"`
+			Title string `json:"jobTitle"`
+		} `json:"jobList"`
+	}
+	if err := json.Unmarshal(raw, &cfg); err != nil {
+		return nil, fmt.Errorf("parse widget config: %w", err)
+	}
+	// Aggregate by job id: the same posting appears once per location, so union the location tails
+	// of every row sharing an id (insertion order, deduped) into the ref's location.
+	byJob := map[string]*bairesDevRef{}
+	var order []string
+	for _, j := range cfg.JobList {
+		mm := bairesDevApplyPath.FindStringSubmatch(j.URL)
+		if mm == nil {
+			continue
+		}
+		careerID, jobID := mm[1], mm[2]
+		ref, ok := byJob[jobID]
+		if !ok {
+			ref = &bairesDevRef{careerID: careerID, jobID: jobID}
+			byJob[jobID] = ref
+			order = append(order, jobID)
+		}
+		if loc := bairesDevTitleLocation(j.Title); loc != "" && !strings.Contains(ref.location, loc) {
+			if ref.location == "" {
+				ref.location = loc
+			} else {
+				ref.location += ", " + loc
+			}
+		}
+	}
+	if len(order) == 0 {
+		return nil, fmt.Errorf("no apply links in widget config")
+	}
+	refs := make([]bairesDevRef, 0, len(order))
+	for _, jobID := range order {
+		refs = append(refs, *byJob[jobID])
+	}
+	return refs, nil
+}
+
+// bairesDevTitleLocation returns the location tail of a widget row title
+// ("Python Developer | Remote Work | Brazil" → "Brazil"), or "" when the title carries no location
+// segment. The listing embeds the per-variant location only in the title (the JobPosting title is
+// location-stripped), so this is the sole per-job geography.
+func bairesDevTitleLocation(title string) string {
+	parts := strings.Split(title, "|")
+	if len(parts) < 3 {
+		return "" // not the "role | Remote Work | location" shape
+	}
+	loc := strings.TrimSpace(parts[len(parts)-1])
+	if strings.EqualFold(loc, "Remote Work") {
+		return ""
+	}
+	return loc
+}
+
+// bairesDevPosting selects the JobPosting ld+json fields the public endpoint returns.
+type bairesDevPosting struct {
+	Title              string `json:"title"`
+	Description        string `json:"description"`
+	DatePosted         string `json:"datePosted"`
+	JobLocationType    string `json:"jobLocationType"`
+	HiringOrganization struct {
+		Name string `json:"name"`
+	} `json:"hiringOrganization"`
+}
+
+// detail hydrates one posting: the JobPosting endpoint supplies the clean title, real date, and
+// remote flag; the Job endpoint supplies the full description (JobPosting's is truncated). The
+// external id and URL match the linksource adapter exactly, so a job crawled here and one followed
+// from a Telegram link dedup into a single row. ok=false (skip) when the id no longer resolves to a
+// live posting.
+func (b bairesdev) detail(ctx context.Context, r bairesDevRef) (Job, bool) {
+	var p bairesDevPosting
+	if err := b.http.GetJSON(ctx, fmt.Sprintf(bairesDevJobPostingURL, r.jobID), &p); err != nil {
+		return Job{}, false
+	}
+	if strings.TrimSpace(p.Title) == "" {
+		return Job{}, false // no live posting under this id
+	}
+
+	// The full description lives on the apply-flow endpoint; fall back to the JobPosting teaser
+	// when it is unavailable, so a Job-endpoint hiccup degrades the text instead of dropping the job.
+	desc := b.fullDescription(ctx, r.jobID)
+	if desc == "" {
+		desc = p.Description
+	}
+	// datePosted has no timezone (e.g. "2025-06-02T10:23:21.503"), so RFC3339 rejects it; fall
+	// back to the date alone, keeping the approximate posted_at.
+	posted := parseRFC3339(p.DatePosted)
+	if posted == nil && len(p.DatePosted) >= 10 {
+		posted = parseDate(p.DatePosted[:10])
+	}
+	company := p.HiringOrganization.Name
+	if company == "" {
+		company = "BairesDev"
+	}
+	mode := ""
+	if strings.EqualFold(p.JobLocationType, "TELECOMMUTE") {
+		mode = "remote"
+	}
+	return Job{
+		ExternalID:  r.jobID,
+		URL:         b.applyURL(fmt.Sprintf(bairesDevApplyURL, r.careerID, r.jobID)),
+		Title:       p.Title,
+		Company:     company,
+		Location:    r.location,
+		Description: sanitizeHTML(desc),
+		Remote:      mode == "remote",
+		WorkMode:    mode,
+		PostedAt:    posted,
+	}, true
+}
+
+// fullDescription reads the full HTML description from the apply-flow endpoint
+// (jobResults[0].description), or "" when the endpoint fails or carries no result.
+func (b bairesdev) fullDescription(ctx context.Context, jobID string) string {
+	var resp struct {
+		JobResults []struct {
+			Description string `json:"description"`
+		} `json:"jobResults"`
+	}
+	if err := b.http.GetJSON(ctx, fmt.Sprintf(bairesDevJobDetailURL, jobID), &resp); err != nil {
+		return ""
+	}
+	if len(resp.JobResults) == 0 {
+		return ""
+	}
+	return resp.JobResults[0].Description
+}

@@ -1,0 +1,13 @@
+{
+  "name": "freehire",
+  "image": "mcr.microsoft.com/devcontainers/base:ubuntu",
+  "features": {
+    "ghcr.io/devcontainers/features/docker-in-docker:2": {}
+  },
+  "hostRequirements": { "cpus": 4, "memory": "8gb", "storage": "32gb" },
+  "forwardPorts": [8090],
+  "portsAttributes": {
+    "8090": { "label": "freehire web", "onAutoForward": "notify" }
+  },
+  "postStartCommand": "bash .devcontainer/setup.sh"
+}

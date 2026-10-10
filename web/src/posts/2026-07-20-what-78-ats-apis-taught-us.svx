@@ -1,0 +1,85 @@
+---
+title: 78 applicant-tracking systems, one schema
+date: 2026-07-20
+summary: We now pull jobs straight from 78 different ATS platforms. Normalizing them into a single shape meant meeting each API exactly where it lives — and they live in very different places.
+type: article
+tags:
+  - sources
+  - ats
+  - engineering
+draft: false
+---
+
+freehire's promise is boring on purpose: every posting, normalized into one
+shape, deduplicated, linking back to the company's own careers page. The boring
+part is the point. The unglamorous part is that "one shape" hides a long tail of
+applicant-tracking systems that agree on almost nothing about how you're supposed
+to read them.
+
+As of this week the catalogue pulls from **78 ATS platforms** — 2.9M open
+postings between them. Here's what integrating that many taught us, grouped not by
+vendor but by the kind of problem each one hands you.
+
+## The clean ones
+
+A handful of platforms make aggregation genuinely boring — the good kind. Lever
+(`api.lever.co/v0/postings`), Ashby (`api.ashbyhq.com/posting-api/job-board`),
+Greenhouse, SmartRecruiters: a public, documented JSON endpoint per board, sane
+pagination, stable field names. You point an adapter at a company's board token
+and you're done. Most of the long tail of company entries in freehire — one line
+of YAML each — rides on these four, because adding a company is trivial when the
+platform already speaks clean JSON.
+
+If you're a job board deciding what to build: this is the bar. A boring, stable
+JSON feed is the single kindest thing you can do for everyone downstream of you.
+
+## The heavyweights
+
+The five biggest by volume tell the story: Workday (831,217 open postings),
+Oracle (291,963), SmartRecruiters (257,443), Greenhouse (178,084) and iCIMS
+(122,532). Workday alone is a quarter of everything. At that scale the quirks stop being
+curiosities and become correctness problems: a paginated endpoint that reports a
+total of zero on a transient error will, if you trust it blindly, "close" tens of
+thousands of live jobs in a single bad run. Volume forces you to treat every
+count the source gives you as a claim to verify, not a fact.
+
+## The streamers
+
+Some platforms don't hand you a paginated API at all — they hand you the whole
+thing at once. nofluffjobs answers its listing as a single ~60 MB document;
+several isolved tenants ship their entire job sitemap as one stream. You cannot
+buffer these into memory and parse them; the adapter has to stream-decode as the
+bytes arrive. It's a good reminder that "the API" is sometimes just "a very large
+file," and your reader has to be built for that from the start.
+
+## The stateful ones
+
+Then there are the platforms where you can't make the first useful request until
+you've earned a credential. Cornerstone embeds a JSON config blob with a
+short-lived JWT read token on the careers page; you scrape the token, then send it
+as a Bearer to the real search endpoint. Taleo wants a session and the right
+timezone before it will talk. None of this is documented — you infer the
+handshake by watching what the browser does, then reproduce it.
+
+## The hydrating ones
+
+The last group has no API in any honest sense. The jobs live inside the page —
+embedded JSON, JSON-LD, or a framework's server-rendered hydration payload
+(Next.js flight data, an SSR data island). The "integration" is really an
+extraction: find where the structured data hides in the HTML and pull it out
+before it becomes pixels.
+
+## The takeaway
+
+One schema is worth the tax. From the outside freehire looks like a single feed
+with faceted filters; underneath, every one of those 78 platforms needed its own
+answer to the same three questions — how do I list, how do I paginate, how do I
+read one posting. The value isn't any single adapter. It's that once a posting
+clears the pipeline, nothing downstream — search, dedup, the API, you — has to
+care which of these worlds it came from.
+
+The whole pipeline and the full per-source breakdown are open source; the
+[Sources table in the README](https://github.com/strelov1/freehire#sources) lists
+every platform and its live count. If that kind of thing is useful to you — or you
+just like jobs straight from the source — a
+[⭐ on GitHub](https://github.com/strelov1/freehire) helps other people find it.

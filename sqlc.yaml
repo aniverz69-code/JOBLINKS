@@ -1,0 +1,126 @@
+version: "2"
+sql:
+  - engine: "postgresql"
+    schema: "migrations"
+    queries: "internal/platform/db/queries"
+    gen:
+      go:
+        package: "db"
+        out: "internal/platform/db"
+        sql_package: "pgx/v5"
+        emit_json_tags: true
+        emit_interface: true
+        emit_empty_slices: true
+        rename:
+          # Go initialism: column "url" -> field URL (not Url). JSON tag stays "url".
+          url: "URL"
+        overrides:
+          # Read jobs.enrichment as json.RawMessage, not []byte. RawMessage keeps
+          # the JSONB blob as raw bytes that marshal straight through to the API
+          # response (an empty payload stays {}); a plain []byte would base64-encode.
+          - column: "jobs.enrichment"
+            go_type: "encoding/json.RawMessage"
+          # Same reasoning for the company-info extras JSONB: raw bytes marshal
+          # straight through to the company-detail response ({} stays {}), not base64.
+          - column: "companies.company_info"
+            go_type: "encoding/json.RawMessage"
+          # A multi-job digest's job snapshot ({title, company, slug}[]): raw JSON
+          # round-trips whole into the notification-detail response (NULL stays
+          # null for every other kind), where a []byte would base64-encode it.
+          - column: "user_notifications.jobs"
+            go_type: "encoding/json.RawMessage"
+          # The profile location block: raw JSON round-trips whole. The service
+          # marshals a validated, normalized block (or NULL for none), and the stored
+          # bytes marshal straight through to the profile response (null stays null).
+          - column: "user_profiles.location_preferences"
+            go_type: "encoding/json.RawMessage"
+          # Referral ids are random UUIDs for the same reason CV ids are, and with
+          # a sharper edge: an incoming request's CV is served to an approved
+          # referrer rather than to the owner, so its check is a membership
+          # question — the kind that is expensive to get wrong once.
+          - column: "referral_offers.id"
+            go_type: "github.com/google/uuid.UUID"
+          - column: "referral_requests.id"
+            go_type: "github.com/google/uuid.UUID"
+          # A CV id is a random UUID the client treats as an opaque string, and the
+          # two columns that reference it follow. google/uuid gives them a real
+          # type, so a mis-typed id fails at the edge rather than deep in a query.
+          - column: "cvs.id"
+            go_type: "github.com/google/uuid.UUID"
+          # A revision's own id and the CV it belongs to follow the same rule. batch_id
+          # and reverts_id are pointers because most revisions have neither: a change
+          # made by hand belongs to no agent run, and only an undo reverts something.
+          - column: "cv_revisions.id"
+            go_type: "github.com/google/uuid.UUID"
+          - column: "cv_revisions.cv_id"
+            go_type: "github.com/google/uuid.UUID"
+          - column: "cv_revisions.batch_id"
+            go_type:
+              import: "github.com/google/uuid"
+              type: "UUID"
+              pointer: true
+          - column: "cv_revisions.reverts_id"
+            go_type:
+              import: "github.com/google/uuid"
+              type: "UUID"
+              pointer: true
+          # What a revision did and what would undo it: raw JSON round-trips whole into
+          # the feed response, where a []byte would base64-encode both.
+          - column: "cv_revisions.ops"
+            go_type: "encoding/json.RawMessage"
+          - column: "cv_revisions.inverse"
+            go_type: "encoding/json.RawMessage"
+          - column: "referral_requests.cv_id"
+            go_type:
+              import: "github.com/google/uuid"
+              type: "UUID"
+              pointer: true
+          # The tailored CV an auto-apply queue entry's tailoring run produced (openspec/
+          # changes/auto-apply-tailored-resume) — nullable until tailoring finishes.
+          - column: "auto_apply_queue.tailored_cv_id"
+            go_type:
+              import: "github.com/google/uuid"
+              type: "UUID"
+              pointer: true
+          # A session id is a random UUID the client treats as an opaque string.
+          # google/uuid gives it a real type (parse errors surface at the edge)
+          # rather than pgtype.UUID's byte array, which every caller would have to
+          # convert by hand.
+          - column: "assistant_sessions.id"
+            go_type: "github.com/google/uuid.UUID"
+          - column: "assistant_messages.session_id"
+            go_type: "github.com/google/uuid.UUID"
+          - column: "assistant_sessions.cv_id"
+            go_type:
+              import: "github.com/google/uuid"
+              type: "UUID"
+              pointer: true
+          - column: "assistant_sessions.job_id"
+            go_type:
+              type: "int64"
+              pointer: true
+          # An assistant message's payload: prose, a tool call, or a tool result. It is
+          # stored and replayed verbatim, so raw JSON round-trips whole — a []byte would
+          # base64-encode it into the transcript response.
+          - column: "assistant_messages.content"
+            go_type: "encoding/json.RawMessage"
+          # Experience-bank ids are random UUIDs for the same reason CV and session ids
+          # are: the client treats them as opaque strings, and a real type puts a
+          # mis-typed id at the edge rather than deep in a query. employment_id is a
+          # pointer because an atom may stand alone — evidence that belongs to no single
+          # job (a certification, a skill used across roles) is not an anomaly here.
+          - column: "experience_employments.id"
+            go_type: "github.com/google/uuid.UUID"
+          - column: "experience_atoms.id"
+            go_type: "github.com/google/uuid.UUID"
+          - column: "experience_atoms.employment_id"
+            go_type:
+              import: "github.com/google/uuid"
+              type: "UUID"
+              pointer: true
+          # The Talent Network public profile id follows the same opaque-id rule as
+          # cvs.id/session ids above: it addresses an unauthenticated public route, so
+          # it must be a real UUID type the client treats as an opaque string rather
+          # than a bigint that would leak signup order.
+          - column: "users.talent_network_public_id"
+            go_type: "github.com/google/uuid.UUID"

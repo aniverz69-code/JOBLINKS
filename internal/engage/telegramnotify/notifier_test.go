@@ -1,0 +1,308 @@
+package telegramnotify
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"strconv"
+	"strings"
+	"testing"
+	"unicode/utf16"
+
+	"github.com/strelov1/freehire/internal/engage/notify"
+)
+
+func TestNotifier_Render(t *testing.T) {
+	n := NewNotifier(NewClient("t"), "https://freehire.me/")
+	d := notify.Digest{
+		SavedSearchName: "Go & <remote>",
+		Total:           3,
+		Jobs: []notify.DigestJob{
+			{Title: "Go Dev <x>", Company: "Acme", Slug: "go-dev-acme",
+				SalaryMin: 130000, SalaryMax: 170000, SalaryCurrency: "USD", SalaryPeriod: "year"},
+			{Title: "Rustacean", Company: "", Slug: "rustacean-foo"},
+		},
+	}
+	got := n.render(d)
+
+	// Heading reflects the true total and pluralizes; the name is HTML-escaped.
+	if !strings.Contains(got, "<b>3</b> new jobs for") {
+		t.Errorf("missing heading: %q", got)
+	}
+	if !strings.Contains(got, "Go &amp; &lt;remote&gt;") {
+		t.Errorf("saved-search name not HTML-escaped: %q", got)
+	}
+	// Line: a bullet whose escaped title links to the freehire job page (trailing
+	// slash trimmed) tagged with the telegram UTM, then " — Company · salary".
+	if want := `• <a href="https://freehire.me/jobs/go-dev-acme?utm_source=telegram-bot">Go Dev &lt;x&gt;</a> — Acme · $130K—$170K / year`; !strings.Contains(got, want) {
+		t.Errorf("line missing %q in: %q", want, got)
+	}
+	// A job with no company/salary omits those suffixes but still renders the link.
+	if want := `• <a href="https://freehire.me/jobs/rustacean-foo?utm_source=telegram-bot">Rustacean</a>` + "\n"; !strings.Contains(got, want) {
+		t.Errorf("company/salary-less line wrong: %q", got)
+	}
+	if strings.Contains(got, " — ·") || strings.Count(got, "·") != 1 {
+		t.Errorf("empty company/salary suffixes should be omitted: %q", got)
+	}
+	// Total 3 but only 2 listed → "+ 1 more".
+	if !strings.Contains(got, "+ 1 more") {
+		t.Errorf("missing overflow summary: %q", got)
+	}
+}
+
+func TestNotifier_RenderSingularNoOverflow(t *testing.T) {
+	n := NewNotifier(NewClient("t"), "https://freehire.me")
+	got := n.render(notify.Digest{SavedSearchName: "x", Total: 1, Jobs: []notify.DigestJob{{Title: "A", Slug: "a"}}})
+	if !strings.Contains(got, "<b>1</b> new job for") || strings.Contains(got, "more") {
+		t.Errorf("singular render wrong: %q", got)
+	}
+}
+
+// A digest of many long-title jobs must stay within Telegram's 4096-code-unit
+// sendMessage limit — otherwise the send fails deterministically, every retry
+// re-fails, and the whole batch is dead-lettered (the user loses all of it). The
+// jobs that don't fit fall into the "+ N more" tail, and none are lost.
+func TestNotifier_RenderCapsAtTelegramLimit(t *testing.T) {
+	n := NewNotifier(NewClient("t"), "https://freehire.me")
+	const total = 20
+	// Long enough that fewer than notify.ListLimit lines fit, so the length guard
+	// — not the product bound — is what stops the loop.
+	longTitle := strings.Repeat("Senior Staff Platform Reliability Engineer ", 15)
+	jobs := make([]notify.DigestJob, total)
+	for i := range jobs {
+		jobs[i] = notify.DigestJob{
+			Title:   longTitle,
+			Company: "A Rather Long Company Name Incorporated",
+			Slug:    strings.Repeat("some-long-job-slug-", 5),
+		}
+	}
+	got := n.render(notify.Digest{SavedSearchName: "big search", Total: total, Jobs: jobs})
+
+	if n16 := len(utf16.Encode([]rune(got))); n16 > 4096 {
+		t.Errorf("rendered %d UTF-16 units, want <= 4096 (Telegram sendMessage limit)", n16)
+	}
+	shown := strings.Count(got, "• ")
+	if shown == 0 || shown >= notify.ListLimit {
+		t.Errorf("shown = %d, want fewer than the %d-job product bound — the length guard must bite first", shown, notify.ListLimit)
+	}
+	if !strings.Contains(got, "more") {
+		t.Errorf("dropped jobs must be summarized by a '+ N more' tail: %q", got)
+	}
+}
+
+func TestNotifier_Send(t *testing.T) {
+	var gotPath string
+	var gotBody map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		body, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(body, &gotBody)
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer srv.Close()
+
+	c := NewClient("BOTTOKEN")
+	c.base = srv.URL
+	n := NewNotifier(c, "https://freehire.me")
+
+	err := n.Send(context.Background(), notify.ChannelTelegram, "12345", notify.Digest{SavedSearchName: "x", Total: 1, Jobs: []notify.DigestJob{{Title: "A", Slug: "a"}}})
+	if err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	if gotPath != "/botBOTTOKEN/sendMessage" {
+		t.Errorf("path = %q, want /botBOTTOKEN/sendMessage", gotPath)
+	}
+	if gotBody["chat_id"].(float64) != 12345 {
+		t.Errorf("chat_id = %v, want 12345", gotBody["chat_id"])
+	}
+	if gotBody["parse_mode"] != "HTML" {
+		t.Errorf("parse_mode = %v, want HTML", gotBody["parse_mode"])
+	}
+}
+
+func TestNotifier_SendBadChatID(t *testing.T) {
+	n := NewNotifier(NewClient("t"), "https://freehire.me")
+	if err := n.Send(context.Background(), notify.ChannelTelegram, "not-a-number", notify.Digest{}); err == nil {
+		t.Error("Send with non-numeric dest succeeded, want error")
+	}
+}
+
+func TestClient_PropagatesAPIError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"ok":false,"description":"chat not found"}`))
+	}))
+	defer srv.Close()
+
+	c := NewClient("t")
+	c.base = srv.URL
+	err := c.SendMessage(context.Background(), 1, "hi")
+	if err == nil || !strings.Contains(err.Error(), "chat not found") {
+		t.Errorf("SendMessage err = %v, want it to carry the API description", err)
+	}
+}
+
+func TestStartToken(t *testing.T) {
+	cases := []struct {
+		text      string
+		wantOK    bool
+		wantToken string
+	}{
+		{"/start abc123", true, "abc123"},
+		{"/start   abc123  ", true, "abc123"},
+		{"/start", false, ""},
+		{"/start ", false, ""},
+		{"hello", false, ""},
+	}
+	for _, tc := range cases {
+		u := Update{}
+		u.Message = &struct {
+			Chat struct {
+				ID int64 `json:"id"`
+			} `json:"chat"`
+			Text string `json:"text"`
+		}{Text: tc.text}
+		u.Message.Chat.ID = 99
+
+		tok, chat, ok := StartToken(u)
+		if ok != tc.wantOK || tok != tc.wantToken {
+			t.Errorf("StartToken(%q) = (%q,%v), want (%q,%v)", tc.text, tok, ok, tc.wantToken, tc.wantOK)
+		}
+		if ok && chat != 99 {
+			t.Errorf("StartToken(%q) chat = %d, want 99", tc.text, chat)
+		}
+	}
+}
+
+func TestStartToken_NilMessage(t *testing.T) {
+	if _, _, ok := StartToken(Update{}); ok {
+		t.Error("StartToken(empty update) ok = true, want false")
+	}
+}
+
+// --- listing bound and the "view all" destination --------------------------
+
+func tgDigest(n int, notificationID int64) notify.Digest {
+	d := notify.Digest{SavedSearchName: "Go", Total: n, NotificationID: notificationID}
+	for i := range n {
+		d.Jobs = append(d.Jobs, notify.DigestJob{Title: "Job", Slug: "job-" + strconv.Itoa(i)})
+	}
+	return d
+}
+
+func TestNotifier_RenderListsAtMostTenJobs(t *testing.T) {
+	n := NewNotifier(NewClient("t"), "https://freehire.me")
+	got := n.render(tgDigest(67, 42))
+
+	if shown := strings.Count(got, "• "); shown != notify.ListLimit {
+		t.Errorf("listed %d jobs, want %d", shown, notify.ListLimit)
+	}
+	if !strings.Contains(got, "<b>67</b> new jobs for") {
+		t.Errorf("heading must still carry the true count: %q", got)
+	}
+	if want := `<a href="https://freehire.me/my/notifications/42/jobs?utm_source=telegram-bot">+ 57 more</a>`; !strings.Contains(got, want) {
+		t.Errorf("tail missing %q in: %q", want, got)
+	}
+}
+
+func TestNotifier_RenderTailFallsBackWithoutANotificationID(t *testing.T) {
+	n := NewNotifier(NewClient("t"), "https://freehire.me")
+	got := n.render(tgDigest(67, 0))
+
+	if strings.Contains(got, "/my/notifications/0/jobs") {
+		t.Errorf("a zero notification id must not be rendered as a URL: %q", got)
+	}
+	if want := `<a href="https://freehire.me/my/notifications">+ 57 more</a>`; !strings.Contains(got, want) {
+		t.Errorf("tail missing fallback %q in: %q", want, got)
+	}
+}
+
+// Every 403 the Bot API answers a send with means the same thing — this chat will
+// not take messages again — and the engines act on it by forgetting the link. The
+// status code is the signal, deliberately not the description: that text is prose
+// Telegram may reword, and a rule keyed to one sentence would stop firing silently.
+func TestClient_ForbiddenIsChatUnreachable(t *testing.T) {
+	for _, desc := range []string{
+		"Forbidden: bot was blocked by the user",
+		"Forbidden: user is deactivated",
+		"Forbidden: bot was kicked from the group chat",
+		"Forbidden: bot can't initiate conversation with a user",
+		"Forbidden: something Telegram has not thought of yet",
+	} {
+		t.Run(desc, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(http.StatusForbidden)
+				_, _ = w.Write([]byte(`{"ok":false,"description":"` + desc + `"}`))
+			}))
+			defer srv.Close()
+
+			c := NewClient("t")
+			c.base = srv.URL
+			err := c.SendMessage(context.Background(), 1, "hi")
+			if !errors.Is(err, ErrChatUnreachable) {
+				t.Errorf("SendMessage err = %v, want it to wrap ErrChatUnreachable", err)
+			}
+			if !strings.Contains(err.Error(), desc) {
+				t.Errorf("SendMessage err = %v, want it to keep the API description for the log", err)
+			}
+		})
+	}
+}
+
+// A rejection that is not a 403 stays an ordinary failure: "message is too long"
+// and "chat not found" are the engine's to retry or dead-letter, and unlinking a
+// user's chat over either would be destroying settings on a guess.
+func TestClient_NonForbiddenRejectionIsNotChatUnreachable(t *testing.T) {
+	for _, tc := range []struct {
+		status int
+		desc   string
+	}{
+		{http.StatusBadRequest, "message is too long"},
+		{http.StatusBadRequest, "chat not found"},
+		{http.StatusTooManyRequests, "Too Many Requests: retry after 30"},
+		{http.StatusInternalServerError, "Internal Server Error"},
+	} {
+		t.Run(tc.desc, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(tc.status)
+				_, _ = w.Write([]byte(`{"ok":false,"description":"` + tc.desc + `"}`))
+			}))
+			defer srv.Close()
+
+			c := NewClient("t")
+			c.base = srv.URL
+			err := c.SendMessage(context.Background(), 1, "hi")
+			if err == nil {
+				t.Fatal("SendMessage succeeded, want an error")
+			}
+			if errors.Is(err, ErrChatUnreachable) {
+				t.Errorf("SendMessage err = %v, want it NOT to read as a permanently closed chat", err)
+			}
+		})
+	}
+}
+
+// The engines cannot import this package (it imports notify for Digest), so the
+// notifier is where the transport's 403 becomes the engine's vocabulary. If this
+// translation is dropped the 403 reaches the runner as a plain error and the
+// blocked-user loop comes back.
+func TestNotifier_ForbiddenSurfacesAsRecipientGone(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte(`{"ok":false,"description":"Forbidden: bot was blocked by the user"}`))
+	}))
+	defer srv.Close()
+
+	c := NewClient("t")
+	c.base = srv.URL
+	n := NewNotifier(c, "https://freehire.me")
+	err := n.Send(context.Background(), notify.ChannelTelegram, "555", notify.Digest{SavedSearchName: "Go", Total: 1})
+	if !errors.Is(err, notify.ErrRecipientGone) {
+		t.Errorf("Send err = %v, want it to wrap notify.ErrRecipientGone", err)
+	}
+	if !errors.Is(err, ErrChatUnreachable) {
+		t.Errorf("Send err = %v, want the transport cause kept for the log", err)
+	}
+}

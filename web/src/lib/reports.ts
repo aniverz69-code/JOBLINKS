@@ -1,0 +1,155 @@
+// The report-reason vocabulary, mirroring the backend's internal/report reasons.
+// One source of truth for both the report dialog (the reason picker) and the
+// moderator queue (rendering a stored reason). Kept beside the API client rather
+// than generated, since these reasons live in the report package, not the
+// enrichment contract that cmd/gen-contracts emits.
+import type { ProcessReportKind, ReportPickerValue, ReportReason } from './types';
+
+interface ReasonOption {
+  value: ReportPickerValue;
+  /** Short label for the picker and the queue. */
+  label: string;
+  /** One-line help shown under the label in the picker. */
+  hint: string;
+}
+
+/** The entries in the order they appear in the picker (mirrors the mockup). One list
+ *  to a person; three destinations underneath — see reportRoute. */
+export const reportReasons: ReasonOption[] = [
+  { value: 'no_response', label: 'No response', hint: 'Applied but never heard back' },
+  { value: 'ai_interview', label: 'AI interview', hint: 'The interview was conducted by a bot' },
+  { value: 'not_relevant', label: 'No longer relevant', hint: 'Position filled or expired' },
+  { value: 'spam', label: 'Spam or not a job', hint: 'An ad or not a real vacancy' },
+  { value: 'fraud', label: 'Fraud', hint: 'A scam or asks for payment' },
+  { value: 'other', label: 'Other', hint: 'Something else is wrong' },
+];
+
+/** Label for a stored reason value (used by the moderator queue). */
+export function reportReasonLabel(reason: ReportPickerValue): string {
+  return reportReasons.find((r) => r.value === reason)?.label ?? reason;
+}
+
+/** What a moderator decided: close the vacancy too, resolve and leave it up, or dismiss. */
+export type DecisionKind = 'close' | 'resolve' | 'dismiss';
+
+/** The button label for each decision. */
+export function decisionLabel(kind: DecisionKind): string {
+  switch (kind) {
+    case 'close':
+      return 'Resolve and close job';
+    case 'resolve':
+      return 'Resolve, keep open';
+    case 'dismiss':
+      return 'Dismiss';
+  }
+}
+
+/** What the decision form asks the moderator to write, per decision. The wording says the
+ *  reporter reads it, because the note is emailed to them verbatim. */
+export function decisionNotePrompt(kind: DecisionKind): string {
+  return kind === 'dismiss'
+    ? 'Why nothing changed — the reporter reads this'
+    : 'What you did about it — the reporter reads this';
+}
+
+/** An example note, shaped like the decision it belongs to. */
+export function decisionNotePlaceholder(kind: DecisionKind): string {
+  return kind === 'dismiss'
+    ? 'The source really does say remote'
+    : 'Fixed — the job is now marked hybrid';
+}
+
+interface DecisionResult {
+  /** Whether the moderator asked for the reporter to be told. */
+  notifyRequested: boolean;
+  /** Whether the server reports the notice was actually delivered. */
+  notified: boolean;
+  /** Who should have been told, and about what. There is no retry and the row leaves the
+   *  queue on success, so a warning that names neither is a dead end. */
+  reporterEmail?: string;
+  jobTitle?: string;
+}
+
+/**
+ * The message to show after a decision, or null when there is nothing to say.
+ *
+ * A decision always stands, even when its notice fails — so the only thing worth
+ * interrupting the moderator for is the gap between the two: they asked to tell the
+ * reporter and the reporter was not told.
+ */
+export function decisionOutcome({
+  notifyRequested,
+  notified,
+  reporterEmail,
+  jobTitle,
+}: DecisionResult): string | null {
+  if (!notifyRequested || notified) return null;
+  const who = reporterEmail ? ` to ${reporterEmail}` : ' to the reporter';
+  const about = jobTitle ? ` about "${jobTitle}"` : '';
+  return `The decision was recorded, but the email${who}${about} did not go out. Follow up by hand if it matters.`;
+}
+
+/** Where a picked entry is filed.
+ *
+ *  - `moderation` — a complaint about the POSTING, for a reviewer who can close it.
+ *  - `ghost` — evidence about an outcome the reporter lived through, accumulating on
+ *    the job and withdrawable.
+ *  - `process` — a fact about how the COMPANY hires, accumulating on the employer.
+ *
+ *  Only the first reaches a person. The moderation queue's only lever is closing the
+ *  job, so an entry routed there by mistake reaches a reviewer who cannot express
+ *  "noted, counted" — and for `ai_interview` there is nothing to act on at all, since
+ *  the report is true.
+ *
+ *  This lives here rather than inline in the dialog so the routing is pinned by a
+ *  test. Nothing in the component would notice an entry silently changing lanes. */
+export type ReportRoute = 'moderation' | 'ghost' | 'process';
+
+export function reportRoute(value: ReportPickerValue): ReportRoute {
+  if (value === 'no_response') return 'ghost';
+  if (value === 'ai_interview') return 'process';
+  return 'moderation';
+}
+
+/** The process-report kinds the picker can produce, narrowed from a picked value.
+ *  Returns null for everything else, so a caller cannot hand a moderation reason to
+ *  the company endpoint. */
+export function processKindOf(value: ReportPickerValue): ProcessReportKind | null {
+  return value === 'ai_interview' ? 'ai_interview' : null;
+}
+
+/** The moderation reason a picked value denotes, or null when it is filed elsewhere.
+ *  This is the type-level guard that keeps a picker entry off the endpoint whose
+ *  vocabulary does not contain it. */
+export function moderationReasonOf(value: ReportPickerValue): ReportReason | null {
+  return reportRoute(value) === 'moderation' ? (value as ReportReason) : null;
+}
+
+interface AppliedOnInput {
+  /** The input's value: an ISO `YYYY-MM-DD` day, or empty. */
+  value: string;
+  /** The input's `validity.badInput` — what the browser typed but could not read. */
+  badInput: boolean;
+  /** Today as an ISO day, in the reporter's own timezone. */
+  today: string;
+}
+
+/**
+ * Why the stated apply date cannot be filed, or null when it can.
+ *
+ * A date input reports an impossible entry (30 February, a year still being typed)
+ * by clearing its value, so an empty string means either "nothing entered" or
+ * "entered something that does not exist" — indistinguishable without `badInput`.
+ * Blocking the submit button on the empty value alone therefore reads, to someone
+ * looking at a filled-in field, as a button that simply does not work.
+ *
+ * The server checks the date again and answers 400. That answer says nothing the
+ * reporter can act on, which is what this exists to say instead.
+ */
+export function appliedOnError({ value, badInput, today }: AppliedOnInput): string | null {
+  if (badInput) return "That date doesn't exist — check the day and the month.";
+  if (!value) return 'Pick the date you applied.';
+  // Both sides are ISO days, so lexical order is calendar order.
+  if (value > today) return 'That date is in the future — pick the day you applied.';
+  return null;
+}

@@ -1,0 +1,292 @@
+package sources
+
+import (
+	"context"
+	"errors"
+	"testing"
+	"time"
+
+	"golang.org/x/net/html"
+)
+
+// recordingWaiter is a fake rate-limit gate: it counts Wait calls and can force an error.
+type recordingWaiter struct {
+	calls int
+	err   error
+}
+
+func (w *recordingWaiter) Wait(context.Context) error {
+	w.calls++
+	return w.err
+}
+
+// recordingHTMLGetter records the URLs it was asked to fetch and returns a fixed node.
+type recordingHTMLGetter struct {
+	urls []string
+	node *html.Node
+}
+
+func (g *recordingHTMLGetter) GetHTML(_ context.Context, url string) (*html.Node, error) {
+	g.urls = append(g.urls, url)
+	return g.node, nil
+}
+
+func TestRateLimitedHTMLGetter_GatesThenDelegates(t *testing.T) {
+	waiter := &recordingWaiter{}
+	node := &html.Node{}
+	inner := &recordingHTMLGetter{node: node}
+	g := rateLimitedHTMLGetter{inner: inner, limiter: waiter}
+
+	got, err := g.GetHTML(context.Background(), "https://example.careers-page.com/jobs/x")
+	if err != nil {
+		t.Fatalf("GetHTML returned error: %v", err)
+	}
+	if waiter.calls != 1 {
+		t.Fatalf("limiter.Wait called %d times, want 1", waiter.calls)
+	}
+	if len(inner.urls) != 1 {
+		t.Fatalf("inner GetHTML called %d times, want 1", len(inner.urls))
+	}
+	if got != node {
+		t.Fatalf("GetHTML did not pass through the inner node")
+	}
+}
+
+func TestRateLimitedHTMLGetter_WaitErrorShortCircuits(t *testing.T) {
+	sentinel := errors.New("rate wait cancelled")
+	waiter := &recordingWaiter{err: sentinel}
+	inner := &recordingHTMLGetter{node: &html.Node{}}
+	g := rateLimitedHTMLGetter{inner: inner, limiter: waiter}
+
+	_, err := g.GetHTML(context.Background(), "https://example.careers-page.com/")
+	if !errors.Is(err, sentinel) {
+		t.Fatalf("GetHTML error = %v, want %v", err, sentinel)
+	}
+	if len(inner.urls) != 0 {
+		t.Fatalf("inner GetHTML called despite Wait error (%d times)", len(inner.urls))
+	}
+}
+
+func TestConcurrencyLimitedHTMLGetter_AcquiresThenDelegates(t *testing.T) {
+	node := &html.Node{}
+	inner := &recordingHTMLGetter{node: node}
+	g := concurrencyLimitedHTMLGetter{inner: inner, sem: make(chan struct{}, 2)}
+
+	got, err := g.GetHTML(context.Background(), "https://wellfound.com/role/r/software-engineer?page=1")
+	if err != nil {
+		t.Fatalf("GetHTML returned error: %v", err)
+	}
+	if len(inner.urls) != 1 {
+		t.Fatalf("inner GetHTML called %d times, want 1", len(inner.urls))
+	}
+	if got != node {
+		t.Fatalf("GetHTML did not pass through the inner node")
+	}
+	// The slot must be released after the call, so the getter is reusable up to its cap.
+	if len(g.sem) != 0 {
+		t.Fatalf("semaphore slot not released: len=%d, want 0", len(g.sem))
+	}
+}
+
+func TestConcurrencyLimitedHTMLGetter_CancelledContextShortCircuits(t *testing.T) {
+	inner := &recordingHTMLGetter{node: &html.Node{}}
+	sem := make(chan struct{}, 1)
+	sem <- struct{}{} // fill the only slot so the next acquire must wait
+	g := concurrencyLimitedHTMLGetter{inner: inner, sem: sem}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := g.GetHTML(ctx, "https://wellfound.com/"); !errors.Is(err, context.Canceled) {
+		t.Fatalf("GetHTML error = %v, want context.Canceled", err)
+	}
+	if len(inner.urls) != 0 {
+		t.Fatalf("inner GetHTML called despite no free slot (%d times)", len(inner.urls))
+	}
+}
+
+// Wellfound's requests all go through the hosted Firecrawl client, and pacing the request
+// START rate alone (rateLimitedHTMLGetter) was not enough live: crawling 11 role-slice boards
+// concurrently still hit "vendor rate limit did not lift after 4 attempts" on 10 of 11 boards
+// within ~3 minutes on 2026-09-14, even paced at one new request every 2 seconds — because a
+// slow in-flight request (Firecrawl bypassing Wellfound's Cloudflare challenge takes several
+// seconds) overlaps with the next board's paced request, so several requests are in flight at
+// once despite the spaced-out start times. This is the same "simultaneity, not rate" shape
+// TestLimitedWhatJobsGetter_SharesOneGentleCap documents — the fix is a concurrency cap, not a
+// tighter rate.
+func TestLimitedWellfoundGetter_SharesOneInFlightCap(t *testing.T) {
+	g, ok := limitedWellfoundGetter(&recordingHTMLGetter{}).(concurrencyLimitedHTMLGetter)
+	if !ok {
+		t.Fatal("limitedWellfoundGetter should wrap the getter in a concurrency limiter")
+	}
+	if got := cap(g.sem); got != wellfoundMaxInFlight {
+		t.Errorf("cap = %d, want wellfoundMaxInFlight (%d)", got, wellfoundMaxInFlight)
+	}
+	if wellfoundMaxInFlight != 1 {
+		t.Errorf("wellfoundMaxInFlight = %d, want 1 — Firecrawl's own account-level ceiling is shared "+
+			"with bayt/gulftalent/hh and unmeasured, so this run's share of it must stay minimal",
+			wellfoundMaxInFlight)
+	}
+}
+
+// recordingJSONGetter records the URLs it was asked to fetch.
+type recordingJSONGetter struct {
+	urls []string
+}
+
+func (g *recordingJSONGetter) GetJSON(_ context.Context, url string, _ any) error {
+	g.urls = append(g.urls, url)
+	return nil
+}
+
+func TestConcurrencyLimitedJSONGetter_AcquiresThenDelegates(t *testing.T) {
+	inner := &recordingJSONGetter{}
+	g := concurrencyLimitedJSONGetter{inner: inner, sem: make(chan struct{}, 2)}
+
+	if err := g.GetJSON(context.Background(), "https://opendata.trudvsem.ru/api/v1/vacancies/region/x", nil); err != nil {
+		t.Fatalf("GetJSON returned error: %v", err)
+	}
+	if len(inner.urls) != 1 {
+		t.Fatalf("inner GetJSON called %d times, want 1", len(inner.urls))
+	}
+	// The slot must be released after the call, so the getter is reusable up to its cap.
+	if len(g.sem) != 0 {
+		t.Fatalf("semaphore slot not released: len=%d, want 0", len(g.sem))
+	}
+}
+
+// The WhatJobs feed rate-limited 8 of 10 boards on the first production run: sequential requests are
+// served fine, so the trigger is the pipeline crawling boards in parallel. One semaphore shared by
+// every board of the run is what bounds it.
+func TestLimitedWhatJobsGetter_SharesOneGentleCap(t *testing.T) {
+	g, ok := limitedWhatJobsGetter(&recordingJSONGetter{}).(concurrencyLimitedJSONGetter)
+	if !ok {
+		t.Fatal("limitedWhatJobsGetter should wrap the getter in a concurrency limiter")
+	}
+	if got := cap(g.sem); got != whatjobsMaxInFlight {
+		t.Errorf("cap = %d, want whatjobsMaxInFlight (%d)", got, whatjobsMaxInFlight)
+	}
+	if whatjobsMaxInFlight < 1 || whatjobsMaxInFlight > 4 {
+		t.Errorf("whatjobsMaxInFlight = %d, want a gentle few", whatjobsMaxInFlight)
+	}
+}
+
+// SmartRecruiters meters per caller and all 5,204 boards reach it through one host, so an
+// unpaced run 429s nearly all of them: measured on production 2026-09-16, 5,165 boards took a
+// 429 inside two days. One limiter shared by every board of a run is what bounds it.
+func TestPacedSmartRecruitersGetter_SharesOneMeasuredBucket(t *testing.T) {
+	g, ok := pacedSmartRecruitersGetter(&recordingJSONGetter{}).(rateLimitedJSONGetter)
+	if !ok {
+		t.Fatal("pacedSmartRecruitersGetter should wrap the getter in a rate limiter")
+	}
+	if g.limiter == nil {
+		t.Fatal("no limiter on the wrapped getter")
+	}
+	// A clean egress IP served 10 req/s with zero 429s, so anything at or above that has
+	// stopped pacing and is only pretending to. The floor keeps a well-meaning edit from
+	// slowing a 5,204-board crawl past what one hour can cover.
+	perSec := float64(time.Second) / float64(smartRecruitersRequestInterval)
+	if perSec >= 10 || perSec < 1 {
+		t.Errorf("rate = %.2f req/s, want between 1 and the measured 10 req/s ceiling", perSec)
+	}
+	if smartRecruitersRequestBurst < 1 || smartRecruitersRequestBurst > 4 {
+		t.Errorf("burst = %d, want a small one", smartRecruitersRequestBurst)
+	}
+}
+
+// A single unpaced run against 31 Dover boards drew 22 HTTP 429s within ~2s (2026-09-19,
+// production incident) — each board's resolve+list+detail requests firing independently. One
+// limiter shared by every board of a run is what bounds it, the same fix
+// pacedSmartRecruitersGetter applies for the same failure shape.
+func TestPacedDoverGetter_SharesOneBucket(t *testing.T) {
+	g, ok := pacedDoverGetter(&recordingJSONGetter{}).(rateLimitedJSONGetter)
+	if !ok {
+		t.Fatal("pacedDoverGetter should wrap the getter in a rate limiter")
+	}
+	if g.limiter == nil {
+		t.Fatal("no limiter on the wrapped getter")
+	}
+	// No clean ceiling has been measured for Dover (see doverRequestInterval's comment) — this
+	// only guards against a well-meaning edit turning the deliberately slow default back into
+	// an effectively unpaced burst.
+	perSec := float64(time.Second) / float64(doverRequestInterval)
+	if perSec >= 5 || perSec < 1 {
+		t.Errorf("rate = %.2f req/s, want a conservative 1-5 req/s until a real ceiling is measured", perSec)
+	}
+	if doverRequestBurst < 1 || doverRequestBurst > 2 {
+		t.Errorf("burst = %d, want a small one", doverRequestBurst)
+	}
+}
+
+func TestConcurrencyLimitedJSONGetter_CancelledContextShortCircuits(t *testing.T) {
+	inner := &recordingJSONGetter{}
+	sem := make(chan struct{}, 1)
+	sem <- struct{}{} // fill the only slot so the next acquire must wait
+	g := concurrencyLimitedJSONGetter{inner: inner, sem: sem}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := g.GetJSON(ctx, "https://opendata.trudvsem.ru/", nil); !errors.Is(err, context.Canceled) {
+		t.Fatalf("GetJSON error = %v, want context.Canceled", err)
+	}
+	if len(inner.urls) != 0 {
+		t.Fatalf("inner GetJSON called despite no free slot (%d times)", len(inner.urls))
+	}
+}
+
+// recordingJSONPoster records the URLs it was asked to post to.
+type recordingJSONPoster struct{ urls []string }
+
+func (p *recordingJSONPoster) PostJSON(_ context.Context, url string, _, _ any) error {
+	p.urls = append(p.urls, url)
+	return nil
+}
+
+func TestRateLimitedJSONPoster_GatesThenDelegates(t *testing.T) {
+	waiter := &recordingWaiter{}
+	inner := &recordingJSONPoster{}
+	p := rateLimitedJSONPoster{inner: inner, limiter: waiter}
+
+	if err := p.PostJSON(context.Background(), "https://www.seek.com.au/graphql", nil, nil); err != nil {
+		t.Fatalf("PostJSON returned error: %v", err)
+	}
+	if waiter.calls != 1 {
+		t.Fatalf("limiter.Wait called %d times, want 1", waiter.calls)
+	}
+	if len(inner.urls) != 1 {
+		t.Fatalf("inner PostJSON called %d times, want 1", len(inner.urls))
+	}
+}
+
+func TestRateLimitedJSONPoster_WaitErrorShortCircuits(t *testing.T) {
+	sentinel := errors.New("rate wait cancelled")
+	waiter := &recordingWaiter{err: sentinel}
+	inner := &recordingJSONPoster{}
+	p := rateLimitedJSONPoster{inner: inner, limiter: waiter}
+
+	err := p.PostJSON(context.Background(), "https://www.seek.com.au/graphql", nil, nil)
+	if !errors.Is(err, sentinel) {
+		t.Fatalf("PostJSON error = %v, want %v", err, sentinel)
+	}
+	if len(inner.urls) != 0 {
+		t.Fatalf("inner PostJSON called despite Wait error (%d times)", len(inner.urls))
+	}
+}
+
+// challengingHTMLGetter always fails the fetch with a WAF ChallengeError.
+type challengingHTMLGetter struct{ url string }
+
+func (g challengingHTMLGetter) GetHTML(_ context.Context, _ string) (*html.Node, error) {
+	return nil, &ChallengeError{URL: g.url}
+}
+
+func TestPacedClinchGetter_PropagatesChallengeError(t *testing.T) {
+	g := pacedHTMLGetter(challengingHTMLGetter{url: "https://careers.example.com/jobs/x"}, clinchRequestInterval, clinchRequestBurst)
+
+	// The first call is admitted immediately by the limiter's burst, so this exercises the
+	// wiring without any timing dependency.
+	_, err := g.GetHTML(context.Background(), "https://careers.example.com/jobs/x")
+	var chErr *ChallengeError
+	if !errors.As(err, &chErr) {
+		t.Fatalf("GetHTML error = %v, want the inner *ChallengeError to propagate unchanged", err)
+	}
+}

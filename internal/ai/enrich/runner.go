@@ -1,0 +1,248 @@
+package enrich
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"log"
+	"time"
+
+	"github.com/strelov1/freehire/internal/platform/outbox"
+	"github.com/strelov1/freehire/internal/platform/pgerr"
+)
+
+// Claimed is one outbox entry leased to this run.
+type Claimed struct {
+	OutboxID      int64
+	JobID         int64
+	TargetVersion int
+}
+
+// Store is the persistence the runner needs, expressed in domain terms so the
+// runner is independent of the DB layer. The real implementation wraps the
+// generated queries and a connection pool (and runs Complete in a transaction);
+// tests use an in-memory fake.
+type Store interface {
+	// Enqueue adds outbox entries for jobs not yet enriched to targetVersion.
+	Enqueue(ctx context.Context, targetVersion int) (int64, error)
+	// Claim leases up to batch live, unleased entries.
+	Claim(ctx context.Context, batch, leaseSeconds int) ([]Claimed, error)
+	// Job returns the source fields a Provider reads for the given job id.
+	Job(ctx context.Context, id int64) (JobInput, error)
+	// Complete writes the enrichment payload + provenance stamp to the entry's job
+	// and deletes the outbox entry, atomically.
+	Complete(ctx context.Context, entry Claimed, payload json.RawMessage) error
+	// Fail records a failed attempt under the given policy; it returns whether the
+	// entry was dead-lettered.
+	Fail(ctx context.Context, outboxID int64, errMsg string, policy FailurePolicy) (deadLettered bool, err error)
+	// Reap deletes up to maxRows live entries Claim can never take (their job closed,
+	// became a non-canonical repost, or is gone), returning how many it removed.
+	Reap(ctx context.Context, maxRows int) (int64, error)
+}
+
+// FailurePolicy is how one failure should be bounded. Which of the two bounds applies
+// is decided by PostingAtFault, and the two are not interchangeable: MaxAttempts counts
+// tries at a task that may be impossible, UpstreamGraceDays waits out a dependency that
+// is expected back. See postingAtFault and RecordEnrichmentFailure.
+type FailurePolicy struct {
+	PostingAtFault    bool
+	MaxAttempts       int
+	UpstreamGraceDays int
+}
+
+// RunOptions are the per-run knobs.
+type RunOptions struct {
+	TargetVersion int
+	// Concurrency is both the number of LLM calls in flight and the claim wave size.
+	// Sizing the wave to the concurrency keeps each claimed entry's lease window short
+	// (≈ one LLM call), so an overlapping run can't reclaim a still-in-flight entry.
+	Concurrency  int
+	LeaseSeconds int
+	// MaxAttempts bounds failures the posting caused; UpstreamGraceDays bounds every
+	// other failure, by the entry's queue age rather than by tries.
+	MaxAttempts       int
+	UpstreamGraceDays int
+}
+
+// Stats reports what a run did.
+type Stats struct {
+	Enriched     int
+	Failed       int
+	DeadLettered int
+	// Reaped counts entries deleted because Claim could never take them — housekeeping,
+	// not enrichment work.
+	Reaped int
+}
+
+// reapLimit bounds how many ineligible entries one run deletes. Sized against the backlog
+// this accumulated into before anything reaped it: 633,532 of 1,118,601 entries on prod
+// 2026-08-19, 57% of the queue. An unbounded first pass over that is a long delete holding
+// row locks the claim then waits on, so the run takes a slice and the next one takes the
+// next. Larger than search-drain's 2,000 because enrich runs on a far slower cadence and
+// its backlog is two orders of magnitude bigger.
+const reapLimit = 20_000
+
+// Runner drives the enrichment process: enqueue pending jobs, then drain claimed
+// batches, enriching and writing back each entry.
+type Runner struct {
+	Provider Provider
+	Store    Store
+}
+
+// Run enqueues pending jobs and drains the queue until no claimable entries remain.
+// A failure on a single entry is recorded and never aborts the run.
+func (r Runner) Run(ctx context.Context, opt RunOptions) (Stats, error) {
+	// Reap before enqueueing, so the depth this run reports is work and not residue.
+	// Claim skips an entry whose job has closed or become a repost, but nothing deleted
+	// those entries, and they accumulated into most of the queue. Best-effort:
+	// housekeeping must never be the reason enrichment stops.
+	reaped, err := r.Store.Reap(ctx, reapLimit)
+	if err != nil {
+		log.Printf("enrich: reap ineligible entries (continuing): %v", err)
+	} else if reaped > 0 {
+		log.Printf("enrich: reaped %d entries whose job closed or became a repost", reaped)
+	}
+
+	enqueued, err := r.Store.Enqueue(ctx, opt.TargetVersion)
+	if err != nil {
+		return Stats{Reaped: int(reaped)}, fmt.Errorf("enqueue: %w", err)
+	}
+	log.Printf("enrich: enqueued %d pending, draining (concurrency=%d)", enqueued, opt.Concurrency)
+
+	rn := &run{provider: r.Provider, store: r.Store, opt: opt}
+	s, err := outbox.RunPool(ctx, r.Store, outbox.RunOptions{
+		// The wave is sized to the concurrency, then drained in parallel: each entry
+		// starts processing at once, so its lease window stays ≈ one LLM call.
+		BatchSize:    opt.Concurrency,
+		LeaseSeconds: opt.LeaseSeconds,
+		Concurrency:  opt.Concurrency,
+		OnWave: func(cum outbox.Stats) {
+			// A heartbeat per wave so a long drain shows running totals instead of
+			// going silent for hours.
+			log.Printf("enrich: progress enriched=%d failed=%d dead=%d", cum.Succeeded, cum.Failed, cum.DeadLettered)
+		},
+	}, rn.process)
+	stats := Stats{Enriched: s.Succeeded, Failed: s.Failed, DeadLettered: s.DeadLettered, Reaped: int(reaped)}
+	if err != nil {
+		return stats, fmt.Errorf("claim: %w", err)
+	}
+	return stats, nil
+}
+
+// run carries one Run's dependencies and options so the per-entry helpers use the
+// receiver instead of threading them through every call.
+type run struct {
+	provider Provider
+	store    Store
+	opt      RunOptions
+}
+
+// process handles one claimed entry and reports what happened; internal/platform/outbox's
+// RunPool tallies the result. Each entry logs its outcome and duration so a long
+// drain is observable in real time.
+func (rn *run) process(ctx context.Context, entry Claimed) outbox.Outcome {
+	start := time.Now()
+
+	job, err := rn.store.Job(ctx, entry.JobID)
+	if err != nil {
+		// A corrupted row (XX001) is permanently unreadable — retrying across cron
+		// runs would only burn the attempt budget on a job that can never load, so
+		// dead-letter it immediately (maxAttempts=1) instead.
+		if pgerr.IsDataCorrupted(err) {
+			outcome := rn.failN(ctx, entry, fmt.Errorf("load job: %w", err), 1)
+			log.Printf("enrich: job=%d dead-lettered (corrupted row) in %s: %v", entry.JobID, time.Since(start).Round(time.Millisecond), err)
+			return outcome
+		}
+		outcome := rn.fail(ctx, entry, fmt.Errorf("load job: %w", err))
+		log.Printf("enrich: job=%d load failed in %s: %v", entry.JobID, time.Since(start).Round(time.Millisecond), err)
+		return outcome
+	}
+
+	enr, err := rn.enrich(ctx, job)
+	if err != nil {
+		outcome := rn.fail(ctx, entry, err)
+		log.Printf("enrich: job=%d FAILED in %s: %v", entry.JobID, time.Since(start).Round(time.Millisecond), err)
+		return outcome
+	}
+
+	payload, err := json.Marshal(enr)
+	if err != nil {
+		outcome := rn.fail(ctx, entry, fmt.Errorf("marshal: %w", err))
+		log.Printf("enrich: job=%d marshal failed: %v", entry.JobID, err)
+		return outcome
+	}
+
+	if err := rn.store.Complete(ctx, entry, payload); err != nil {
+		outcome := rn.fail(ctx, entry, fmt.Errorf("write back: %w", err))
+		log.Printf("enrich: job=%d write-back failed: %v", entry.JobID, err)
+		return outcome
+	}
+	log.Printf("enrich: job=%d ok in %s", entry.JobID, time.Since(start).Round(time.Millisecond))
+	return outbox.Succeeded
+}
+
+// enrich asks the provider for a payload and validates it, retrying once on a
+// transient transport failure. An invalid payload is treated as an error so it
+// is never persisted. Deterministic failures (an unparseable response, or a
+// payload that fails validation even after sanitizing) are not retried
+// in-process — an identical re-call would reproduce them; the outbox attempts
+// counter re-tries them on the next cron run, drawing a fresh sample.
+func (rn *run) enrich(ctx context.Context, job JobInput) (Enrichment, error) {
+	var lastErr error
+	for range 2 {
+		enr, err := rn.provider.Enrich(ctx, job)
+		if err != nil {
+			lastErr = err
+			if errors.Is(err, errUnparseableResponse) {
+				break
+			}
+			continue
+		}
+		// Drop any out-of-vocabulary enum values rather than failing the whole
+		// payload over one stray field; Validate is then a guard that should pass.
+		enr.Sanitize()
+		if err := enr.Validate(); err != nil {
+			// Sanitize already dropped out-of-vocab values, so a Validate failure
+			// is a structural problem a retry won't fix. Wrapped so postingAtFault
+			// can recognise it — Validate itself stays a plain error, since the
+			// Sanitize+Validate gate has callers outside this runner.
+			return Enrichment{}, fmt.Errorf("%w: %w", errInvalidPayload, err)
+		}
+		return enr, nil
+	}
+	return Enrichment{}, lastErr
+}
+
+func (rn *run) fail(ctx context.Context, entry Claimed, cause error) outbox.Outcome {
+	return rn.failN(ctx, entry, cause, rn.opt.MaxAttempts)
+}
+
+// failN records a failure with an explicit attempt ceiling. fail uses the run's
+// configured MaxAttempts; the corrupted-row path passes 1 to force an immediate
+// dead-letter (an unreadable row will never succeed on retry).
+//
+// The ceiling only applies when the posting is at fault — postingAtFault decides that
+// from the cause, so a caller cannot forget to. Everything else is bounded by the
+// entry's queue age instead, which is what lets an outage of any duration cost nothing
+// permanently.
+func (rn *run) failN(ctx context.Context, entry Claimed, cause error, maxAttempts int) outbox.Outcome {
+	policy := FailurePolicy{
+		PostingAtFault:    postingAtFault(cause),
+		MaxAttempts:       maxAttempts,
+		UpstreamGraceDays: rn.opt.UpstreamGraceDays,
+	}
+	dead, err := rn.store.Fail(ctx, entry.OutboxID, cause.Error(), policy)
+	if err != nil {
+		// The attempt still counts as a failure below, but log the cause: a
+		// bookkeeping outage (e.g. the DB going unreachable mid-drain) would
+		// otherwise hide behind an opaque Failed tally with no way to diagnose it.
+		log.Printf("enrich: outbox=%d fail-bookkeeping error: %v", entry.OutboxID, err)
+	}
+	// Only a recorded dead-letter is distinct; a non-dead attempt and a Fail that
+	// couldn't even be recorded both count as a plain failure.
+	if err == nil && dead {
+		return outbox.DeadLettered
+	}
+	return outbox.Failed
+}

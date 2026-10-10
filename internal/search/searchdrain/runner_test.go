@@ -1,0 +1,604 @@
+package searchdrain
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/jackc/pgx/v5/pgconn"
+
+	"github.com/strelov1/freehire/internal/platform/db"
+)
+
+// fakeStore is an in-memory Store. It records batch vs. per-item calls so tests can
+// assert the happy path takes one batch call and a failure falls back to per-item.
+type fakeStore struct {
+	mu sync.Mutex
+
+	pending []Claimed        // claimed FIFO, one wave per Claim up to batch
+	jobs    map[int64]db.Job // rows returned by Jobs
+	jobErr  map[int64]error  // load error for a job id (e.g. corrupted row)
+
+	// jobsBatchErr fails a MULTI-id load only, which is what a statement timeout on the
+	// wide read under database pressure looks like: the batch cannot be served, every
+	// single-id load still can, and the runner falls back to per-item.
+	jobsBatchErr error
+
+	completeErr map[int64]error // Complete error for a job id (single-item path)
+
+	completeBatches [][]int64 // job ids per Complete call (len>1 = a real batch)
+	completed       []int64   // all job ids Complete'd
+	failCalls       []failCall
+	attempts        map[int64]int // outbox id -> attempts so far
+
+	reapCalls []int // max_rows per Reap call
+	reaped    int64 // rows Reap reports removed
+	reapErr   error
+}
+
+type failCall struct {
+	outboxID    int64
+	maxAttempts int
+	msg         string
+}
+
+func newFakeStore() *fakeStore {
+	return &fakeStore{
+		jobs: map[int64]db.Job{}, jobErr: map[int64]error{}, completeErr: map[int64]error{},
+		attempts: map[int64]int{},
+	}
+}
+
+func (s *fakeStore) Claim(_ context.Context, batch, _ int) ([]Claimed, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	n := batch
+	if n > len(s.pending) {
+		n = len(s.pending)
+	}
+	wave := s.pending[:n]
+	s.pending = s.pending[n:]
+	return wave, nil
+}
+
+func (s *fakeStore) Jobs(_ context.Context, ids []int64) ([]db.Job, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(ids) > 1 && s.jobsBatchErr != nil {
+		return nil, s.jobsBatchErr
+	}
+	// A corrupted row aborts a whole multi-id load (a seq scan hits it); a single-id
+	// load surfaces the row's own error so the runner can isolate it.
+	for _, id := range ids {
+		if err := s.jobErr[id]; err != nil {
+			return nil, err
+		}
+	}
+	out := make([]db.Job, 0, len(ids))
+	for _, id := range ids {
+		if j, ok := s.jobs[id]; ok {
+			out = append(out, j)
+		}
+	}
+	return out, nil
+}
+
+func (s *fakeStore) Complete(_ context.Context, entries []Claimed) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var ids []int64
+	for _, e := range entries {
+		if err := s.completeErr[e.JobID]; err != nil {
+			return err
+		}
+		ids = append(ids, e.JobID)
+	}
+	s.completeBatches = append(s.completeBatches, ids)
+	s.completed = append(s.completed, ids...)
+	return nil
+}
+
+func (s *fakeStore) Fail(_ context.Context, outboxID int64, msg string, maxAttempts int) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.failCalls = append(s.failCalls, failCall{outboxID, maxAttempts, msg})
+	s.attempts[outboxID]++
+	return s.attempts[outboxID] >= maxAttempts, nil
+}
+
+func (s *fakeStore) Reap(_ context.Context, maxRows int) (int64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.reapCalls = append(s.reapCalls, maxRows)
+	return s.reaped, s.reapErr
+}
+
+func TestRunnerReapsIneligibleEntriesBeforeDraining(t *testing.T) {
+	store := newFakeStore()
+	store.reaped = 7
+	ix := newFakeIndexer()
+	seed(store, 1, 2)
+
+	stats, err := Runner{Store: store, Indexer: ix}.Run(context.Background(), opt())
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	if len(store.reapCalls) != 1 {
+		t.Fatalf("Reap called %d times, want exactly once per run", len(store.reapCalls))
+	}
+	if stats.Reaped != 7 {
+		t.Errorf("stats.Reaped = %d, want 7", stats.Reaped)
+	}
+	// Reaping first means the claim does not have to scan past rows it would only
+	// skip, and the depth gauge stops counting work nobody will ever do.
+	if stats.Indexed != 2 {
+		t.Errorf("stats.Indexed = %d, want 2 — reaping must not disturb the drain", stats.Indexed)
+	}
+}
+
+func TestRunnerDrainsEvenWhenReapFails(t *testing.T) {
+	store := newFakeStore()
+	store.reapErr = errors.New("deadlock detected")
+	ix := newFakeIndexer()
+	seed(store, 1, 2, 3)
+
+	stats, err := Runner{Store: store, Indexer: ix}.Run(context.Background(), opt())
+
+	// Reaping is housekeeping. Letting it fail the run would trade a queue that is
+	// merely untidy for one that is not being drained at all.
+	if err != nil {
+		t.Fatalf("Run returned %v, want the reap failure to be logged and the drain to continue", err)
+	}
+	if stats.Indexed != 3 {
+		t.Errorf("stats.Indexed = %d, want 3", stats.Indexed)
+	}
+	if stats.Reaped != 0 {
+		t.Errorf("stats.Reaped = %d, want 0 when the reap failed", stats.Reaped)
+	}
+}
+
+// fakeIndexer records IndexBatch calls. batchFails makes any multi-job IndexBatch
+// fail (to exercise the per-item fallback); indexErr fails a specific job.
+type fakeIndexer struct {
+	mu         sync.Mutex
+	indexCalls [][]int64 // job ids per IndexBatch call
+	indexed    []int64
+	batchFails bool
+	indexErr   map[int64]error
+	// blockUntilCtxDone makes IndexBatch hang until the call context expires and
+	// return its error — simulating a push that is genuinely still working server-side
+	// (Meilisearch never reported a failure) but outran the caller's CallTimeout.
+	blockUntilCtxDone bool
+	// stopRun cancels the run's own context from inside a push, standing in for the
+	// SIGTERM freehire-reindexw sends this service before every rebuild.
+	stopRun context.CancelFunc
+	// opaqueErr is returned INSTEAD of the context's own error once the context is
+	// done, standing in for *meilisearch.Error — which implements no Unwrap, so nothing
+	// downstream can recover a context sentinel from it.
+	opaqueErr error
+	// waveErr fails every call outright, batch and per-item alike.
+	waveErr error
+}
+
+func newFakeIndexer() *fakeIndexer { return &fakeIndexer{indexErr: map[int64]error{}} }
+
+func (ix *fakeIndexer) IndexBatch(ctx context.Context, jobs []db.Job) error {
+	ix.mu.Lock()
+	ids := make([]int64, len(jobs))
+	for i, j := range jobs {
+		ids[i] = j.ID
+	}
+	ix.indexCalls = append(ix.indexCalls, ids)
+	block, stop, opaque := ix.blockUntilCtxDone, ix.stopRun, ix.opaqueErr
+	ix.mu.Unlock()
+
+	if stop != nil {
+		stop()
+	}
+	if block || stop != nil {
+		<-ctx.Done()
+		if opaque != nil {
+			return opaque
+		}
+		return ctx.Err()
+	}
+
+	ix.mu.Lock()
+	defer ix.mu.Unlock()
+	if ix.waveErr != nil {
+		return ix.waveErr
+	}
+	if ix.batchFails && len(jobs) > 1 {
+		return errors.New("batch index failed")
+	}
+	for _, j := range jobs {
+		if err := ix.indexErr[j.ID]; err != nil {
+			return err
+		}
+	}
+	ix.indexed = append(ix.indexed, ids...)
+	return nil
+}
+
+func opt() RunOptions {
+	return RunOptions{BatchSize: 500, LeaseSeconds: 300, MaxAttempts: 3}
+}
+
+// seed queues one claimable entry per job id, with the job row to match.
+func seed(s *fakeStore, ids ...int64) {
+	for _, id := range ids {
+		s.jobs[id] = db.Job{ID: id}
+		s.pending = append(s.pending, Claimed{OutboxID: id * 10, JobID: id})
+	}
+}
+
+func has(ids []int64, id int64) bool {
+	for _, x := range ids {
+		if x == id {
+			return true
+		}
+	}
+	return false
+}
+
+func TestRunnerBatchesOneWaveIntoOneIndexCall(t *testing.T) {
+	store := newFakeStore()
+	ix := newFakeIndexer()
+	for _, id := range []int64{1, 2, 3} {
+		store.jobs[id] = db.Job{ID: id}
+	}
+	store.pending = []Claimed{
+		{OutboxID: 10, JobID: 1},
+		{OutboxID: 20, JobID: 2},
+		{OutboxID: 30, JobID: 3},
+	}
+
+	stats, err := Runner{Store: store, Indexer: ix}.Run(context.Background(), opt())
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if stats.Indexed != 3 || stats.Failed != 0 {
+		t.Fatalf("stats = %+v, want indexed=3 failed=0", stats)
+	}
+	// The whole wave must be indexed in ONE IndexBatch call and completed in ONE
+	// Complete call — that is the fix's point: collapse many per-board pushes into
+	// one Meili task per wave.
+	if len(ix.indexCalls) != 1 || len(ix.indexCalls[0]) != 3 {
+		t.Errorf("IndexBatch calls = %v, want a single 3-job batch", ix.indexCalls)
+	}
+	if len(store.completeBatches) != 1 || len(store.completeBatches[0]) != 3 {
+		t.Errorf("Complete batches = %v, want a single 3-entry batch", store.completeBatches)
+	}
+}
+
+func TestRunnerDrainsMultipleWavesUntilEmpty(t *testing.T) {
+	store := newFakeStore()
+	ix := newFakeIndexer()
+	for _, id := range []int64{1, 2, 3} {
+		store.jobs[id] = db.Job{ID: id}
+	}
+	store.pending = []Claimed{
+		{OutboxID: 10, JobID: 1},
+		{OutboxID: 20, JobID: 2},
+		{OutboxID: 30, JobID: 3},
+	}
+
+	opts := opt()
+	opts.BatchSize = 1 // force three separate waves
+	stats, err := Runner{Store: store, Indexer: ix}.Run(context.Background(), opts)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if stats.Indexed != 3 {
+		t.Fatalf("stats = %+v, want indexed=3", stats)
+	}
+	if len(ix.indexCalls) != 3 {
+		t.Errorf("IndexBatch calls = %v, want 3 (one per wave)", ix.indexCalls)
+	}
+}
+
+func TestRunnerFallsBackToPerItemOnBatchFailure(t *testing.T) {
+	store := newFakeStore()
+	ix := newFakeIndexer()
+	ix.batchFails = true                           // the multi-job batch push fails
+	ix.indexErr[2] = errors.New("job 2 is poison") // and job 2 fails individually too
+	for _, id := range []int64{1, 2, 3} {
+		store.jobs[id] = db.Job{ID: id}
+	}
+	store.pending = []Claimed{
+		{OutboxID: 10, JobID: 1},
+		{OutboxID: 20, JobID: 2},
+		{OutboxID: 30, JobID: 3},
+	}
+
+	stats, err := Runner{Store: store, Indexer: ix}.Run(context.Background(), opt())
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	// Batch failed → per-item retry: jobs 1 and 3 succeed, job 2 fails in isolation.
+	if stats.Indexed != 2 || stats.Failed != 1 {
+		t.Fatalf("stats = %+v, want indexed=2 failed=1 (only the poison job fails)", stats)
+	}
+	if !has(ix.indexed, 1) || !has(ix.indexed, 3) {
+		t.Errorf("indexed = %v, want jobs 1 and 3 to survive the poison job", ix.indexed)
+	}
+	if len(store.failCalls) != 1 || store.failCalls[0].outboxID != 20 {
+		t.Errorf("failCalls = %+v, want one for outbox 20 (job 2)", store.failCalls)
+	}
+}
+
+// TestRunnerSkipsWaveOnBatchTimeoutInsteadOfCascading reproduces the 2026-08-05 prod
+// incident: on this Meilisearch instance a single-document push costs about as much
+// wall-clock time as a whole batch push (both dominated by a fixed whole-index
+// re-merge, not by document count). A batch that merely outran CallTimeout — with
+// Meilisearch still working on it server-side, not actually failed — must NOT cascade
+// into per-item fallback, or one slow-but-fine batch turns into up to BatchSize
+// equally slow individual pushes, each competing for the same disk IO that starved
+// freehire-web's accept() queue and produced nginx 504s.
+func TestRunnerSkipsWaveOnBatchTimeoutInsteadOfCascading(t *testing.T) {
+	store := newFakeStore()
+	ix := newFakeIndexer()
+	ix.blockUntilCtxDone = true // simulates a push that never returns before the deadline
+	for _, id := range []int64{1, 2, 3} {
+		store.jobs[id] = db.Job{ID: id}
+	}
+	store.pending = []Claimed{
+		{OutboxID: 10, JobID: 1},
+		{OutboxID: 20, JobID: 2},
+		{OutboxID: 30, JobID: 3},
+	}
+
+	opts := opt()
+	opts.CallTimeout = 20 * time.Millisecond
+
+	stats, err := Runner{Store: store, Indexer: ix}.Run(context.Background(), opts)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if stats.Indexed != 0 || stats.Failed != 0 || stats.DeadLettered != 0 {
+		t.Fatalf("stats = %+v, want all zero — a timed-out batch is skipped this run, not "+
+			"fallen back to per-item and not counted as a failure", stats)
+	}
+	// The one batch attempt, and NOTHING else: no per-item retries.
+	if len(ix.indexCalls) != 1 {
+		t.Fatalf("IndexBatch calls = %d, want 1 (the batch attempt only) — per-item fallback "+
+			"on a mere timeout would multiply the number of equally-expensive Meili pushes by "+
+			"the batch size", len(ix.indexCalls))
+	}
+	// No attempts burned: the wave stays claimed and becomes retryable once its lease
+	// expires, so a later run retries the WHOLE batch fresh rather than spending the
+	// entry's limited attempt budget on a timeout that says nothing about the document.
+	if len(store.failCalls) != 0 {
+		t.Errorf("failCalls = %+v, want none — a timeout must not burn the retry budget", store.failCalls)
+	}
+}
+
+func TestRunnerCorruptedRowDeadLettersInFallback(t *testing.T) {
+	store := newFakeStore()
+	ix := newFakeIndexer()
+	// A corrupted row aborts the batch load; the per-item fallback isolates it and
+	// dead-letters it immediately (maxAttempts=1), while the rest index.
+	store.jobErr[2] = &pgconn.PgError{Code: "XX001"}
+	store.jobs[1] = db.Job{ID: 1}
+	store.jobs[3] = db.Job{ID: 3}
+	store.pending = []Claimed{
+		{OutboxID: 10, JobID: 1},
+		{OutboxID: 20, JobID: 2},
+		{OutboxID: 30, JobID: 3},
+	}
+
+	stats, err := Runner{Store: store, Indexer: ix}.Run(context.Background(), opt())
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if stats.Indexed != 2 || stats.DeadLettered != 1 {
+		t.Fatalf("stats = %+v, want indexed=2 dead=1", stats)
+	}
+	if len(store.failCalls) != 1 || store.failCalls[0].maxAttempts != 1 {
+		t.Errorf("failCalls = %+v, want one with maxAttempts=1 (immediate dead-letter)", store.failCalls)
+	}
+}
+
+func TestRunnerMissingJobDeadLettersInFallback(t *testing.T) {
+	store := newFakeStore()
+	ix := newFakeIndexer()
+	// Job 2 was hard-deleted (or closed/became a repost, so the claim no longer sees
+	// it) after enqueue: the batch load comes back short, the per-item fallback finds
+	// nothing, and the entry dead-letters immediately (maxAttempts=1) instead of
+	// eating an attempt per cron run.
+	store.jobs[1] = db.Job{ID: 1}
+	store.jobs[3] = db.Job{ID: 3}
+	store.pending = []Claimed{
+		{OutboxID: 10, JobID: 1},
+		{OutboxID: 20, JobID: 2},
+		{OutboxID: 30, JobID: 3},
+	}
+
+	stats, err := Runner{Store: store, Indexer: ix}.Run(context.Background(), opt())
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if stats.Indexed != 2 || stats.DeadLettered != 1 {
+		t.Fatalf("stats = %+v, want indexed=2 dead=1", stats)
+	}
+	if len(store.failCalls) != 1 || store.failCalls[0].outboxID != 20 || store.failCalls[0].maxAttempts != 1 {
+		t.Errorf("failCalls = %+v, want one for outbox 20 with maxAttempts=1 (immediate dead-letter)", store.failCalls)
+	}
+}
+
+// An ordinary stop is not a poison row. freehire-reindexw runs
+// `ExecStartPre=+systemctl stop freehire-search-drain.service` before every rebuild, so
+// SIGTERM cancels this run's context mid-push several times a day. Classifying that as a
+// per-document failure drove the whole wave through the per-item path, and each item's
+// Fail runs on a background context — so the attempt REACHED Postgres. Three ordinary
+// stops over one entry set its failed_at, after which ClaimSearchOutboxBatch skips it and
+// EnqueueSearchOutbox's ON CONFLICT DO NOTHING never re-adds it: that job stays out of the
+// index until the next full rebuild.
+func TestRunnerSkipsWaveWhenTheRunIsCancelled(t *testing.T) {
+	store := newFakeStore()
+	ix := newFakeIndexer()
+	seed(store, 1, 2, 3)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ix.stopRun = cancel
+	// The error the SDK actually hands back: it carries no context sentinel to unwrap,
+	// which is why the guard has to ask the context instead.
+	ix.opaqueErr = errors.New("meilisearch: communication error")
+
+	stats, err := Runner{Store: store, Indexer: ix}.Run(ctx, opt())
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if stats.Indexed != 0 || stats.Failed != 0 || stats.DeadLettered != 0 {
+		t.Fatalf("stats = %+v, want all zero — a cancelled run learned nothing about these entries", stats)
+	}
+	if len(ix.indexCalls) != 1 {
+		t.Errorf("IndexBatch calls = %d, want 1 — a cancelled wave must not cascade into per-item pushes",
+			len(ix.indexCalls))
+	}
+	if len(store.failCalls) != 0 {
+		t.Errorf("failCalls = %+v, want none — an ordinary stop must not spend the attempt budget",
+			store.failCalls)
+	}
+}
+
+// A failed Complete comes AFTER a push that succeeded: the documents are in the index and
+// only the wave's rows are left undeleted. Complete is one DELETE over an id list, so it
+// cannot fail because of one row's content and per-row isolation buys nothing — while the
+// fallback re-pushes every document in the wave on its own, at roughly the cost of the
+// whole batch each. That is the shape of the 2026-08-05 incident.
+func TestRunnerLeavesTheWaveClaimedWhenCompleteFailsAfterASuccessfulPush(t *testing.T) {
+	store := newFakeStore()
+	ix := newFakeIndexer()
+	seed(store, 1, 2, 3)
+	for _, id := range []int64{1, 2, 3} {
+		store.completeErr[id] = errors.New("connection reset by peer")
+	}
+
+	stats, err := Runner{Store: store, Indexer: ix}.Run(context.Background(), opt())
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if stats.Indexed != 0 || stats.Failed != 0 || stats.DeadLettered != 0 {
+		t.Fatalf("stats = %+v, want all zero — the wave is left claimed for its lease to expire", stats)
+	}
+	if len(ix.indexCalls) != 1 {
+		t.Errorf("IndexBatch calls = %d, want 1 — the wave was already pushed; re-pushing it one "+
+			"document at a time is hours of whole-index re-merges", len(ix.indexCalls))
+	}
+	if len(store.failCalls) != 0 {
+		t.Errorf("failCalls = %+v, want none — the pool being unwell says nothing about any entry",
+			store.failCalls)
+	}
+}
+
+// An Indexer that could not assemble the wave's documents says so with ErrSkipWave, and
+// the runner must not fall back: the per-item path would push the SAME incomplete
+// documents, one expensive call at a time. Today the only source is cmd/search-drain
+// failing to read the duplicate closure's geography, which does not merely fail to widen a
+// collapsed role's facets — it overwrites the widened ones with the canon's own.
+func TestRunnerSkipsWaveWhenTheIndexerCouldNotBuildIt(t *testing.T) {
+	store := newFakeStore()
+	ix := newFakeIndexer()
+	ix.waveErr = fmt.Errorf("%w: duplicate-closure geography for wave: %v",
+		ErrSkipWave, errors.New("connection reset by peer"))
+	seed(store, 1, 2, 3)
+
+	stats, err := Runner{Store: store, Indexer: ix}.Run(context.Background(), opt())
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if stats.Indexed != 0 || stats.Failed != 0 || stats.DeadLettered != 0 {
+		t.Fatalf("stats = %+v, want all zero — the wave is left claimed for its lease to expire", stats)
+	}
+	if len(ix.indexCalls) != 1 {
+		t.Errorf("IndexBatch calls = %d, want 1 — falling back would push the same narrowed "+
+			"documents one at a time", len(ix.indexCalls))
+	}
+	if len(store.failCalls) != 0 {
+		t.Errorf("failCalls = %+v, want none — the wave was never built, so no entry is at fault",
+			store.failCalls)
+	}
+}
+
+// The batch path is not the only way into the indexer. A wave that fell back for an
+// unrelated reason — here a statement timeout on the wide multi-id load — re-enters it one
+// entry at a time, meets the same unreadable dependency, and would spend a healthy row's
+// whole attempt budget. Three cron runs of that sets failed_at, and neither the claim nor
+// the ON CONFLICT DO NOTHING enqueue ever offers the row again: the posting stays out of the
+// facet index until the next full rebuild. So ErrSkipWave has to be honoured per entry too,
+// which is why the check lives in fail() rather than beside the batch call.
+func TestRunnerDoesNotChargeAnAttemptWhenTheFallbackMeetsTheSameUnbuildableWave(t *testing.T) {
+	store := newFakeStore()
+	ix := newFakeIndexer()
+	store.jobsBatchErr = errors.New("canceling statement due to statement timeout")
+	ix.waveErr = fmt.Errorf("%w: duplicate-closure geography for wave: %v",
+		ErrSkipWave, errors.New("connection reset by peer"))
+	seed(store, 1, 2, 3)
+
+	stats, err := Runner{Store: store, Indexer: ix}.Run(context.Background(), opt())
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if len(store.failCalls) != 0 {
+		t.Errorf("failCalls = %+v, want none — the entries are healthy, the dependency is not",
+			store.failCalls)
+	}
+	if stats.Indexed != 0 || stats.Failed != 0 || stats.DeadLettered != 0 {
+		t.Fatalf("stats = %+v, want all zero — every entry is left claimed for its lease to expire", stats)
+	}
+}
+
+// MaxPerRun bounds one run so the process is handed back rather than held until the queue
+// happens to be empty. Prod 2026-09-06: with no bound the indexing pass ran for over two
+// hours against a queue arrivals kept refilling, and the removal pass sharing the process
+// never got a turn. The leftovers must stay claimable, not be dropped.
+func TestRunnerStopsAtMaxPerRunAndLeavesTheRestQueued(t *testing.T) {
+	store := newFakeStore()
+	ix := newFakeIndexer()
+	for id := int64(1); id <= 6; id++ {
+		store.jobs[id] = db.Job{ID: id}
+		store.pending = append(store.pending, Claimed{OutboxID: id * 10, JobID: id})
+	}
+
+	opts := opt()
+	opts.BatchSize = 2
+	opts.MaxPerRun = 4
+	stats, err := Runner{Store: store, Indexer: ix}.Run(context.Background(), opts)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if stats.Indexed != 4 {
+		t.Fatalf("stats = %+v, want indexed=4 — the run took the whole queue", stats)
+	}
+	if len(store.pending) != 2 {
+		t.Errorf("pending = %d, want 2 still claimable for the next run", len(store.pending))
+	}
+}
+
+// The default has to stay unbounded: a cap set below the arrival rate turns a queue that was
+// draining into one that grows, so it is opt-in and zero must not read as "take nothing".
+func TestRunnerZeroMaxPerRunDrainsEverything(t *testing.T) {
+	store := newFakeStore()
+	ix := newFakeIndexer()
+	for id := int64(1); id <= 5; id++ {
+		store.jobs[id] = db.Job{ID: id}
+		store.pending = append(store.pending, Claimed{OutboxID: id * 10, JobID: id})
+	}
+
+	opts := opt()
+	opts.BatchSize = 2
+	opts.MaxPerRun = 0
+	stats, err := Runner{Store: store, Indexer: ix}.Run(context.Background(), opts)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if stats.Indexed != 5 || len(store.pending) != 0 {
+		t.Errorf("stats = %+v, pending = %d, want the whole queue drained", stats, len(store.pending))
+	}
+}

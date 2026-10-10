@@ -1,0 +1,462 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>freehire — email previews</title>
+<style>
+  :root { color-scheme: light; }
+  body {
+    margin: 0; padding: 40px 32px; background: #fafafa; color: #070707;
+    font-family: ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+  }
+  h1 { margin: 0 0 6px; font-size: 22px; font-weight: 650; letter-spacing: -0.02em; }
+  .lede { margin: 0 0 36px; font-size: 14px; color: #505050; max-width: 60ch; line-height: 1.6; }
+  .grid { display: grid; gap: 28px; grid-template-columns: repeat(auto-fill, minmax(400px, 1fr)); }
+  .card { background: #fff; border: 1px solid #e4e4e4; border-radius: 12px; overflow: hidden; }
+  .meta { padding: 14px 16px; border-bottom: 1px solid #e4e4e4; }
+  .name { font-size: 13px; font-weight: 650; }
+  .subject { margin-top: 3px; font-size: 12px; color: #505050; }
+  iframe { display: block; width: 100%; height: 560px; border: 0; background: #f0f0f0; }
+  .text { padding: 12px 16px; border-top: 1px solid #e4e4e4; background: #fafafa; }
+  .text summary { font-size: 12px; color: #505050; cursor: pointer; }
+  .text pre { margin: 10px 0 0; font-size: 12px; line-height: 1.5; white-space: pre-wrap; color: #070707; }
+
+  .toolbar { display: flex; gap: 8px; align-items: center; margin: 0 0 32px; }
+  .toolbar span { font-size: 13px; color: #505050; margin-right: 4px; }
+  .toolbar button {
+    font: inherit; font-size: 13px; padding: 6px 14px; cursor: pointer;
+    background: #fff; color: #070707; border: 1px solid #e4e4e4; border-radius: 8px;
+  }
+  .toolbar button[aria-pressed='true'] { background: #5b6f00; border-color: #5b6f00; color: #f3f6e2; }
+</style>
+</head>
+<body>
+<h1>Email previews</h1>
+<p class="lede">
+  Every mail freehire sends, rendered from the real templates against sample data.
+  Regenerate with <code>make mail-preview</code>.
+</p>
+
+<div class="toolbar">
+  <span>Theme</span>
+  <button type="button" data-scheme="light" aria-pressed="true">Light</button>
+  <button type="button" data-scheme="dark" aria-pressed="false">Dark</button>
+  <button type="button" data-scheme="auto" aria-pressed="false">Your system</button>
+</div>
+
+<div class="grid">
+
+  <div class="card">
+    <div class="meta">
+      <div class="name">Campaigns / Discord invite</div>
+      <div class="subject">Join a community of job seekers</div>
+    </div>
+    <iframe data-mail="campaign-discord-invite" src="campaign-discord-invite.light.html" title="Campaigns / Discord invite" sandbox="allow-same-origin" loading="lazy"></iframe>
+    <div class="text">
+      <details><summary>Plain-text alternative</summary><pre>Hi — short one. freehire has a Discord, and I&#39;d like you in it.
+
+It is where the questions go now. A filter that misbehaves, a company board we don&#39;t cover
+yet, a posting that smells fake, a feature you wish existed — ask there and I answer myself.
+The whole project is open source, so there is nothing about how it works that is off limits
+to ask.
+
+And it isn&#39;t only me on the other end.
+
+It is a community of job seekers, and what we do there is share how the search is actually
+going: what got a reply and what got silence, a CV rewritten until it started landing
+interviews, what a company&#39;s interview loop really looks like, what the offer came in at.
+I share mine too — I am reading the same market you are.
+
+That half I can&#39;t build. Whether a company is really hiring or just collecting CVs, which
+recruiters answer and which never do — you only get that from other people running the same
+search. Job hunting alone is the worst way to do it, and that is really what the room is for.
+
+Join the Discord: https://discord.gg/79cgB9RRfx
+
+It&#39;s free, it&#39;s small, and lurking is fine. If you&#39;d rather just tell me something, reply to
+this — I read every one.
+
+— Ilya Strelov, building freehire
+https://www.linkedin.com/in/istrelov/
+
+Unsubscribe: ./unsubscribe?t=1.news.2QPea7f2nPgMFm8JnIjHTAoO3YfA2jsJY2SRDfWRCEY
+</pre></details>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="meta">
+      <div class="name">Onboarding / 1 · Welcome</div>
+      <div class="subject">What are you looking for?</div>
+    </div>
+    <iframe data-mail="onboarding-welcome" src="onboarding-welcome.light.html" title="Onboarding / 1 · Welcome" sandbox="allow-same-origin" loading="lazy"></iframe>
+    <div class="text">
+      <details><summary>Plain-text alternative</summary><pre>I built freehire because job boards kept wasting my time — the same posting reposted for months,
+&#34;remote&#34; that turned out to be hybrid, roles that were already filled before I applied.
+
+So I built an aggregator that pulls from hundreds of company boards, merges the duplicates,
+and flags postings that look dead. The whole thing is open source.
+
+One question — a one-line reply is plenty:
+
+What role are you looking for, and where?
+
+I read every reply myself. If we don&#39;t cover your search well yet, tell me — that is usually
+what I work on next.
+
+Set up a job alert: ./my/notifications
+
+— Ilya Strelov, building freehire
+https://www.linkedin.com/in/istrelov/
+
+Unsubscribe: ./unsubscribe?t=1.news.2QPea7f2nPgMFm8JnIjHTAoO3YfA2jsJY2SRDfWRCEY
+</pre></details>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="meta">
+      <div class="name">Onboarding / 2 · Advanced search</div>
+      <div class="subject">The filters go deeper than you’d think</div>
+    </div>
+    <iframe data-mail="onboarding-advanced-search" src="onboarding-advanced-search.light.html" title="Onboarding / 2 · Advanced search" sandbox="allow-same-origin" loading="lazy"></iframe>
+    <div class="text">
+      <details><summary>Plain-text alternative</summary><pre>Most job boards give you a handful of dropdowns. freehire has twenty — role, seniority,
+stack, region, company type, salary currency, even whether a posting looks real.
+
+The one people miss: almost every filter can also mean &#34;not this.&#34; Click a value once to
+require it, again to rule it out — a company you already applied to, a stack you&#39;re done
+with, a source you don&#39;t trust.
+
+Save the search once, and freehire keeps running it for you — Telegram, email or push,
+your choice.
+
+See how the filters work: ./features/advanced-search
+
+— Ilya Strelov, building freehire
+https://www.linkedin.com/in/istrelov/
+
+Unsubscribe: ./unsubscribe?t=1.news.2QPea7f2nPgMFm8JnIjHTAoO3YfA2jsJY2SRDfWRCEY
+</pre></details>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="meta">
+      <div class="name">Onboarding / 3 · No alert yet</div>
+      <div class="subject">Want me to set up your search?</div>
+    </div>
+    <iframe data-mail="onboarding-no-alert" src="onboarding-no-alert.light.html" title="Onboarding / 3 · No alert yet" sandbox="allow-same-origin" loading="lazy"></iframe>
+    <div class="text">
+      <details><summary>Plain-text alternative</summary><pre>You signed up a few days ago but haven&#39;t set up a job alert yet. That is the part that does the
+work for you: describe the search once, and new matches come to you instead of you checking.
+
+If it is easier, just reply with the role and where you want to work. I&#39;ll tell you honestly
+whether we cover it well — and if we don&#39;t, I&#39;d rather you knew now than checked an empty page
+for a week.
+
+Set up an alert: ./my/notifications
+
+— Ilya Strelov, building freehire
+https://www.linkedin.com/in/istrelov/
+
+Unsubscribe: ./unsubscribe?t=1.news.2QPea7f2nPgMFm8JnIjHTAoO3YfA2jsJY2SRDfWRCEY
+</pre></details>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="meta">
+      <div class="name">Onboarding / 4 · Browser extension</div>
+      <div class="subject">A freehire panel on any job page</div>
+    </div>
+    <iframe data-mail="onboarding-extension" src="onboarding-extension.light.html" title="Onboarding / 4 · Browser extension" sandbox="allow-same-origin" loading="lazy"></iframe>
+    <div class="text">
+      <details><summary>Plain-text alternative</summary><pre>One more thing worth knowing about: freehire has a browser extension, and it works on job
+pages that have nothing to do with us.
+
+Open the side panel on a posting — Greenhouse, Lever, Workday, Ashby, or a career page
+nobody has heard of. It reads the page itself, scores the role against your CV, and fills
+the application form out of your profile. You read what it wrote and press Submit.
+
+The point is that it works where you already are.
+
+It signs in with the same account, so it is your CV and your profile it fills from —
+nothing to set up a second time.
+
+Add it to Chrome: https://chromewebstore.google.com/detail/freehire/ijfaechijopdlikalojadpojmpilplnj
+
+What it does, in more detail: ./features/extension
+
+It is Chrome for now. If you are on Firefox or Safari, reply and say so — that is how I
+decide what to build next.
+
+— Ilya Strelov, building freehire
+https://www.linkedin.com/in/istrelov/
+
+Unsubscribe: ./unsubscribe?t=1.news.2QPea7f2nPgMFm8JnIjHTAoO3YfA2jsJY2SRDfWRCEY
+</pre></details>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="meta">
+      <div class="name">Onboarding / 5 · Open source</div>
+      <div class="subject">Open code, and one place to ask</div>
+    </div>
+    <iframe data-mail="onboarding-open-source" src="onboarding-open-source.light.html" title="Onboarding / 5 · Open source" sandbox="allow-same-origin" loading="lazy"></iframe>
+    <div class="text">
+      <details><summary>Plain-text alternative</summary><pre>Some background you might not know: freehire is fully open source. Every parser, every dedup
+rule, the ranking — all of it is public. Nothing is hidden about how a job gets in, or why it
+sits where it sits.
+
+I built it in the open because job search runs on trust, and &#34;trust me&#34; is a poor answer from
+a site that decides what you get to see.
+
+The Discord is where the rest of it happens.
+
+It is the main place to ask anything — a filter that misbehaves, a board we don&#39;t cover yet,
+a posting that smells fake, a feature you want. I read it and answer myself, and it is small
+enough that you will actually be heard.
+
+It is also a community of job seekers sharing how the search actually goes: what got a reply
+and what got silence, a CV rewritten until it started landing interviews, whether a company
+is really hiring or just collecting CVs, what the offer came in at. That half I can&#39;t build —
+it only exists because people show up.
+
+Join the Discord: https://discord.gg/79cgB9RRfx
+
+And if the project has been useful, a star is how most people end up finding it:
+https://github.com/strelov1/freehire
+
+Replying to this mail reaches me too.
+
+— Ilya Strelov, building freehire
+https://www.linkedin.com/in/istrelov/
+
+Unsubscribe: ./unsubscribe?t=1.news.2QPea7f2nPgMFm8JnIjHTAoO3YfA2jsJY2SRDfWRCEY
+</pre></details>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="meta">
+      <div class="name">Account / Verify email</div>
+      <div class="subject">Confirm your freehire email</div>
+    </div>
+    <iframe data-mail="verify-email" src="verify-email.light.html" title="Account / Verify email" sandbox="allow-same-origin" loading="lazy"></iframe>
+    <div class="text">
+      <details><summary>Plain-text alternative</summary><pre>Confirm your email address with this code: 418205
+It expires in 15 minutes. If you did not create an account, ignore this message.</pre></details>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="meta">
+      <div class="name">Account / Password reset</div>
+      <div class="subject">Reset your freehire password</div>
+    </div>
+    <iframe data-mail="password-reset" src="password-reset.light.html" title="Account / Password reset" sandbox="allow-same-origin" loading="lazy"></iframe>
+    <div class="text">
+      <details><summary>Plain-text alternative</summary><pre>Use this code to set a new password: 730914
+It expires in 15 minutes. If this was not you, ignore this message — your password has not changed.</pre></details>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="meta">
+      <div class="name">Alerts / Subscription digest</div>
+      <div class="subject">14 new jobs for &#34;Senior Go, remote in Europe&#34;</div>
+    </div>
+    <iframe data-mail="subscription-digest" src="subscription-digest.light.html" title="Alerts / Subscription digest" sandbox="allow-same-origin" loading="lazy"></iframe>
+    <div class="text">
+      <details><summary>Plain-text alternative</summary><pre>14 new jobs for &#34;Senior Go, remote in Europe&#34;
+
+- Senior Backend Engineer (Go) — Fingerprint · €120K—€160K / year
+  ./jobs/senior-backend-engineer-go-fingerprint?utm_source=email
+- Staff Engineer, Platform — Speechify
+  ./jobs/staff-engineer-platform-speechify?utm_source=email
+- Go Developer — Payments — Avenga · $90K—$110K / year
+  ./jobs/go-developer-payments-avenga?utm_source=email
+
+&#43; 11 more at ./my/notifications
+
+Manage your alerts: ./my/notifications
+
+Unsubscribe: ./unsubscribe?t=1.alerts.fBT2ld7E0NNI3KBbzwdKCgNIbaxtIQbq9Q9kEmbcENI
+</pre></details>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="meta">
+      <div class="name">Tracking / Saved-job reminder</div>
+      <div class="subject">Reminder: Senior Backend Engineer (Go) at Fingerprint</div>
+    </div>
+    <iframe data-mail="saved-job-reminder" src="saved-job-reminder.light.html" title="Tracking / Saved-job reminder" sandbox="allow-same-origin" loading="lazy"></iframe>
+    <div class="text">
+      <details><summary>Plain-text alternative</summary><pre>You saved Senior Backend Engineer (Go) at Fingerprint and haven&#39;t applied yet.
+
+Open the job: ./jobs/senior-backend-engineer-go-fingerprint?utm_source=email
+
+Unsubscribe: ./unsubscribe?t=1.activity.fEzXcKsHMLIW_dGYja7vwmMnLQ0tej13Vrwi73D4ta8
+</pre></details>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="meta">
+      <div class="name">Tracking / Saved-job reminders (batch)</div>
+      <div class="subject">Reminder: 3 saved jobs</div>
+    </div>
+    <iframe data-mail="saved-job-reminder-batch" src="saved-job-reminder-batch.light.html" title="Tracking / Saved-job reminders (batch)" sandbox="allow-same-origin" loading="lazy"></iframe>
+    <div class="text">
+      <details><summary>Plain-text alternative</summary><pre>You saved these jobs and haven’t applied yet.
+
+- Senior Backend Engineer (Go) — Fingerprint
+  ./jobs/senior-backend-engineer-go-fingerprint?utm_source=email
+- Staff Platform Engineer — Vercel
+  ./jobs/staff-platform-engineer-vercel?utm_source=email
+- Site Reliability Engineer — Datadog
+  ./jobs/site-reliability-engineer-datadog?utm_source=email
+
+Unsubscribe: ./unsubscribe?t=1.activity.fEzXcKsHMLIW_dGYja7vwmMnLQ0tej13Vrwi73D4ta8
+</pre></details>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="meta">
+      <div class="name">Tracking / Nudge: follow up</div>
+      <div class="subject">Time to follow up: Staff Engineer, Platform at Speechify</div>
+    </div>
+    <iframe data-mail="nudge-follow-up" src="nudge-follow-up.light.html" title="Tracking / Nudge: follow up" sandbox="allow-same-origin" loading="lazy"></iframe>
+    <div class="text">
+      <details><summary>Plain-text alternative</summary><pre>It&#39;s been 12 days since anything moved on Staff Engineer, Platform at Speechify.
+
+Open your tracking board: ./my/tracking?utm_source=email
+
+Unsubscribe: ./unsubscribe?t=1.activity.fEzXcKsHMLIW_dGYja7vwmMnLQ0tej13Vrwi73D4ta8
+</pre></details>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="meta">
+      <div class="name">Tracking / Nudge: follow up (batch)</div>
+      <div class="subject">Time to follow up on 3 applications</div>
+    </div>
+    <iframe data-mail="nudge-follow-up-batch" src="nudge-follow-up-batch.light.html" title="Tracking / Nudge: follow up (batch)" sandbox="allow-same-origin" loading="lazy"></iframe>
+    <div class="text">
+      <details><summary>Plain-text alternative</summary><pre>Nothing has moved on 3 of your applications.
+
+- Staff Engineer, Platform — Speechify
+  ./jobs/staff-engineer-platform-speechify?utm_source=email
+- Backend Engineer — Monzo
+  ./jobs/backend-engineer-monzo?utm_source=email
+- Infrastructure Engineer — Grafana Labs
+  ./jobs/infrastructure-engineer-grafana-labs?utm_source=email
+
+Open your tracking board: ./my/tracking?utm_source=email
+
+Unsubscribe: ./unsubscribe?t=1.activity.fEzXcKsHMLIW_dGYja7vwmMnLQ0tej13Vrwi73D4ta8
+</pre></details>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="meta">
+      <div class="name">Tracking / Nudge: job closed</div>
+      <div class="subject">Closed: Go Developer — Payments at Avenga</div>
+    </div>
+    <iframe data-mail="nudge-job-closed" src="nudge-job-closed.light.html" title="Tracking / Nudge: job closed" sandbox="allow-same-origin" loading="lazy"></iframe>
+    <div class="text">
+      <details><summary>Plain-text alternative</summary><pre>Go Developer — Payments at Avenga was closed.
+
+Open the job: ./jobs/go-developer-payments-avenga?utm_source=email
+
+Unsubscribe: ./unsubscribe?t=1.activity.fEzXcKsHMLIW_dGYja7vwmMnLQ0tej13Vrwi73D4ta8
+</pre></details>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="meta">
+      <div class="name">Referrals / New request</div>
+      <div class="subject">New referral request on freehire</div>
+    </div>
+    <iframe data-mail="referral-request" src="referral-request.light.html" title="Referrals / New request" sandbox="allow-same-origin" loading="lazy"></iframe>
+    <div class="text">
+      <details><summary>Plain-text alternative</summary><pre>A job seeker asked for a referral. View the request in your inbox: ./my/referrals/inbox
+
+Unsubscribe: ./unsubscribe?t=1.activity.fEzXcKsHMLIW_dGYja7vwmMnLQ0tej13Vrwi73D4ta8
+</pre></details>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="meta">
+      <div class="name">Moderation / Report: job removed</div>
+      <div class="subject">We removed the job you reported</div>
+    </div>
+    <iframe data-mail="report-job-removed" src="report-job-removed.light.html" title="Moderation / Report: job removed" sandbox="allow-same-origin" loading="lazy"></iframe>
+    <div class="text">
+      <details><summary>Plain-text alternative</summary><pre>You reported Go Developer — Payments, and we have removed it from the listings.
+
+What we found:
+Confirmed — the application form is dead and the company stopped hiring in March.
+
+You reported: The posting has been reappearing every week for four months and the form 404s.
+
+Go Developer — Payments: ./jobs/go-developer-payments-avenga
+
+Thanks for flagging it — reports are how the listings stay honest.
+Unsubscribe: ./unsubscribe?t=1.activity.fEzXcKsHMLIW_dGYja7vwmMnLQ0tej13Vrwi73D4ta8
+</pre></details>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="meta">
+      <div class="name">Moderation / Report: no change</div>
+      <div class="subject">Your report on Staff Engineer, Platform — no change</div>
+    </div>
+    <iframe data-mail="report-dismissed" src="report-dismissed.light.html" title="Moderation / Report: no change" sandbox="allow-same-origin" loading="lazy"></iframe>
+    <div class="text">
+      <details><summary>Plain-text alternative</summary><pre>We looked into your report on Staff Engineer, Platform and left the listing as it is.
+
+Why:
+The two postings are for different teams, so both stay up.
+
+You reported: Looks like a duplicate of another posting.
+
+Staff Engineer, Platform: ./jobs/staff-engineer-platform-speechify
+
+Thanks for flagging it — reports are how the listings stay honest.
+Unsubscribe: ./unsubscribe?t=1.activity.fEzXcKsHMLIW_dGYja7vwmMnLQ0tej13Vrwi73D4ta8
+</pre></details>
+    </div>
+  </div>
+
+</div>
+
+<script>
+  
+  
+  const suffix = { light: '.light.html', dark: '.dark.html', auto: '.html' };
+  const buttons = document.querySelectorAll('.toolbar button');
+  const frames = document.querySelectorAll('iframe[data-mail]');
+
+  for (const button of buttons) {
+    button.addEventListener('click', () => {
+      const scheme = button.dataset.scheme;
+      for (const other of buttons) other.setAttribute('aria-pressed', String(other === button));
+      for (const frame of frames) frame.src = frame.dataset.mail + suffix[scheme];
+      document.body.style.background = scheme === 'dark' ? '#141414' : '#fafafa';
+      document.body.style.color = scheme === 'dark' ? '#fafafa' : '#070707';
+    });
+  }
+</script>
+</body>
+</html>

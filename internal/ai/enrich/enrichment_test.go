@@ -1,0 +1,509 @@
+package enrich
+
+import (
+	"encoding/json"
+	"reflect"
+	"strings"
+	"testing"
+
+	"github.com/strelov1/freehire/internal/dict/vocab"
+)
+
+func ptr[T any](v T) *T { return &v }
+
+// A fully-populated value must survive a JSON marshal/unmarshal round trip
+// unchanged. reflect.DeepEqual follows pointers, so pointer fields compare by
+// pointed-to value.
+func TestRoundTripFidelity(t *testing.T) {
+	original := Enrichment{
+		Summary:            "Senior backend role building Go services on PostgreSQL.",
+		WorkMode:           "remote",
+		EmploymentType:     "full_time",
+		Relocation:         "supported",
+		VisaSponsorship:    ptr(true),
+		Regions:            []string{"eu"},
+		Countries:          []string{"US", "DE"},
+		Cities:             []string{"Berlin"},
+		TimezoneNote:       "UTC±2 overlap",
+		SalaryMin:          ptr(80000),
+		SalaryMax:          ptr(120000),
+		SalaryCurrency:     "USD",
+		SalaryPeriod:       "year",
+		Seniority:          "senior",
+		ExperienceYearsMin: ptr(5),
+		EnglishLevel:       "b2",
+		EducationLevel:     "bachelor",
+		Skills:             []string{"go", "postgresql"},
+		Category:           "backend",
+		Domains:            []string{"fintech", "devtools"},
+		PostingLanguage:    "en",
+		CompanyType:        "product",
+		CompanySize:        "51-200",
+		Requirements: []Requirement{
+			{Text: "5+ years Go", Priority: "required"},
+			{Text: "Kubernetes", Priority: "preferred"},
+		},
+	}
+
+	data, err := json.Marshal(original)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	var got Enrichment
+	if err := json.Unmarshal(data, &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+
+	if !reflect.DeepEqual(original, got) {
+		t.Errorf("round trip mismatch:\n original = %+v\n got      = %+v", original, got)
+	}
+}
+
+// Undetermined fields must be omitted from the JSON, not serialized as zero/
+// empty values. A present zero (e.g. experience 0) must NOT be omitted.
+func TestOmitemptyOnUndeterminedFields(t *testing.T) {
+	e := Enrichment{Seniority: "senior"}
+
+	data, err := json.Marshal(e)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	got := string(data)
+
+	for _, key := range []string{
+		"salary_min", "salary_max", "salary_currency", "salary_period",
+		"work_mode", "visa_sponsorship", "experience_years_min", "skills",
+	} {
+		if strings.Contains(got, key) {
+			t.Errorf("expected %q to be omitted, got: %s", key, got)
+		}
+	}
+	if !strings.Contains(got, "seniority") {
+		t.Errorf("expected seniority to be present, got: %s", got)
+	}
+}
+
+// A present zero-valued int field is meaningful and must round-trip, not be
+// dropped by omitempty (the reason those fields are pointers).
+func TestZeroValuedPointerFieldIsPreserved(t *testing.T) {
+	e := Enrichment{ExperienceYearsMin: ptr(0)}
+
+	data, err := json.Marshal(e)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if !strings.Contains(string(data), "experience_years_min") {
+		t.Errorf("present zero must not be omitted, got: %s", data)
+	}
+
+	var got Enrichment
+	if err := json.Unmarshal(data, &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if got.ExperienceYearsMin == nil || *got.ExperienceYearsMin != 0 {
+		t.Errorf("expected experience_years_min = 0, got %v", got.ExperienceYearsMin)
+	}
+}
+
+func TestValidateAccepts(t *testing.T) {
+	valid := []Enrichment{
+		{}, // empty payload: every field optional
+		{Seniority: "senior", WorkMode: "remote", Skills: []string{"go", "postgresql"}},
+		{Domains: []string{"fintech", "devtools"}, Category: "backend"},
+		// ISO and free-text fields are not enum-validated in this phase.
+		{Countries: []string{"ZZ"}, SalaryCurrency: "XXX", PostingLanguage: "qq"},
+	}
+	for i, e := range valid {
+		if err := e.Validate(); err != nil {
+			t.Errorf("case %d: expected valid, got error: %v", i, err)
+		}
+	}
+}
+
+func TestValidateRejectsScalarEnum(t *testing.T) {
+	// A SERVED enum field is still validated (relocation reaches the wire shape).
+	err := Enrichment{Relocation: "seasonal"}.Validate()
+	if err == nil {
+		t.Fatal("expected error for relocation \"seasonal\"")
+	}
+	if !strings.Contains(err.Error(), "relocation") {
+		t.Errorf("error must identify the offending field, got: %v", err)
+	}
+}
+
+// When several SERVED enum fields are invalid, Validate reports the first one in
+// declaration order (relocation is checked before company_size).
+func TestValidateReportsFirstOffender(t *testing.T) {
+	err := Enrichment{Relocation: "telepathic", CompanySize: "huge"}.Validate()
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if !strings.Contains(err.Error(), "relocation") {
+		t.Errorf("want first offender relocation, got: %v", err)
+	}
+	if strings.Contains(err.Error(), "company_size") {
+		t.Errorf("should report only the first offender, got: %v", err)
+	}
+}
+
+// Relax: the dict-covered discovery facets are captured raw — an out-of-vocab
+// work_mode/seniority/category/employment_type/education_level/english_level and a
+// non-vocab regions element pass Validate (they are unserved, so they cannot corrupt
+// production data).
+func TestValidateAcceptsOutOfVocabDiscoveryFacets(t *testing.T) {
+	discovery := []Enrichment{
+		{Seniority: "staff_plus"},
+		{Category: "ml_platform"},
+		{WorkMode: "remote_first"},
+		{Regions: []string{"eu", "europe"}},
+		{EmploymentType: "freelance"},
+		{EducationLevel: "associate"},
+		{EnglishLevel: "toefl_110"},
+	}
+	for i, e := range discovery {
+		if err := e.Validate(); err != nil {
+			t.Errorf("case %d: discovery facet should pass Validate, got: %v", i, err)
+		}
+	}
+}
+
+func TestValidateRejectsMultiEnumElement(t *testing.T) {
+	err := Enrichment{Domains: []string{"fintech", "not_a_domain"}}.Validate()
+	if err == nil {
+		t.Fatal("expected error for invalid domain element")
+	}
+	if !strings.Contains(err.Error(), "domains") {
+		t.Errorf("error must identify the offending field, got: %v", err)
+	}
+}
+
+func TestValidateAcceptsRegions(t *testing.T) {
+	valid := []Enrichment{
+		{WorkMode: "remote", Regions: []string{"global"}},
+		{WorkMode: "remote", Regions: []string{"eu", "mena"}},
+		{WorkMode: "remote", Regions: []string{"north_america", "cis"}},
+	}
+	for i, e := range valid {
+		if err := e.Validate(); err != nil {
+			t.Errorf("case %d: expected valid, got error: %v", i, err)
+		}
+	}
+}
+
+// Global reach must be distinguishable from unknown reach: an explicit "global"
+// region serializes the key, an unknown (empty regions) payload omits it.
+func TestGlobalReachDistinctFromUnknown(t *testing.T) {
+	global, err := json.Marshal(Enrichment{WorkMode: "remote", Regions: []string{"global"}})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if !strings.Contains(string(global), "regions") {
+		t.Errorf("explicit global must serialize regions, got: %s", global)
+	}
+
+	unknown, err := json.Marshal(Enrichment{WorkMode: "remote"})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if strings.Contains(string(unknown), "regions") {
+		t.Errorf("unknown reach must omit regions, got: %s", unknown)
+	}
+}
+
+func TestSanitizeDropsOutOfVocabValues(t *testing.T) {
+	e := Enrichment{
+		Relocation:  "seasonal",                   // SERVED invalid scalar -> blanked
+		CompanyType: "product",                    // SERVED valid -> kept
+		Domains:     []string{"fintech", "bogus"}, // SERVED multi -> keep only known
+		// Discovery facets are captured raw (unserved):
+		Category:       "astrology",      // kept
+		Seniority:      "staff_plus",     // kept
+		Regions:        []string{"nope"}, // kept
+		EmploymentType: "freelance",      // kept
+		EducationLevel: "associate",      // kept
+		EnglishLevel:   "toefl_110",      // kept
+	}
+	e.Sanitize()
+
+	if e.Relocation != "" {
+		t.Errorf("Relocation = %q, want blanked (served field)", e.Relocation)
+	}
+	if e.CompanyType != "product" {
+		t.Errorf("CompanyType = %q, want kept", e.CompanyType)
+	}
+	if len(e.Domains) != 1 || e.Domains[0] != "fintech" {
+		t.Errorf("Domains = %v, want [fintech] (served multi filtered)", e.Domains)
+	}
+	// Discovery facets survive untouched.
+	if e.Category != "astrology" {
+		t.Errorf("Category = %q, want kept raw (discovery)", e.Category)
+	}
+	if e.Seniority != "staff_plus" {
+		t.Errorf("Seniority = %q, want kept raw (discovery)", e.Seniority)
+	}
+	if len(e.Regions) != 1 || e.Regions[0] != "nope" {
+		t.Errorf("Regions = %v, want kept raw (discovery)", e.Regions)
+	}
+	if e.EmploymentType != "freelance" {
+		t.Errorf("EmploymentType = %q, want kept raw (discovery)", e.EmploymentType)
+	}
+	if e.EducationLevel != "associate" {
+		t.Errorf("EducationLevel = %q, want kept raw (discovery)", e.EducationLevel)
+	}
+	if e.EnglishLevel != "toefl_110" {
+		t.Errorf("EnglishLevel = %q, want kept raw (discovery)", e.EnglishLevel)
+	}
+	if err := e.Validate(); err != nil {
+		t.Errorf("Validate after Sanitize = %v, want nil", err)
+	}
+}
+
+func TestSanitizeDropsImplausibleSalary(t *testing.T) {
+	t.Run("non-positive salary is dropped", func(t *testing.T) {
+		e := Enrichment{SalaryMin: ptr(-1), SalaryMax: ptr(0)}
+		e.Sanitize()
+		if e.SalaryMin != nil {
+			t.Errorf("SalaryMin = %v, want nil (negative dropped)", *e.SalaryMin)
+		}
+		if e.SalaryMax != nil {
+			t.Errorf("SalaryMax = %v, want nil (zero dropped)", *e.SalaryMax)
+		}
+	})
+
+	t.Run("valid positive salary kept, including high-denomination currencies", func(t *testing.T) {
+		// 58.8M CLP/year (~$61k) is a real salary — no absolute upper clamp.
+		e := Enrichment{SalaryMin: ptr(49_980_000), SalaryMax: ptr(58_800_000), SalaryCurrency: "CLP"}
+		e.Sanitize()
+		if e.SalaryMin == nil || *e.SalaryMin != 49_980_000 {
+			t.Errorf("SalaryMin = %v, want kept", e.SalaryMin)
+		}
+		if e.SalaryMax == nil || *e.SalaryMax != 58_800_000 {
+			t.Errorf("SalaryMax = %v, want kept", e.SalaryMax)
+		}
+	})
+
+	t.Run("inconsistent min > max drops both", func(t *testing.T) {
+		e := Enrichment{SalaryMin: ptr(200_000), SalaryMax: ptr(100_000)}
+		e.Sanitize()
+		if e.SalaryMin != nil || e.SalaryMax != nil {
+			t.Errorf("min>max should drop both, got min=%v max=%v", e.SalaryMin, e.SalaryMax)
+		}
+	})
+
+	t.Run("min alone or max alone is preserved when positive", func(t *testing.T) {
+		e := Enrichment{SalaryMax: ptr(120_000)}
+		e.Sanitize()
+		if e.SalaryMax == nil || *e.SalaryMax != 120_000 {
+			t.Errorf("lone positive SalaryMax = %v, want kept", e.SalaryMax)
+		}
+	})
+}
+
+func TestSanitizeSummary(t *testing.T) {
+	t.Run("normal summary is trimmed but kept", func(t *testing.T) {
+		e := Enrichment{Summary: "  Backend role building a payments API in Go.  "}
+		e.Sanitize()
+		if want := "Backend role building a payments API in Go."; e.Summary != want {
+			t.Errorf("Summary = %q, want %q", e.Summary, want)
+		}
+	})
+
+	t.Run("over-long summary is clipped to maxSummaryRunes", func(t *testing.T) {
+		e := Enrichment{Summary: strings.Repeat("a", maxSummaryRunes+50)}
+		e.Sanitize()
+		if got := len([]rune(e.Summary)); got != maxSummaryRunes {
+			t.Errorf("clipped length = %d runes, want %d", got, maxSummaryRunes)
+		}
+	})
+
+	t.Run("rune count, not byte count, bounds a multibyte summary", func(t *testing.T) {
+		// Cyrillic runes are multibyte; a summary of exactly the cap must survive whole.
+		e := Enrichment{Summary: strings.Repeat("я", maxSummaryRunes)}
+		e.Sanitize()
+		if got := len([]rune(e.Summary)); got != maxSummaryRunes {
+			t.Errorf("length = %d runes, want %d (must count runes, not bytes)", got, maxSummaryRunes)
+		}
+	})
+}
+
+// The other two served free-text fields (timezone_note, salary_currency) are
+// extracted from the untrusted description and reach the public wire, so Sanitize
+// must bound them like Summary — else an oversized/injected value is served raw.
+func TestSanitizeBoundsFreeTextFields(t *testing.T) {
+	e := Enrichment{
+		TimezoneNote:   "  " + strings.Repeat("z", maxTimezoneNoteRunes+50) + "  ",
+		SalaryCurrency: strings.Repeat("U", maxSalaryCurrencyRunes+50),
+	}
+	e.Sanitize()
+	if got := len([]rune(e.TimezoneNote)); got != maxTimezoneNoteRunes {
+		t.Errorf("TimezoneNote clipped length = %d runes, want %d", got, maxTimezoneNoteRunes)
+	}
+	if got := len([]rune(e.SalaryCurrency)); got != maxSalaryCurrencyRunes {
+		t.Errorf("SalaryCurrency clipped length = %d runes, want %d", got, maxSalaryCurrencyRunes)
+	}
+
+	// A normal timezone note is trimmed but otherwise untouched.
+	e2 := Enrichment{TimezoneNote: "  overlaps US business hours  ", SalaryCurrency: "USD"}
+	e2.Sanitize()
+	if e2.TimezoneNote != "overlaps US business hours" {
+		t.Errorf("TimezoneNote = %q, want trimmed value", e2.TimezoneNote)
+	}
+	if e2.SalaryCurrency != "USD" {
+		t.Errorf("SalaryCurrency = %q, want USD unchanged", e2.SalaryCurrency)
+	}
+}
+
+func TestSanitizeBoundsCities(t *testing.T) {
+	t.Run("an over-long city name is clipped", func(t *testing.T) {
+		e := Enrichment{Cities: []string{"  " + strings.Repeat("x", maxCityRunes+50) + "  "}}
+		e.Sanitize()
+		if len(e.Cities) != 1 {
+			t.Fatalf("Cities = %v, want 1 entry", e.Cities)
+		}
+		if got := len([]rune(e.Cities[0])); got != maxCityRunes {
+			t.Errorf("Cities[0] clipped length = %d runes, want %d", got, maxCityRunes)
+		}
+	})
+
+	t.Run("an oversized list is capped, not just each entry", func(t *testing.T) {
+		var cities []string
+		for i := 0; i < maxCities+50; i++ {
+			cities = append(cities, "City")
+		}
+		e := Enrichment{Cities: cities}
+		e.Sanitize()
+		if len(e.Cities) != maxCities {
+			t.Errorf("len(Cities) = %d, want %d", len(e.Cities), maxCities)
+		}
+	})
+
+	t.Run("a normal city list is untouched", func(t *testing.T) {
+		e := Enrichment{Cities: []string{"Kyiv", "Warsaw"}}
+		e.Sanitize()
+		if !reflect.DeepEqual(e.Cities, []string{"Kyiv", "Warsaw"}) {
+			t.Errorf("Cities = %v, want unchanged", e.Cities)
+		}
+	})
+}
+
+func TestSanitizeBoundsRequirements(t *testing.T) {
+	t.Run("an over-long requirement text is clipped", func(t *testing.T) {
+		e := Enrichment{Requirements: []Requirement{
+			{Text: "  " + strings.Repeat("x", maxRequirementTextRunes+50) + "  ", Priority: "required"},
+		}}
+		e.Sanitize()
+		if len(e.Requirements) != 1 {
+			t.Fatalf("Requirements = %v, want 1 entry", e.Requirements)
+		}
+		if got := len([]rune(e.Requirements[0].Text)); got != maxRequirementTextRunes {
+			t.Errorf("Requirements[0].Text clipped length = %d runes, want %d", got, maxRequirementTextRunes)
+		}
+	})
+
+	t.Run("an oversized list is capped, not just each entry", func(t *testing.T) {
+		var reqs []Requirement
+		for i := 0; i < maxRequirements+50; i++ {
+			reqs = append(reqs, Requirement{Text: "Go", Priority: "required"})
+		}
+		e := Enrichment{Requirements: reqs}
+		e.Sanitize()
+		if len(e.Requirements) != maxRequirements {
+			t.Errorf("len(Requirements) = %d, want %d", len(e.Requirements), maxRequirements)
+		}
+	})
+
+	t.Run("an entry whose text clips to empty is dropped", func(t *testing.T) {
+		e := Enrichment{Requirements: []Requirement{
+			{Text: "   ", Priority: "required"},
+			{Text: "Go", Priority: "required"},
+		}}
+		e.Sanitize()
+		if len(e.Requirements) != 1 || e.Requirements[0].Text != "Go" {
+			t.Errorf("Requirements = %v, want only the non-blank entry", e.Requirements)
+		}
+	})
+
+	t.Run("priority is coerced case/whitespace-insensitively to required", func(t *testing.T) {
+		e := Enrichment{Requirements: []Requirement{{Text: "Go", Priority: "  Required "}}}
+		e.Sanitize()
+		if got := e.Requirements[0].Priority; got != "required" {
+			t.Errorf("Priority = %q, want %q", got, "required")
+		}
+	})
+
+	t.Run("an unrecognized priority is coerced to preferred", func(t *testing.T) {
+		e := Enrichment{Requirements: []Requirement{{Text: "Go", Priority: "nice-to-have"}}}
+		e.Sanitize()
+		if got := e.Requirements[0].Priority; got != "preferred" {
+			t.Errorf("Priority = %q, want %q", got, "preferred")
+		}
+	})
+
+	t.Run("a normal requirements list is otherwise untouched", func(t *testing.T) {
+		e := Enrichment{Requirements: []Requirement{
+			{Text: "5+ years Go", Priority: "required"},
+			{Text: "Kubernetes", Priority: "preferred"},
+		}}
+		e.Sanitize()
+		want := []Requirement{
+			{Text: "5+ years Go", Priority: "required"},
+			{Text: "Kubernetes", Priority: "preferred"},
+		}
+		if !reflect.DeepEqual(e.Requirements, want) {
+			t.Errorf("Requirements = %v, want unchanged %v", e.Requirements, want)
+		}
+	})
+}
+
+// A stated years-of-experience figure is only believable up to a point. The failure it
+// guards is not a model that hallucinates: it is a model that reads the RIGHT number
+// off the WRONG subject, because "N years of experience" in a posting can describe the
+// candidate, the company, or the product, and the three are syntactically identical.
+//
+// Real prod examples, 2026-09-05: "With over 40 years of semiconductor process control
+// experience, chipmakers around the world rely on KLA" became experience_years_min=40,
+// and a cluster of postings carried 84. This field is a search FILTER, so such a job
+// stops matching anyone who searches honestly.
+func TestSanitizeCapsImplausibleExperienceYears(t *testing.T) {
+	years := func(n int) *int { return &n }
+
+	t.Run("a figure past the ceiling is dropped, not clamped", func(t *testing.T) {
+		for _, n := range []int{vocab.MaxExperienceYears + 1, 40, 60, 84} {
+			e := Enrichment{ExperienceYearsMin: years(n)}
+			e.Sanitize()
+			if e.ExperienceYearsMin != nil {
+				t.Errorf("ExperienceYearsMin = %d for input %d, want nil — clamping to the "+
+					"ceiling would state a requirement the posting never made",
+					*e.ExperienceYearsMin, n)
+			}
+		}
+	})
+
+	t.Run("a believable figure is untouched, including at the ceiling", func(t *testing.T) {
+		for _, n := range []int{0, 1, 5, 18, 21, 25, vocab.MaxExperienceYears} {
+			e := Enrichment{ExperienceYearsMin: years(n)}
+			e.Sanitize()
+			if e.ExperienceYearsMin == nil || *e.ExperienceYearsMin != n {
+				t.Errorf("ExperienceYearsMin = %v for input %d, want it kept — 18, 21 and 25 are "+
+					"all figures real postings genuinely state", e.ExperienceYearsMin, n)
+			}
+		}
+	})
+
+	t.Run("a negative figure is dropped", func(t *testing.T) {
+		e := Enrichment{ExperienceYearsMin: years(-3)}
+		e.Sanitize()
+		if e.ExperienceYearsMin != nil {
+			t.Errorf("ExperienceYearsMin = %d, want nil", *e.ExperienceYearsMin)
+		}
+	})
+
+	t.Run("an unstated figure stays unstated", func(t *testing.T) {
+		e := Enrichment{}
+		e.Sanitize()
+		if e.ExperienceYearsMin != nil {
+			t.Errorf("ExperienceYearsMin = %d, want nil", *e.ExperienceYearsMin)
+		}
+	})
+}

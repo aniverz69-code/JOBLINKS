@@ -1,0 +1,193 @@
+package mailingest
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"log"
+
+	awsconfig "github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/aws-sdk-go-v2/service/sqs"
+)
+
+// SESSource is the production InboundSource: SES receives mail for the domain,
+// stores the raw MIME in S3, and notifies SNS → SQS. Receive long-polls SQS,
+// reads the S3 object each notification points at, and yields it; Ack deletes the
+// SQS message. It is a thin AWS adapter — the parse/resolve/store logic it feeds
+// is covered by the worker tests over the fake source.
+type SESSource struct {
+	sqs      *sqs.Client
+	s3       *s3.Client
+	queueURL string
+	// bucket is the fallback S3 bucket when a notification omits one.
+	bucket string
+}
+
+// NewSESSource builds the source from AWS config resolved via the default chain
+// (SSO / IAM role / env) — credentials never come from app config.
+func NewSESSource(ctx context.Context, region, queueURL, bucket string) (*SESSource, error) {
+	cfg, err := awsconfig.LoadDefaultConfig(ctx, awsconfig.WithRegion(region))
+	if err != nil {
+		return nil, fmt.Errorf("aws config: %w", err)
+	}
+	return &SESSource{
+		sqs:      sqs.NewFromConfig(cfg),
+		s3:       s3.NewFromConfig(cfg),
+		queueURL: queueURL,
+		bucket:   bucket,
+	}, nil
+}
+
+// snsEnvelope is the SNS notification wrapping the SES payload in an SQS message.
+type snsEnvelope struct {
+	Message string `json:"Message"`
+}
+
+// sesNotification is the subset of the SES "Received" notification we need: the
+// envelope recipients (receipt.recipients) and where SES stored the raw MIME
+// (receipt.action).
+//
+// It deliberately does not decode mail.destination, the OTHER recipient list SES
+// publishes. That one is "a complete list of all recipient addresses (including To:
+// and CC: recipients) from the MIME headers", while receipt.recipients is "the
+// envelope RCPT TO addresses that were matched by the active receipt rule" — AWS's
+// own words, and it says outright that the two may differ. They differ for every
+// forwarded message, because a Sieve `redirect` rewrites the envelope and leaves the
+// headers naming the mailbox that forwarded: reading the headers dropped such mail
+// entirely (freehire#3027). The header list is also the SENDER's to write, so
+// resolving a mailbox from it let anyone deliver a message into another user's inbox
+// by naming them in To:. Not decoding the field is the guard — a field that is not
+// there cannot be read back by mistake.
+type sesNotification struct {
+	Receipt struct {
+		Recipients []string `json:"recipients"`
+		Action     struct {
+			Type       string `json:"type"`
+			BucketName string `json:"bucketName"`
+			ObjectKey  string `json:"objectKey"`
+		} `json:"action"`
+	} `json:"receipt"`
+}
+
+// Receive long-polls SQS and turns each notification into an Inbound by fetching
+// the referenced S3 object.
+func (s *SESSource) Receive(ctx context.Context) ([]Inbound, error) {
+	out, err := s.sqs.ReceiveMessage(ctx, &sqs.ReceiveMessageInput{
+		QueueUrl:            &s.queueURL,
+		MaxNumberOfMessages: 10,
+		WaitTimeSeconds:     20,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("sqs receive: %w", err)
+	}
+
+	var batch []Inbound
+	for _, m := range out.Messages {
+		note, err := decodeNotification(*m.Body)
+		if err != nil {
+			// A notification we can't decode is not retryable; drop it (ack) so it
+			// doesn't wedge the queue. The raw is still in S3 if it landed there.
+			batch = append(batch, Inbound{AckHandle: *m.ReceiptHandle})
+			continue
+		}
+		bucket := note.Receipt.Action.BucketName
+		if bucket == "" {
+			bucket = s.bucket
+		}
+		raw, err := s.fetch(ctx, bucket, note.Receipt.Action.ObjectKey)
+		switch {
+		case errors.Is(err, errMessageTooLarge):
+			// Not retryable, so it is acked like an undecodable notification above: the
+			// object is the same size on every redelivery, and leaving it un-acked would
+			// cycle it through the queue — re-downloading it each time — until the
+			// queue's own redrive policy noticed. The raw MIME stays in S3.
+			log.Printf("mailingest: s3 object %s dropped: %v", note.Receipt.Action.ObjectKey, err)
+			batch = append(batch, Inbound{AckHandle: *m.ReceiptHandle})
+			continue
+		case err != nil:
+			// Skip just this message (leave it un-acked so SQS redelivers it after
+			// the visibility timeout) rather than discarding the whole batch.
+			log.Printf("mailingest: s3 fetch %s: %v", note.Receipt.Action.ObjectKey, err)
+			continue
+		}
+		batch = append(batch, Inbound{
+			Raw:        raw,
+			Recipients: note.Receipt.Recipients,
+			S3Key:      note.Receipt.Action.ObjectKey,
+			AckHandle:  *m.ReceiptHandle,
+		})
+	}
+	return batch, nil
+}
+
+// Ack deletes the SQS message so it is not redelivered.
+func (s *SESSource) Ack(ctx context.Context, handle string) error {
+	_, err := s.sqs.DeleteMessage(ctx, &sqs.DeleteMessageInput{
+		QueueUrl:      &s.queueURL,
+		ReceiptHandle: &handle,
+	})
+	return err
+}
+
+func (s *SESSource) fetch(ctx context.Context, bucket, key string) ([]byte, error) {
+	obj, err := s.s3.GetObject(ctx, &s3.GetObjectInput{Bucket: &bucket, Key: &key})
+	if err != nil {
+		return nil, err
+	}
+	defer obj.Body.Close()
+	return readBounded(obj.Body, maxRawMessage)
+}
+
+// maxRawMessage caps one raw MIME message held in memory. Receive pulls ten notifications
+// at a time and this used to be a bare io.ReadAll, before the recipient is even resolved,
+// in the one Restart=always daemon on the host with no MemoryMax — so a batch of large
+// objects was bounded by nothing at all.
+//
+// The figure is SES's own inbound ceiling: SES refuses to accept a message larger than
+// this, so nothing this bound rejects was ever deliverable mail. It is a guard against a
+// corrupt or planted object in the bucket, not a policy about email size.
+const maxRawMessage = 40 << 20 // 40 MiB
+
+// errMessageTooLarge marks an object over maxRawMessage. It is an error rather than a
+// truncation on purpose: a half-read MIME message parses — the headers are at the front —
+// and would be stored as though it were whole, which is a worse outcome than not storing
+// it, and an invisible one.
+var errMessageTooLarge = errors.New("mailingest: raw message exceeds the size limit")
+
+// readBounded reads up to max bytes from r, refusing anything longer. It reads max+1 so
+// "exactly at the limit" is distinguishable from "over it" without trusting a
+// Content-Length the object may not carry.
+func readBounded(r io.Reader, max int64) ([]byte, error) {
+	b, err := io.ReadAll(io.LimitReader(r, max+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(b)) > max {
+		// The real size is unknown by construction — reading it is the thing being
+		// refused — so the message names the limit that was passed, not the object.
+		return nil, fmt.Errorf("%w: over %d bytes", errMessageTooLarge, max)
+	}
+	return b, nil
+}
+
+// decodeNotification unwraps the SNS envelope and then the SES notification.
+func decodeNotification(body string) (sesNotification, error) {
+	var env snsEnvelope
+	if err := json.Unmarshal([]byte(body), &env); err != nil {
+		return sesNotification{}, err
+	}
+	// SES-over-SNS wraps the notification in a JSON string; a raw SES→SQS setup
+	// would deliver it directly, so fall back to the body itself.
+	payload := env.Message
+	if payload == "" {
+		payload = body
+	}
+	var note sesNotification
+	if err := json.Unmarshal([]byte(payload), &note); err != nil {
+		return sesNotification{}, err
+	}
+	return note, nil
+}

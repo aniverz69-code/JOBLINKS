@@ -1,0 +1,140 @@
+# ingest-status-page Specification
+
+## Purpose
+TBD - created by archiving change add-status-page. Update Purpose after archive.
+## Requirements
+### Requirement: Per-provider health rollup
+
+The system SHALL provide a read-only rollup over `board_health` grouped by
+`provider`, exposing for each provider: total boards, healthy boards
+(`consecutive_failures = 0`), boards currently in cooldown (`cooldown_until >
+now()`), the most recent `last_run_at`, the most recent `last_success_at`, and
+the sum of `last_ingested_count` over healthy boards. The rollup SHALL be pure
+read: it SHALL NOT modify `board_health` or affect cooldown behavior.
+
+#### Scenario: Rollup aggregates a provider's boards
+
+- **WHEN** a provider has 3 boards recorded in `board_health`, 2 with
+  `consecutive_failures = 0` and 1 in active cooldown
+- **THEN** the rollup returns one row for that provider with `total_boards = 3`,
+  `healthy_boards = 2`, and `cooled_boards = 1`
+
+#### Scenario: Rollup ignores providers with no recorded boards
+
+- **WHEN** a provider exists in the source YAML but has never been crawled (no
+  `board_health` row)
+- **THEN** the rollup returns no row for that provider
+
+### Requirement: Provider status derivation
+
+The system SHALL derive each provider's status from its rollup via a pure
+function using the healthy fraction (`healthy_boards / total_boards`) and success
+freshness:
+
+- `operational` WHEN the healthy fraction is at least 0.9 AND a success occurred
+  within the freshness window (48 hours).
+- `down` WHEN the healthy fraction is at most 0.1, OR no success occurred within
+  the freshness window.
+- `degraded` in every other case.
+
+The thresholds and freshness window SHALL be named constants.
+
+#### Scenario: All boards healthy and fresh
+
+- **WHEN** a provider has 100 boards, all healthy, with a success 1 hour ago
+- **THEN** its derived status is `operational`
+
+#### Scenario: A minority of boards failing
+
+- **WHEN** a provider has 100 boards, 20 failing, with a recent success
+- **THEN** its derived status is `degraded`
+
+#### Scenario: Almost all boards failing
+
+- **WHEN** a provider has 100 boards, 95 failing
+- **THEN** its derived status is `down`
+
+#### Scenario: Stale despite healthy counts
+
+- **WHEN** a provider's boards all show `consecutive_failures = 0` but the most
+  recent `last_success_at` is older than the freshness window
+- **THEN** its derived status is `down`
+
+### Requirement: Overall fleet status
+
+The system SHALL derive an overall fleet status as the worst individual provider
+status: `down` if any provider is `down`, else `degraded` if any provider is
+`degraded`, else `operational`.
+
+#### Scenario: One provider down drags the fleet
+
+- **WHEN** every provider is `operational` except one that is `down`
+- **THEN** the overall status is `down`
+
+#### Scenario: Empty fleet
+
+- **WHEN** there are no providers in the rollup
+- **THEN** the overall status is `operational`
+
+### Requirement: Public status endpoint
+
+The system SHALL expose `GET /api/v1/status` as a public, unauthenticated
+endpoint returning `{ "data": { overall, generated_at, providers[], site } }`.
+Each provider entry SHALL include only sanitized fields: provider key,
+derived status, total/healthy/cooled board counts, last run, last success,
+and ingested total. The response SHALL NOT include raw error text
+(`last_error`) or individual board identifiers. `site` SHALL carry the
+site/API's own derived status, database availability, the rolling error
+fraction, the window (in minutes) it was computed over, and a `history` list
+of the trailing 90 days' recorded daily status (oldest first, omitting any
+day with no recorded sample) — independent of `overall`, which reflects the
+ingest fleet only.
+
+#### Scenario: Anonymous request succeeds
+
+- **WHEN** an unauthenticated client requests `GET /api/v1/status`
+- **THEN** the response is `200` with `data.overall`, a `data.providers`
+  array, and a `data.site` object carrying the site's own status and its
+  `history`
+
+#### Scenario: No internal detail leaks
+
+- **WHEN** the response is inspected
+- **THEN** it contains no `last_error` field and no board-level identifiers
+
+#### Scenario: Database unreachable
+
+- **WHEN** the database is unreachable
+- **THEN** the response is still `200`, with `data.site.status` `"down"`,
+  `data.overall` `"operational"` (the same "no data" value an empty rollup
+  already reports — a database outage means the ingest fleet's health is
+  unknown for this request, not that it has failed) and `data.providers` an
+  empty array, rather than an error response with no body
+
+### Requirement: Public status page
+
+The web app SHALL serve a public `/status` page that renders a "Site status"
+section (a status pill for the site/API itself, plus a row of up to 90 daily
+history tiles below it) above the existing ingest-fleet section, which
+renders the overall fleet status as a banner and a flat list of providers,
+each showing a status pill, board counts (total and healthy), and a relative
+last-run time. The page SHALL be reachable without authentication. The
+site-status section and the ingest-fleet section SHALL be visually distinct,
+since they report on different things (the site/API itself vs. the crawl
+fleet). Within the site-status section, a day with no recorded history
+SHALL be rendered as a visually distinct "no data" tile, never as if it were
+`operational`.
+
+#### Scenario: Visitor views the status page
+
+- **WHEN** an unauthenticated visitor opens `/status`
+- **THEN** they see a site-status pill, a row of daily history tiles, an
+  overall ingest-fleet status banner, and one row per provider with its
+  status pill and board counts
+
+#### Scenario: A day with no recorded history reads as unknown, not healthy
+
+- **WHEN** the history tile row includes a day with no recorded sample
+- **THEN** that day's tile is rendered in the distinct "no data" treatment,
+  not the "operational" color
+

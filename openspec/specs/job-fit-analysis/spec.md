@@ -1,0 +1,431 @@
+# job-fit-analysis Specification
+
+## Purpose
+TBD - created by archiving change job-fit-analysis. Update Purpose after archive.
+## Requirements
+### Requirement: On-demand LLM fit analysis
+
+The system SHALL provide an authenticated `POST /api/v1/jobs/:slug/fit` endpoint that runs a fixed
+three-stage LLM prompt-chain comparing the job (title + description), the company context, and the
+caller's stored CV text, and returns a structured fit analysis. The chain MUST be a deterministic,
+server-orchestrated sequence of typed calls — not an autonomous, self-directing agent. The analysis
+MUST be scoped to the calling user and the job addressed by `:slug`.
+
+#### Scenario: Signed-in user with a CV requests analysis
+
+- **WHEN** a signed-in user with a stored CV and a saved profile POSTs to `/api/v1/jobs/:slug/fit` for an open job
+- **THEN** the system runs the three-stage chain and responds `200` with `{ "data": { "has_cv": true, "analysis": <verdict> } }`
+
+#### Scenario: Unknown job slug
+
+- **WHEN** the caller POSTs to `/api/v1/jobs/:slug/fit` for a slug that does not exist
+- **THEN** the system responds `404`
+
+#### Scenario: Unauthenticated caller
+
+- **WHEN** an unauthenticated request hits the fit endpoint
+- **THEN** the system responds `401` and never invokes the LLM
+
+### Requirement: Five-dimension scored verdict
+
+The analysis payload SHALL contain five dimensions — Title & role alignment, Experience
+relevance, Seniority fit, Skills coverage, and Company & role context — each with an integer
+score clamped to 0–100, plus a weighted `overall_score`, a `verdict` label drawn from the
+controlled set {Strong Fit, Good Fit, Moderate Fit, Weak Fit, Poor Fit}, a `strengths` array,
+a `gaps` array, and a single `recommendation` string. All model output MUST be sanitized: scores
+clamped, the verdict coerced to the controlled set, and free-text fields trimmed and length/count
+bounded before it is persisted or served. The served `overall_score` MUST additionally be clamped
+down to the deterministic hard-constraint ceiling (the minimum score-cap over the caller's unmet
+blockers) when any blocker is present, so a posting the caller plainly cannot meet can never present
+as a strong fit; the `verdict` label is derived from the capped `overall_score`. The ceiling is
+recomputed from the current job, résumé, and hard-constraint dictionary each time the analysis is
+served — for both a freshly computed and a cached analysis — so it is never stale and needs no cache
+stamp of its own.
+
+#### Scenario: Out-of-range or invalid model output
+
+- **WHEN** the LLM returns a dimension score above 100 or a verdict outside the controlled set
+- **THEN** the score is clamped to 0–100 and the verdict is derived from `overall_score`, so no out-of-vocabulary value is ever persisted or served
+
+#### Scenario: Overall score is the weighted dimensions
+
+- **WHEN** the five dimension scores are known and the caller has no unmet hard-constraint blockers
+- **THEN** `overall_score` equals the deterministic weighted average of the dimensions, computed server-side rather than trusting the model's own overall
+
+#### Scenario: Hard-constraint ceiling caps an over-optimistic score
+
+- **WHEN** the weighted average is 88 but the caller has an unmet certification blocker with score-cap 60
+- **THEN** the served `overall_score` is 60 and the `verdict` label is derived from that capped value
+
+#### Scenario: Cached analysis re-caps on read after a dictionary change
+
+- **WHEN** a cached analysis is served after the hard-constraint dictionary changed such that a blocker is now unmet
+- **THEN** the ceiling is recomputed on read and the served `overall_score` reflects the current dictionary without the cached row being marked stale
+
+### Requirement: Deterministic match as grounding anchor
+
+The LLM prompt SHALL include the deterministic skills match (exact/adjacent/missing slugs from
+`internal/candidate/jobmatch`) so the model explains and augments it rather than recomputing skills from
+scratch. The Skills coverage dimension MUST be consistent with the deterministic coverage.
+
+#### Scenario: Anchor passed into the prompt
+
+- **WHEN** the fit analysis is computed for a job with a non-empty skills list
+- **THEN** the prompt carries the exact/adjacent/missing classification and the coverage percent from the deterministic match
+
+### Requirement: ATS-style requirement match (Stage 1)
+
+The first stage SHALL extract the vacancy's explicit requirements together with its role-title and
+seniority signals, classify each requirement against the CV text as one of `covered`,
+`synonym-only`, `missing-but-have`, or `missing-gap`, carrying a required/preferred priority, and —
+for the two positive statuses (`covered`, `synonym-only`) — grade the strength of the cited evidence
+as one of `metric` (an accomplishment with a number, scale, or measured outcome), `scope` (breadth
+of work: teams, systems, regions), `responsibility` (clear ownership with tools or methods), or
+`keyword` (the term is present but the surrounding evidence is a bare mention or duty-only). This
+requirement-match table MUST be included in the served analysis and MUST NOT fabricate a skill the
+CV does not evidence — a genuine gap is reported as `missing-gap`, never hidden. All model output
+MUST be sanitized to the controlled vocabulary: an unknown or absent strength on a positive status
+coerces to `keyword`, and the two `missing-*` statuses carry no strength.
+
+#### Scenario: Requirement present only under a synonym
+
+- **WHEN** the vacancy requires a skill the CV evidences under a different but equivalent term
+- **THEN** that requirement is classified `synonym-only`, not `missing`
+
+#### Scenario: Genuine gap is reported honestly
+
+- **WHEN** the vacancy requires a skill absent from the CV with no close equivalent held
+- **THEN** that requirement is classified `missing-gap` and is never presented as covered
+
+#### Scenario: Covered requirement graded by evidence strength
+
+- **WHEN** the CV evidences a covered requirement with a measured accomplishment (a number, scale, or outcome)
+- **THEN** that requirement's `evidence_strength` is `metric`, and a covered requirement whose CV evidence is only a bare mention is graded `keyword`
+
+#### Scenario: Out-of-vocabulary or missing strength is coerced
+
+- **WHEN** the model returns an unrecognised or empty `evidence_strength` on a `covered` or `synonym-only` requirement
+- **THEN** the served requirement's strength is coerced to `keyword`, and any strength on a `missing-*` requirement is dropped
+
+### Requirement: Adversarial audit (Stage 3)
+
+The final stage SHALL challenge the recruiter verdict — flagging inflated dimension scores,
+strengths not supported by the CV evidence, and gaps that were glossed over — and return a
+corrected verdict that the served analysis is built from. The audit MUST treat weak evidence on a
+**required** requirement as weak support: a `synonym-only` match, or a `covered` match graded
+`keyword`, MUST NOT by itself sustain a high `skills_coverage` score. If the audit stage fails or
+does not parse, the system MUST fall back to the un-audited recruiter verdict rather than error the
+request.
+
+#### Scenario: Audit prunes an unsupported strength
+
+- **WHEN** the recruiter stage lists a strength the CV does not actually evidence
+- **THEN** the audit removes or downgrades it and the served analysis reflects the corrected verdict
+
+#### Scenario: Audit demotes keyword-only coverage of a required skill
+
+- **WHEN** a required requirement is `covered` only at `keyword` evidence strength (or `synonym-only`)
+- **THEN** the audit does not let that match alone sustain a high `skills_coverage` score
+
+#### Scenario: Audit stage fails
+
+- **WHEN** the adversarial audit call fails or returns unparseable output
+- **THEN** the system serves the recruiter-stage verdict and still responds `200`
+
+### Requirement: Per-(user, job) cache with staleness invalidation
+
+The system SHALL cache each analysis per `(user_id, job_id)`, stamped with the CV's upload time,
+the job's `content_hash`, and the model that produced it at analysis time. `GET /api/v1/jobs/:slug/fit`
+MUST return a cached analysis only when all three stamps still equal the current CV upload time, job
+`content_hash`, and model; when any differs it MUST report the cached analysis as stale rather than
+serving it as current. A `content_hash` absent on both the stored stamp and the live job (a non-board
+job that is never re-crawled) counts as unchanged, so it does not force an endless recompute.
+
+#### Scenario: Fresh cache hit
+
+- **WHEN** a user GETs the fit for a job they already analyzed, and neither their CV, the job, nor the model has changed since
+- **THEN** the system returns the cached analysis with `stale: false` and makes no LLM call
+
+#### Scenario: Model upgraded since analysis
+
+- **WHEN** a user GETs the fit for a job analyzed under a previous `LLM_MODEL`
+- **THEN** the cached analysis is reported with `stale: true` so the improved model can re-analyze on request
+
+#### Scenario: CV changed since analysis
+
+- **WHEN** a user GETs the fit after re-uploading their CV
+- **THEN** the cached analysis is reported with `stale: true` so the SPA can offer a recompute, and it is not served as current
+
+#### Scenario: Job re-ingested with changed content
+
+- **WHEN** a user GETs the fit for a job whose `content_hash` changed since the analysis
+- **THEN** the cached analysis is reported with `stale: true`
+
+#### Scenario: No analysis yet
+
+- **WHEN** a user GETs the fit for a job they have never analyzed
+- **THEN** the system responds `200` with `has_cv` reflecting CV presence and a null analysis (no LLM call)
+
+### Requirement: Best-effort degradation
+
+The feature SHALL degrade gracefully: when the LLM is unconfigured or the call fails, the endpoint
+MUST NOT error the request and MUST leave the deterministic profile-match unaffected. When the
+caller has no stored CV, the response MUST indicate `has_cv: false` and prompt an upload instead of
+running the LLM. When the caller has a CV but no current structured résumé, the chain MUST degrade
+to no analysis (the structured résumé is the fit input, and it is what carries the de-identified
+signal). An unavailable PII detector SHALL still leave the chain fail-closed, but by that same
+route rather than by masking inside it: extraction is what fail-closes on the detector, so a
+detector outage leaves no current structured résumé and the fit degrades to no analysis.
+
+#### Scenario: LLM unconfigured
+
+- **WHEN** a user POSTs the fit endpoint while the LLM is not configured
+- **THEN** the system responds `200` with no analysis and does not persist a cache row
+
+#### Scenario: Caller has no stored CV
+
+- **WHEN** a user without a stored CV requests the fit
+- **THEN** the system responds `200` with `has_cv: false` and no analysis, and does not invoke the LLM
+
+#### Scenario: No structured résumé degrades to no analysis
+
+- **WHEN** a user POSTs the fit endpoint with a CV but no current structured résumé
+- **THEN** the system responds `200` with no analysis and does not persist a cache row
+
+#### Scenario: PII detector unavailable is fail-closed
+
+- **WHEN** a user POSTs the fit endpoint while the PII detector is unconfigured or failing
+- **THEN** the system responds `200` with no analysis, does not send the CV to the LLM, and does not persist a cache row
+
+### Requirement: Profile-match UI shows the AI analysis on demand
+
+The Profile match block SHALL keep the fast deterministic bar on top and render the LLM fit
+analysis in an expandable section driven by the fit endpoint. The AI analysis MUST be shown only
+after an explicit user action (it is not fetched automatically on page open), and a stale cached
+analysis MUST offer a recompute.
+
+#### Scenario: User expands the AI analysis
+
+- **WHEN** a signed-in profiled user with a CV clicks the "AI fit analysis" action on a job page
+- **THEN** the block requests the analysis (cached or freshly computed) and renders the five-dimension verdict with the overall score and label
+
+#### Scenario: Stale analysis offers recompute
+
+- **WHEN** the expanded section loads a cached analysis reported as stale
+- **THEN** the block surfaces that it is outdated and offers a recompute action rather than silently showing stale scores
+
+### Requirement: Location & work-mode fit dimension
+
+The fit analysis SHALL score a sixth dimension, Location & work-mode fit, judging whether the
+candidate can actually take the role given the job's geography (work mode, remote flag, regions,
+countries, free-text location) and the caller's profile location preferences (accepted work modes,
+remote reach, current base, relocation willingness). The weighted `overall_score` MUST include this
+dimension with all six weights summing to 100, and title alignment and experience relevance MUST
+remain the two heaviest. When the profile carries no location preferences, the dimension MUST still
+resolve (scored on the job geography alone) rather than erroring.
+
+#### Scenario: Onsite job far from a remote-only candidate
+
+- **WHEN** the job is onsite in a country outside the candidate's base and relocation set, and the candidate prefers remote only
+- **THEN** the Location & work-mode fit dimension scores low and the mismatch surfaces in the gaps/recommendation
+
+#### Scenario: Remote job within the candidate's remote reach
+
+- **WHEN** the job is remote and its region is within the candidate's declared remote reach
+- **THEN** the Location & work-mode fit dimension scores high
+
+#### Scenario: Profile with no location preferences
+
+- **WHEN** a candidate with no location preferences set requests the analysis
+- **THEN** the analysis still returns six dimensions (location scored on the job geography alone), never an error
+
+### Requirement: Location signals in the prompt-chain
+
+The prompt-chain SHALL carry the job's geography and the caller's location preferences into the
+recruiter and audit stages so their reasoning and the `gaps`/`recommendation` reflect geographic and
+work-mode fit, not only skills and title.
+
+#### Scenario: Location gap explained
+
+- **WHEN** the location dimension is a genuine mismatch
+- **THEN** the recommendation names the geographic/work-mode reason rather than leaving it implicit
+
+### Requirement: Fuller fit-result presentation
+
+The SPA SHALL present the fit result in fuller detail: each dimension's score and its one-line
+rationale visible (not only the bar), the six dimensions including Location & work-mode fit, the
+ATS requirement match, and the strengths/gaps/recommendation, in a clear visual hierarchy.
+
+#### Scenario: Dimension rationale is visible
+
+- **WHEN** the analysis renders
+- **THEN** each dimension shows its score and its rationale comment, so the user sees why, not just a number
+
+### Requirement: Live-streaming fit computation
+
+The system SHALL provide an authenticated Server-Sent Events endpoint
+`GET /api/v1/jobs/:slug/fit/stream` that runs the three-stage chain and emits, in order, events for
+each stage's start and completion, the model's thinking tokens when available, each stage's
+structured result (requirements after Stage 1, dimensions after Stage 2, the final verdict after
+Stage 3), and a terminal completion event carrying the full analysis. On successful completion it
+MUST cache the analysis exactly as the synchronous compute does (same per-(user, job) row and
+staleness stamps). The synchronous `POST /jobs/:slug/fit` MUST remain for non-browser clients, and
+both paths MUST produce the same final analysis for the same inputs.
+
+#### Scenario: Stream emits stages then the final analysis
+
+- **WHEN** a signed-in user with a CV opens the fit stream for a job
+- **THEN** the connection emits stage progress and section events in order and ends with a completion event carrying the six-dimension analysis, which is then cached
+
+#### Scenario: Thinking is best-effort
+
+- **WHEN** the configured model emits no reasoning tokens
+- **THEN** the stream still emits stage progress and the structured results, with the thinking events simply absent (never an error)
+
+#### Scenario: Stream failure is reported, not fatal
+
+- **WHEN** a stage fails mid-stream
+- **THEN** the stream emits an error event and closes without caching a partial analysis
+
+### Requirement: Fit analysis surfaces in the tailoring workspace
+
+The SPA SHALL NOT provide a dedicated, standalone fit-analysis page. The Tailor workspace's Job
+Match tab (`/tailor/[slug]`) is the sole surface presenting the full analysis (overall score +
+verdict, the six dimensions with their rationale, the ATS requirement match, strengths, gaps,
+recommendation). When the tailoring bootstrap returns an existing cached analysis, the tab renders
+it immediately from that response. When the bootstrap flags a first-time cold start (no cached
+analysis existed yet — see `cv-tailoring`'s "The bootstrap response flags a first-time cold start"),
+the workspace SHALL NOT open a separate fit-analysis stream or block on one — the analysis is
+computed as a precondition step inside the automatically-triggered autopilot run itself (see
+`tailor-autopilot`'s "An autopilot run satisfies its own analysis precondition"), on the same
+request/stream the workspace is already consuming for the live build. The Job Match tab SHALL show
+an in-progress state until the analysis lands, then render it, without the candidate taking any
+action or being sent to a separate screen.
+
+Requests to the former standalone page path (`/match/[slug]`) and its earlier legacy alias
+(`/jobs/[slug]/fit`) SHALL redirect (308) to `/tailor/[slug]`.
+
+#### Scenario: Cached analysis renders from the bootstrap response
+
+- **WHEN** the user opens `/tailor/[slug]` for a vacancy with a fresh cached analysis
+- **THEN** the Job Match tab shows the full analysis immediately, with no separate fetch or stream
+
+#### Scenario: A cold-start analysis populates the tab once it lands
+
+- **WHEN** the user opens `/tailor/[slug]` for a vacancy with no cached analysis, triggering the
+  automatic cold-start autopilot run
+- **THEN** the Job Match tab shows an in-progress state, and renders the full analysis once that
+  run's inline analysis step completes, without the workspace blocking on it or the candidate
+  triggering anything
+
+#### Scenario: Old links redirect into the workspace
+
+- **WHEN** a request is made to `/match/[slug]` or `/jobs/[slug]/fit`
+- **THEN** the system responds with a 308 redirect to `/tailor/[slug]`
+
+### Requirement: Sidebar reduced to a summary linking to the page
+
+The Profile-match sidebar block SHALL show only a short fit summary — the overall percentage, the
+verdict label, and the single most important gap — with a link to the dedicated page. It MUST NOT
+run the analysis inline. When no analysis is cached it MUST show an action that navigates to the
+page (which starts the stream) rather than computing in the sidebar.
+
+The "dedicated page" this links to is the Tailor workspace (`/tailor/[slug]`), not a separate
+fit-analysis page — see "Fit analysis surfaces in the tailoring workspace".
+
+#### Scenario: Sidebar summarizes and links
+
+- **WHEN** a cached analysis exists and the user views the job
+- **THEN** the sidebar shows the overall %, the verdict, and the top gap, with a link to `/tailor/[slug]`
+
+#### Scenario: Sidebar with no analysis links to the workspace
+
+- **WHEN** no analysis is cached
+- **THEN** the sidebar shows an action that navigates to `/tailor/[slug]` instead of computing inline
+
+### Requirement: Per-user monthly fit-analysis quota
+
+The system SHALL limit each user to at most **10 AI fit analyses per rolling 30-day window**, enforced BEFORE the LLM prompt-chain runs on both the synchronous `POST /api/v1/jobs/:slug/fit` endpoint and the streaming `GET /api/v1/jobs/:slug/fit/stream` endpoint. Only the FIRST analysis of a distinct `(user, job)` pair consumes quota: a recompute of a pair the user has already analysed, and re-running the same job, MUST be allowed regardless of the count. Consumption is counted from the persisted `user_job_analysis` rows whose first-analysis timestamp falls within the last 30 days, so an analysis that fails or is never persisted MUST NOT consume quota. The limit applies to every role — there is no staff exemption.
+
+#### Scenario: New job under the limit
+
+- **WHEN** a user who has analysed fewer than 10 distinct jobs in the last 30 days requests an analysis for a job they have not analysed
+- **THEN** the system runs the chain, persists the result, and the run counts toward the 30-day window
+
+#### Scenario: New job over the limit
+
+- **WHEN** a user who has already analysed 10 distinct jobs in the last 30 days requests an analysis for a job they have not analysed
+- **THEN** the system responds `429`, never invokes the LLM, and persists nothing
+
+#### Scenario: Recompute is always free
+
+- **WHEN** a user at or above the limit requests an analysis for a job they have already analysed (a recompute of an existing `(user, job)` pair)
+- **THEN** the system runs the chain and does not reject the request on quota grounds
+
+#### Scenario: Streaming endpoint enforces the same cap
+
+- **WHEN** a user over the limit opens the SSE stream for a job they have not analysed
+- **THEN** the system responds `429` before opening the event stream and never invokes the LLM
+
+#### Scenario: Failed analysis does not consume quota
+
+- **WHEN** an under-limit new-job analysis is attempted but the LLM is unconfigured or errors, so no row is persisted
+- **THEN** the user's remaining quota is unchanged
+
+### Requirement: Quota state on the read endpoint
+
+The read endpoint `GET /api/v1/jobs/:slug/fit` SHALL return a `quota` object carrying `used`, `limit`, and `remaining` (where `remaining = max(0, limit - used)`) computed over the caller's last 30 days, without invoking the LLM, so the client can display usage and pre-block a new-job analysis when no quota remains.
+
+#### Scenario: Quota reported on read
+
+- **WHEN** a signed-in caller reads `GET /api/v1/jobs/:slug/fit`
+- **THEN** the response includes `quota` with `used`, `limit` (10), and `remaining` reflecting the caller's distinct-job analyses in the last 30 days, and no LLM call is made
+
+#### Scenario: Remaining never negative
+
+- **WHEN** a caller has analysed 10 or more distinct jobs in the window
+- **THEN** `remaining` is reported as `0`, not a negative number
+
+### Requirement: Structured résumé augments the fit input
+
+The fit prompt-chain SHALL additionally consume the caller's current structured résumé, when present, as pre-normalized candidate context supplied beside the existing CV text — never replacing it. The raw CV text remains the ground truth for requirement matching; the structured résumé is additive signal. When the caller has no current structured résumé (unconfigured LLM, not yet extracted, or stale), the chain MUST run exactly as it does today on the CV text alone, with no error.
+
+#### Scenario: Structured résumé is provided to the chain when present
+
+- **WHEN** the caller has a current structured résumé and requests a fit analysis
+- **THEN** the fit input includes the structured résumé as pre-normalized context in addition to the CV text
+
+#### Scenario: Analysis degrades to text-only when the structure is absent
+
+- **WHEN** the caller has a CV but no current structured résumé
+- **THEN** the fit analysis runs on the CV text alone, exactly as before, with no error
+
+### Requirement: Hard-constraint blockers ground the prompt chain
+
+The prompt chain SHALL include the deterministic hard-constraint blockers as known, already-established constraints so the model explains and respects them rather than re-deriving degree, years, license, or work-authorization requirements. The served analysis MUST expose the blockers alongside the verdict.
+
+#### Scenario: Blockers passed into the prompt and surfaced
+
+- **WHEN** the fit analysis is computed for a caller with an unmet hard constraint
+- **THEN** the prompt carries the blocker as a known constraint and the served analysis exposes it beside the dimensions
+
+### Requirement: Fit is scored from the de-identified structured résumé
+
+The fit chain SHALL score the candidate from the **contact-free projection** of the structured
+résumé — the typed seam defined by "The contact-free projection is the one typed seam to a
+model" — and SHALL NOT send the raw CV text to the model. The chain SHALL take that projection as
+a typed value rather than a serialization it re-projects, so the guarantee is carried by the
+input's type rather than by each producer's discipline. The structured résumé is produced once at
+upload, so the fit analysis carries no direct identifier to the provider by construction — no
+per-analysis masking is performed.
+
+#### Scenario: Provider never sees CV PII
+
+- **WHEN** a fit analysis runs for a user whose CV contains name/email/phone/links
+- **THEN** the text sent to the model is the contact-free projection of the structured résumé, and the raw CV is not sent
+
+#### Scenario: No structured résumé, no analysis
+
+- **WHEN** a user has a stored CV but no current structured résumé (extraction absent or stale)
+- **THEN** the fit analysis does not run and the endpoint responds `200` with no analysis
+

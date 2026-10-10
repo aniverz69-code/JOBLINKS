@@ -1,0 +1,172 @@
+# job-aggregate Specification
+
+## Purpose
+TBD - created by archiving change job-domain-aggregate. Update Purpose after archive.
+## Requirements
+### Requirement: A Job is constructed only through the aggregate factory
+
+The system SHALL expose a single construction path for a `Job` domain value — a
+factory (`job.New`) taking a source-agnostic draft of the raw posting fields — and
+SHALL NOT allow callers to assemble a `Job` from a raw composite literal outside the
+`job` package. The factory SHALL run the deterministic derivation (`jobderive`,
+wrapping `location`/`skilltag`/`classify`/`roletag` and the public-identity slugs)
+internally, so a constructed `Job` always carries facets consistent with its source
+fields. The draft MAY carry explicit values for the `regions`, `cities`, `work_mode`,
+and `skills` facets; when present, an explicit value SHALL win over the dictionary
+derivation for that facet, and when absent, derivation SHALL fill it. Every write path
+that persists a posting — automated ingest, moderator authoring, and Telegram
+extraction — SHALL obtain its `Job` from this factory.
+
+#### Scenario: Every write path derives facets identically
+
+- **WHEN** the ingest pipeline, the moderator authoring path, and Telegram
+  extraction each construct a job from the same title, description, and location
+- **THEN** all three produce the same dictionary facets (`countries`, `regions`,
+  `work_mode`, `skills`, `seniority`, `category`) and the same public/company slugs,
+  because each obtains its `Job` through `job.New`
+
+#### Scenario: Facets cannot be omitted
+
+- **WHEN** a caller constructs a `Job` through the factory and never touches the
+  facet fields
+- **THEN** the resulting `Job` still carries the derived facets, because derivation
+  happens inside `job.New` rather than in caller code
+
+#### Scenario: Explicit facet values win over derivation
+
+- **WHEN** a caller constructs a `Job` whose draft supplies explicit `regions`,
+  `cities`, `work_mode`, or `skills`
+- **THEN** the resulting `Job` carries those explicit values for those facets instead
+  of the values the dictionaries would derive, while any unsupplied facet is still
+  derived
+
+### Requirement: A manual salary override takes precedence over enriched salary
+
+The system SHALL let a job carry an authoritative manual salary (min, max, currency,
+period) independent of the LLM-enriched salary. When a job has a manual salary, the
+effective salary the system exposes (search facets, filters, insights, the public wire
+shape) SHALL be the manual salary, and an enrichment pass SHALL NOT displace it: applying
+enrichment to a job that has a manual salary MUST preserve that manual salary as the
+effective salary, even if the enrichment payload proposes a different figure.
+
+#### Scenario: Enrichment does not displace a manual salary
+
+- **WHEN** a job with a manual salary is processed by an enrichment pass whose payload proposes a different salary
+- **THEN** the job's effective salary remains the manual salary after the pass
+
+#### Scenario: Jobs without a manual salary are unaffected
+
+- **WHEN** a job that has no manual salary is processed by an enrichment pass
+- **THEN** the job's effective salary is the enriched salary, exactly as before
+
+### Requirement: The domain Job is loaded and persisted through a repository port
+
+The `job` package SHALL define a `Repository` port (interface) for loading a domain
+`Job` by identity and persisting it, and SHALL provide a `QueriesRepository` adapter
+implementing that port over the shared `*db.Queries`. The domain `Job` type SHALL NOT
+be `db.Job`; the adapter SHALL map between the persistence row and the domain type.
+The shared `db.Queries` surface SHALL NOT be split per context by this change — the
+port sits on top of the existing generated queries.
+
+#### Scenario: The adapter maps persistence to domain
+
+- **WHEN** the repository loads a stored posting by its `(source, external_id)` identity
+- **THEN** it returns a domain `Job` value, not a `db.Job` row, and callers depend on
+  the domain type only
+
+#### Scenario: A compile-time contract binds adapter to port
+
+- **WHEN** the package compiles
+- **THEN** a `var _ Repository = (*QueriesRepository)(nil)` assertion proves the
+  adapter satisfies the port, mirroring the existing `jobtracking` convention
+
+### Requirement: The public wire shape projects from the domain Job
+
+The public read model SHALL be projected from the domain `Job` type
+(`jobview.FromDomain`), not built directly from the persistence row. The `jobview`
+package SHALL depend on the `job` aggregate for its input shape rather than on the
+raw `db.Job` row. The projected wire output SHALL be observably equivalent to the
+current `jobview.FromRow(db.Job)` output — this change relocates the source of the
+projection, not its result.
+
+#### Scenario: Wire output is unchanged by the projection move
+
+- **WHEN** a stored job is projected to the wire shape through the domain type
+- **THEN** the emitted JSON is byte-equivalent to what `jobview.FromRow` produced for
+  the same stored row before this change
+
+### Requirement: Lifecycle and enrichment eligibility are guarded aggregate behavior
+
+The domain `Job` SHALL expose its lifecycle transitions and enrichment-eligibility
+rule as guarded methods — `Close(at)` (idempotent; preserves `public_slug`,
+`enrichment`, and interaction references), `Reopen()`, and `ShouldEnrich()` (open and
+below the current enrichment version). The three close mechanisms (the ingest unseen
+sweep, the stream-driven self-close, and the liveness probe) and the enrichment
+eligibility predicate SHALL express their decision through the aggregate rather than
+duplicating the open/closed condition. This change SHALL NOT alter *when* a job closes
+or *whether* it is enriched — only where the rule lives.
+
+#### Scenario: Closing is idempotent and non-destructive
+
+- **WHEN** `Close(at)` is called on an already-closed `Job`
+- **THEN** the operation is a no-op that leaves `closed_at`, `public_slug`, and
+  enrichment intact
+
+#### Scenario: A closed job is not enrichment-eligible
+
+- **WHEN** `ShouldEnrich()` is evaluated on a closed `Job`
+- **THEN** it returns false, matching today's `closed_at IS NULL` guard in the
+  enrichment queue
+
+#### Scenario: Reopen clears the closed state on re-ingest
+
+- **WHEN** a previously closed posting reappears in its source feed and is upserted
+- **THEN** `Reopen()` clears `closed_at` and the job is served on list/search surfaces
+  again
+
+### Requirement: The aggregate's write mapping owns every derived column
+
+The mapping from a `Job`'s readable projection to its persistence parameters SHALL
+compute every derived column a stored posting carries — the content fingerprint
+(`content_hash`) and the role-identity fingerprint (`role_fingerprint`) — rather than
+documenting that each caller must set them after the mapping returns. A write path
+SHALL NOT be able to persist a posting missing either column by omitting a step.
+
+This SHALL hold for every write path without exception: automated ingest, Telegram
+extraction, URL import, moderator authoring, and moderator editing. The mapping SHALL
+be the only producer of these two columns on the write path, so the same posting
+content yields the same fingerprints regardless of which path wrote it.
+
+Because the content fingerprint covers the source posted time, a caller that supplies
+a posted time outside the deterministic derivation SHALL supply it through the
+aggregate's draft, before the mapping runs — not by overwriting the mapped parameters
+afterwards, which would fingerprint a posted time other than the one written.
+
+#### Scenario: A moderator-authored vacancy carries both derived columns
+
+- **WHEN** a moderator creates a hand-curated vacancy
+- **THEN** the stored row carries a non-empty `role_fingerprint` and a non-empty
+  `content_hash`, so the vacancy clusters against the automated copy of the same role
+  and is eligible for the content-change re-embed
+
+#### Scenario: A moderator edit refreshes the content fingerprint
+
+- **WHEN** a moderator edits the description of a hand-curated vacancy that has
+  already been embedded
+- **THEN** the stored `content_hash` changes to match the edited content, so the
+  semantic index re-embeds the vacancy instead of permanently describing the pre-edit
+  text
+
+#### Scenario: A caller-supplied posted time is inside the fingerprint
+
+- **WHEN** a write path that takes the posted time from its source (Telegram
+  extraction, URL import) persists a posting
+- **THEN** the stored `content_hash` is the fingerprint of the posted time that was
+  written, and re-ingesting the same posting unchanged reports no content change
+
+#### Scenario: Identical content fingerprints identically across write paths
+
+- **WHEN** two write paths persist postings with identical mapped content
+- **THEN** both rows carry the same `content_hash` and the same `role_fingerprint`,
+  because a single mapping computed them
+

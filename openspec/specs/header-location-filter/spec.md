@@ -1,0 +1,146 @@
+# header-location-filter Specification
+
+## Purpose
+TBD - created by archiving change header-filter-cross-cutting. Update Purpose after archive.
+## Requirements
+### Requirement: Company-list filter mode
+
+On the companies list (`/companies`), the header filter menu SHALL present a
+company-appropriate scope — **Region** and **Remote hiring** pills — that
+live-filters the company list through its existing filter store's `regions` and
+`remote_regions` facets. Work format, countries, and cities SHALL NOT appear in
+company mode (companies do not carry those facets).
+
+#### Scenario: Companies list shows the company scope
+- **WHEN** a user opens the filter menu on `/companies`
+- **THEN** the popover shows Region and Remote-hiring pills and no work-format section
+
+#### Scenario: Selecting a company region filters the list
+- **WHEN** the user activates a Region or Remote-hiring pill
+- **THEN** the `regions`/`remote_regions` facet updates, the company list and its counts reload, and the choice is mirrored to the URL
+
+### Requirement: Launcher mode on listless pages
+
+The header search launcher SHALL show the filter trigger on pages without a
+filterable list (job detail, `/about`, `/collections`, …); because there is no list
+to filter in place, selecting a value SHALL navigate to the jobs feed (`/jobs`) with
+that scope applied, where further changes filter live.
+
+#### Scenario: Trigger present on a listless page
+- **WHEN** a user is on a page served by the global search launcher
+- **THEN** the filter trigger is shown in the header search box
+
+#### Scenario: Selecting a scope jumps to the filtered feed
+- **WHEN** the user picks a work format or region from the launcher popover
+- **THEN** the app navigates to `/jobs` with that value applied as a facet in the URL
+
+### Requirement: Trigger summary covers company and empty-launcher states
+
+The trigger's summary label SHALL reflect the active scope in every mode: company
+geography (including `remote_regions`) on the companies list, and a neutral label on
+a launcher with no selection.
+
+#### Scenario: Company remote-hiring selection summarized
+- **WHEN** a company Remote-hiring region is selected on `/companies`
+- **THEN** the trigger label reflects that region
+
+#### Scenario: Empty launcher shows the neutral label
+- **WHEN** the launcher popover has no selection
+- **THEN** the trigger shows the neutral "Location" label
+
+### Requirement: Location & work-format trigger in the header search box
+
+The header search box on jobs-backed list pages SHALL render a scope-prefix
+trigger, positioned to the left of the search icon and separated from it by a
+divider, that opens a Location & work-format popover. The trigger SHALL NOT alter
+the search text input or its `/` focus hotkey.
+
+#### Scenario: Trigger shown on the jobs feed
+- **WHEN** a user views the jobs feed (`/`) or a company's jobs list (`/companies/:slug`)
+- **THEN** the header search box shows the scope-prefix trigger before the search icon
+
+#### Scenario: Trigger hidden where it does not apply
+- **WHEN** a user views the company list (`/companies`) or any page served by the global search launcher
+- **THEN** no scope-prefix trigger is shown and the header search box is unchanged
+
+#### Scenario: Opening and dismissing the popover
+- **WHEN** the user clicks the trigger
+- **THEN** the popover opens; and it closes on an outside click, on Escape, or on navigation
+
+### Requirement: Work-format and location selection drive the page filter store
+
+The popover SHALL present a Work format pill row (Remote / Hybrid / On-site) above
+the location pane (region → country accordion and searchable cities). Every
+selection SHALL drive the active page's existing job-filter store facets
+(`work_mode`, `regions`, `countries`, `cities`) using its established cycle
+(off → include → exclude → off) semantics, with no new filter logic and no
+additional facet-count request.
+
+#### Scenario: Selecting a work format
+- **WHEN** the user activates the "Remote" pill
+- **THEN** the `work_mode` facet includes `remote`, the jobs list and its counts reload, and the selection is mirrored to the URL
+
+#### Scenario: Selecting a location
+- **WHEN** the user selects a region, country, or city in the pane
+- **THEN** the corresponding `regions`/`countries`/`cities` facet updates and the list reloads, identically to the same selection made in the full filter modal
+
+#### Scenario: Clearing the scope
+- **WHEN** the user activates "Clear all" in the popover
+- **THEN** the `work_mode`, `regions`, `countries`, and `cities` facets are all cleared
+
+#### Scenario: Reusing already-fetched facet counts
+- **WHEN** the popover renders the location pane
+- **THEN** it uses the jobs view's already-fetched facet counts and issues no new facet-count request
+
+### Requirement: Trigger label summarizes the current scope
+
+The trigger SHALL display a computed summary of the current work-format and
+geography selection so the active scope is visible without opening the popover.
+On narrow viewports the text summary SHALL collapse to an icon.
+
+#### Scenario: No selection
+- **WHEN** no work-format or geography facet is selected
+- **THEN** the trigger reads a neutral "Location" label
+
+#### Scenario: Work format only
+- **WHEN** only a work format is selected (e.g. Remote)
+- **THEN** the trigger shows that format's icon and label
+
+#### Scenario: Geography only, multiple values
+- **WHEN** two or more geography values are selected (e.g. Europe and UK and APAC)
+- **THEN** the trigger shows the first value's label followed by a "+N" roll-up of the rest
+
+#### Scenario: Both work format and geography
+- **WHEN** both a work format and one or more geography values are selected
+- **THEN** the trigger shows the format followed by the geography summary (e.g. "Remote · Europe +1")
+
+### Requirement: The trigger says when the scope was inferred
+
+When the active scope came from the visitor's IP country rather than from anything
+they did, the header filter trigger SHALL say so, and clearing it SHALL be the same
+single action that clears any chosen scope.
+
+A visitor who did not pick "LATAM" has no way to tell a small catalogue from a
+filtered one. The chip is the only place the site can answer "why am I seeing so
+few jobs" before they conclude there are few jobs.
+
+#### Scenario: The scope was guessed
+
+- **WHEN** the jobs feed is scoped by the IP-derived region and the visitor has not touched the filters
+- **THEN** the trigger marks the scope as inferred, and its accessible name says the same in words
+
+#### Scenario: The visitor clears the guessed scope
+
+- **WHEN** the visitor clears the scope from the trigger
+- **THEN** the region facet is emptied, the list reloads unscoped, and the trigger returns to its neutral state
+
+#### Scenario: The visitor edits the guessed scope
+
+- **WHEN** the visitor changes the scope to something else — another region, a country, a city
+- **THEN** the scope is theirs from that point on and the trigger no longer marks it as inferred
+
+#### Scenario: A chosen scope is never marked as inferred
+
+- **WHEN** the scope came from the URL, from a restored filter set, or from a pill the visitor clicked
+- **THEN** the trigger renders exactly as it does today, with no inferred marking
+

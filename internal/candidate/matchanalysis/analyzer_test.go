@@ -1,0 +1,408 @@
+package matchanalysis
+
+import (
+	"context"
+	"errors"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/tmc/langchaingo/llms"
+
+	"github.com/strelov1/freehire/internal/candidate/jobmatch"
+	"github.com/strelov1/freehire/internal/candidate/resumeextract"
+	"github.com/strelov1/freehire/internal/platform/llm"
+)
+
+// queuedModel returns canned responses in order, one per GenerateContent call — so a
+// single fake drives the three sequential stages of the chain.
+type queuedModel struct {
+	resp []string
+	err  error
+	n    int
+}
+
+func (m *queuedModel) GenerateContent(context.Context, []llms.MessageContent, ...llms.CallOption) (*llms.ContentResponse, error) {
+	if m.err != nil {
+		return nil, m.err
+	}
+	r := m.resp[m.n]
+	m.n++
+	return &llms.ContentResponse{Choices: []*llms.ContentChoice{{Content: r}}}, nil
+}
+func (*queuedModel) Call(context.Context, string, ...llms.CallOption) (string, error) { return "", nil }
+
+// hangsThenSucceedsModel burns the first call's entire deadline and then returns the
+// partial text a gateway hands back when it stops emitting — with a nil error, exactly as
+// production logged it. The second call answers normally. This is the 19:25 shape: a stage
+// that ate its whole budget while the retry finished in under eight seconds.
+type hangsThenSucceedsModel struct{ calls int }
+
+func (m *hangsThenSucceedsModel) GenerateContent(ctx context.Context, _ []llms.MessageContent, _ ...llms.CallOption) (*llms.ContentResponse, error) {
+	m.calls++
+	if m.calls == 1 {
+		<-ctx.Done()
+		return &llms.ContentResponse{Choices: []*llms.ContentChoice{{Content: `{"requi`}}}, nil
+	}
+	return &llms.ContentResponse{Choices: []*llms.ContentChoice{{Content: `{"ok":true}`}}}, nil
+}
+func (*hangsThenSucceedsModel) Call(context.Context, string, ...llms.CallOption) (string, error) {
+	return "", nil
+}
+
+// A hung stage is not a slow one: prod showed a call burn its full deadline while the very
+// next attempt answered in seconds. Failing the whole analysis there throws away an answer
+// that was one retry away, so a timed-out stage is retried like a parse failure.
+func TestStreamStage_RetriesATimedOutStage(t *testing.T) {
+	m := &hangsThenSucceedsModel{}
+	a := &Analyzer{client: llm.NewWithModel(m).WithTimeout(20 * time.Millisecond)}
+
+	var out struct {
+		OK bool `json:"ok"`
+	}
+	err := a.streamStage(context.Background(), 1, "sys", "usr", func(Event) {}, &out)
+
+	if err != nil {
+		t.Fatalf("streamStage: %v, want the retry to succeed", err)
+	}
+	if m.calls != 2 {
+		t.Errorf("model calls = %d, want 2 (the timed-out stage retried once)", m.calls)
+	}
+	if !out.OK {
+		t.Error("out was not populated from the retry's response")
+	}
+}
+
+// partialThenOmitsModel's first call returns JSON that decodes field "a" fine before
+// hitting a type mismatch on "b" (encoding/json keeps decoding after a type-mismatched
+// field and only reports the error once done, so "a" really does land in the destination
+// before Unmarshal returns its error). The second call is valid JSON that omits "a"
+// entirely — reproducing a real model retry that answers a narrower question the second
+// time.
+type partialThenOmitsModel struct{ calls int }
+
+func (m *partialThenOmitsModel) GenerateContent(context.Context, []llms.MessageContent, ...llms.CallOption) (*llms.ContentResponse, error) {
+	m.calls++
+	if m.calls == 1 {
+		return &llms.ContentResponse{Choices: []*llms.ContentChoice{{Content: `{"a":999,"b":"not-an-int"}`}}}, nil
+	}
+	return &llms.ContentResponse{Choices: []*llms.ContentChoice{{Content: `{"b":7}`}}}, nil
+}
+func (*partialThenOmitsModel) Call(context.Context, string, ...llms.CallOption) (string, error) {
+	return "", nil
+}
+
+// A failed attempt's partial decode must not survive into a later attempt: encoding/json
+// does not roll back the fields it reached before erroring, so out must be restored to
+// its pre-attempt state before every retry, or a field the second, successful attempt
+// never mentions silently keeps the first attempt's never-validated value.
+func TestStreamStage_DiscardsAPartiallyDecodedFailedAttempt(t *testing.T) {
+	m := &partialThenOmitsModel{}
+	a := &Analyzer{client: llm.NewWithModel(m)}
+
+	var out struct {
+		A int `json:"a"`
+		B int `json:"b"`
+	}
+	err := a.streamStage(context.Background(), 1, "sys", "usr", func(Event) {}, &out)
+
+	if err != nil {
+		t.Fatalf("streamStage: %v, want the retry to succeed", err)
+	}
+	if m.calls != 2 {
+		t.Fatalf("model calls = %d, want 2", m.calls)
+	}
+	if out.A != 0 {
+		t.Errorf("out.A = %d, want 0 — the first attempt's value must not survive into the "+
+			"second attempt's result, which never mentioned \"a\"", out.A)
+	}
+	if out.B != 7 {
+		t.Errorf("out.B = %d, want 7 (the second attempt's own answer)", out.B)
+	}
+}
+
+// A retry is only worth spending when there is still someone to answer. When the caller's
+// own context is already dead, a second call would burn tokens on a reply nobody reads.
+func TestStreamStage_DoesNotRetryWhenTheCallerIsGone(t *testing.T) {
+	m := &hangsThenSucceedsModel{}
+	a := &Analyzer{client: llm.NewWithModel(m).WithTimeout(time.Second)}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	var out struct{}
+	err := a.streamStage(ctx, 1, "sys", "usr", func(Event) {}, &out)
+
+	if err == nil {
+		t.Fatal("streamStage returned nil, want the cancellation")
+	}
+	if m.calls != 1 {
+		t.Errorf("model calls = %d, want 1 (no retry once the caller is gone)", m.calls)
+	}
+}
+
+func sampleInput() Input {
+	return Input{
+		JobTitle:       "Senior Go Engineer",
+		JobDescription: "Build backends in Go. Kafka a plus.",
+		CompanyInfo:    `{"tagline":"We ship fridges"}`,
+		StructuredResume: resumeextract.Professional{
+			Summary:    "Backend engineer, 5y Go at Acme.",
+			Experience: []resumeextract.Experience{{Company: "Acme", Title: "Backend Engineer"}},
+			Skills:     []string{"Go"},
+		},
+		Match:               jobmatch.JobMatch{Matched: []string{"go"}, Missing: []string{"kafka"}, CoveragePercent: 50},
+		JobWorkMode:         "onsite",
+		JobLocation:         "Berlin, Germany",
+		JobRegions:          []string{"eu"},
+		JobCountries:        []string{"de"},
+		LocationPreferences: `{"work_modes":["remote"],"base":{"country":"br","city":"São Paulo"}}`,
+	}
+}
+
+const (
+	stage1JSON = `{"requirements":[{"text":"Go","priority":"required","status":"covered","evidence":"5y at Acme"},{"text":"Kafka","priority":"preferred","status":"missing-gap"}]}`
+	stage2JSON = `{"title_alignment":{"score":80,"comment":"titles align"},"experience_relevance":{"score":70},"seniority_fit":{"score":60},"skills_coverage":{"score":50},"company_context":{"score":40},"location_fit":{"score":60},"strengths":["Strong Go"],"gaps":["No Kafka"],"recommendation":"Apply."}`
+	// Stage 3 tightens experience down and prunes the unsupported strength.
+	stage3JSON = `{"title_alignment":{"score":80},"experience_relevance":{"score":50},"seniority_fit":{"score":60},"skills_coverage":{"score":50},"company_context":{"score":40},"location_fit":{"score":60},"strengths":[],"gaps":["No Kafka","Thin on scale"],"recommendation":"Apply, address Kafka."}`
+)
+
+func TestAnalyze_NilClientIsNoOp(t *testing.T) {
+	got, err := NewAnalyzer(nil).Analyze(context.Background(), sampleInput())
+	if err != nil || got != nil {
+		t.Fatalf("nil analyzer = (%v,%v), want (nil,nil)", got, err)
+	}
+	var nilAnalyzer *Analyzer
+	if id := nilAnalyzer.ModelID(); id != "" {
+		t.Errorf("nil-receiver ModelID = %q, want \"\"", id)
+	}
+}
+
+// A candidate with no banked work history stops the chain, and stops it BEFORE the first model
+// call — scoring somebody against experience nothing owns is worse than not scoring them, and
+// the raw CV is never a fallback. The rule lives here rather than in the handler because the
+// candidate context is now a typed value: "nothing to reason over" is a property of the input,
+// not of an empty string the producer happened to return.
+func TestAnalyze_NoBankedExperienceIsNoAnalysis(t *testing.T) {
+	m := &queuedModel{resp: []string{stage1JSON, stage2JSON, stage3JSON}}
+	in := sampleInput()
+	in.StructuredResume.Experience = nil
+
+	got, err := NewAnalyzer(llm.NewWithModel(m)).Analyze(context.Background(), in)
+	if err != nil || got != nil {
+		t.Fatalf("no banked experience = (%v,%v), want (nil,nil)", got, err)
+	}
+	if m.n != 0 {
+		t.Errorf("model calls = %d, want 0 — the chain must not run without a candidate", m.n)
+	}
+}
+
+func TestAnalyze_ThreeStageChainUsesAuditedVerdict(t *testing.T) {
+	m := &queuedModel{resp: []string{stage1JSON, stage2JSON, stage3JSON}}
+	got, err := NewAnalyzer(llm.NewWithModel(m)).Analyze(context.Background(), sampleInput())
+	if err != nil {
+		t.Fatalf("Analyze: %v", err)
+	}
+	if m.n != 3 {
+		t.Errorf("stages called = %d, want 3", m.n)
+	}
+	// Experience relevance came from Stage 3 (50), not Stage 2 (70).
+	if got.Dimensions[1].Key != DimExperienceRelevance || got.Dimensions[1].Score != 50 {
+		t.Errorf("experience = %+v, want audited score 50", got.Dimensions[1])
+	}
+	if len(got.Strengths) != 0 {
+		t.Errorf("Strengths = %v, want the audit's empty list", got.Strengths)
+	}
+	if len(got.RequirementMatch) != 2 {
+		t.Errorf("RequirementMatch = %d, want the 2 Stage-1 requirements", len(got.RequirementMatch))
+	}
+	// overall = 80*.20 + 50*.25 + 60*.15 + 50*.15 + 40*.10 + 60*.15 = 16+12.5+9+7.5+4+9 = 58.
+	if got.OverallScore != 58 {
+		t.Errorf("OverallScore = %d, want 58", got.OverallScore)
+	}
+}
+
+func TestAnalyze_Stage3FailFallsBackToStage2(t *testing.T) {
+	// Stage 3 fails on both attempts (the retry also gets junk), then falls back.
+	m := &queuedModel{resp: []string{stage1JSON, stage2JSON, "not json", "still not json"}}
+	got, err := NewAnalyzer(llm.NewWithModel(m)).Analyze(context.Background(), sampleInput())
+	if err != nil {
+		t.Fatalf("Analyze should degrade, not error: %v", err)
+	}
+	// Falls back to Stage 2's experience score (70).
+	if got.Dimensions[1].Score != 70 {
+		t.Errorf("experience = %d, want Stage-2 fallback 70", got.Dimensions[1].Score)
+	}
+}
+
+func TestAnalyze_Stage3PartialMergesOntoStage2(t *testing.T) {
+	// A budget model returns only the fields it changed. The omitted dimensions must
+	// keep their Stage 2 scores, not collapse to 0 (which would corrupt a strong verdict).
+	partial := `{"experience_relevance":{"score":40},"gaps":["Thin on scale"]}`
+	m := &queuedModel{resp: []string{stage1JSON, stage2JSON, partial}}
+	got, err := NewAnalyzer(llm.NewWithModel(m)).Analyze(context.Background(), sampleInput())
+	if err != nil {
+		t.Fatalf("Analyze: %v", err)
+	}
+	// title_alignment omitted by the audit → keeps Stage 2's 80, not 0.
+	if got.Dimensions[0].Key != DimTitleAlignment || got.Dimensions[0].Score != 80 {
+		t.Errorf("title = %+v, want Stage-2 80 preserved", got.Dimensions[0])
+	}
+	// experience_relevance present in the audit → overridden to 40.
+	if got.Dimensions[1].Score != 40 {
+		t.Errorf("experience = %d, want audited 40", got.Dimensions[1].Score)
+	}
+	if len(got.Gaps) != 1 || got.Gaps[0] != "Thin on scale" {
+		t.Errorf("gaps = %v, want the audit's override", got.Gaps)
+	}
+}
+
+func TestAnalyze_Stage3NullListsKeepStage2(t *testing.T) {
+	// An explicit JSON null in the audit would unmarshal to a nil slice and hollow out
+	// Stage 2's strengths — the audit may only refine, never hollow out.
+	nulls := `{"title_alignment":{"score":80},"strengths":null,"gaps":null}`
+	m := &queuedModel{resp: []string{stage1JSON, stage2JSON, nulls}}
+	got, err := NewAnalyzer(llm.NewWithModel(m)).Analyze(context.Background(), sampleInput())
+	if err != nil {
+		t.Fatalf("Analyze: %v", err)
+	}
+	if len(got.Strengths) != 1 || got.Strengths[0] != "Strong Go" {
+		t.Errorf("strengths = %v, want Stage-2 list preserved on null", got.Strengths)
+	}
+	if len(got.Gaps) != 1 || got.Gaps[0] != "No Kafka" {
+		t.Errorf("gaps = %v, want Stage-2 list preserved on null", got.Gaps)
+	}
+}
+
+func TestAnalyzeStream_RetriesATransientStageFailure(t *testing.T) {
+	// Stage 1 first returns an HTML error page (a transient gateway 502), then valid JSON
+	// on the retry; the chain must recover and produce the final analysis.
+	m := &queuedModel{resp: []string{`<html>502 Bad Gateway</html>`, stage1JSON, stage2JSON, stage3JSON}}
+	got, err := NewAnalyzer(llm.NewWithModel(m)).Analyze(context.Background(), sampleInput())
+	if err != nil {
+		t.Fatalf("Analyze should recover on retry: %v", err)
+	}
+	if got == nil || got.OverallScore != 58 {
+		t.Errorf("recovered final = %+v, want overall 58", got)
+	}
+	if m.n != 4 {
+		t.Errorf("model calls = %d, want 4 (1 failed stage-1 + retry + stages 2,3)", m.n)
+	}
+}
+
+func TestAnalyze_Stage1ErrorPropagates(t *testing.T) {
+	m := &queuedModel{err: errors.New("boom")}
+	if _, err := NewAnalyzer(llm.NewWithModel(m)).Analyze(context.Background(), sampleInput()); err == nil {
+		t.Fatal("want error when Stage 1 fails")
+	}
+}
+
+func TestAnalyzeStream_EmitsOrderedEventsAndMatchesSyncFinal(t *testing.T) {
+	events := func() []Event {
+		m := &queuedModel{resp: []string{stage1JSON, stage2JSON, stage3JSON}}
+		var got []Event
+		final, err := NewAnalyzer(llm.NewWithModel(m)).AnalyzeStream(context.Background(), sampleInput(), func(e Event) {
+			got = append(got, e)
+		})
+		if err != nil {
+			t.Fatalf("AnalyzeStream: %v", err)
+		}
+		if final == nil || final.OverallScore != 58 {
+			t.Fatalf("stream final = %+v, want overall 58", final)
+		}
+		return got
+	}()
+
+	// Kinds must arrive in chain order.
+	wantKinds := []EventKind{
+		EventStageStart, EventRequirements, EventStageDone, // stage 1
+		EventStageStart, EventDimensions, EventStageDone, // stage 2
+		EventStageStart, EventStageDone, // stage 3
+		EventFinal,
+	}
+	if len(events) != len(wantKinds) {
+		t.Fatalf("emitted %d events, want %d: %+v", len(events), len(wantKinds), events)
+	}
+	for i, k := range wantKinds {
+		if events[i].Kind != k {
+			t.Errorf("event[%d].Kind = %q, want %q", i, events[i].Kind, k)
+		}
+	}
+	// The requirements event carries the Stage-1 match; the final event carries the analysis.
+	if reqEv := events[1]; len(reqEv.Requirements) != 2 {
+		t.Errorf("requirements event = %+v, want 2 requirements", reqEv)
+	}
+	if fin := events[len(events)-1]; fin.Analysis == nil || len(fin.Analysis.Dimensions) != 6 {
+		t.Errorf("final event analysis = %+v, want 6 dimensions", fin.Analysis)
+	}
+
+	// Analyze must return the identical final verdict (it is a thin collector).
+	m := &queuedModel{resp: []string{stage1JSON, stage2JSON, stage3JSON}}
+	sync, _ := NewAnalyzer(llm.NewWithModel(m)).Analyze(context.Background(), sampleInput())
+	if sync == nil || sync.OverallScore != 58 {
+		t.Errorf("Analyze final = %+v, want overall 58 (same as stream)", sync)
+	}
+}
+
+func TestAnalyzeStream_ThreadsHiddenSignals(t *testing.T) {
+	stage1WithSignals := `{"requirements":[{"text":"Go","priority":"required","status":"covered","evidence":"5y at Acme"}],` +
+		`"hidden_signals":[{"quote":"fast-paced, high ownership","insight":"expect a self-driven pace"},` +
+		`{"quote":"  ","insight":"blank quote, must be dropped"}]}`
+	m := &queuedModel{resp: []string{stage1WithSignals, stage2JSON, stage3JSON}}
+
+	var events []Event
+	final, err := NewAnalyzer(llm.NewWithModel(m)).AnalyzeStream(context.Background(), sampleInput(), func(e Event) {
+		events = append(events, e)
+	})
+	if err != nil {
+		t.Fatalf("AnalyzeStream: %v", err)
+	}
+
+	// The requirements event (Stage 1's output) carries the sanitized signals alongside the
+	// requirement match, at the same point in the stream.
+	var reqEvent Event
+	for _, e := range events {
+		if e.Kind == EventRequirements {
+			reqEvent = e
+		}
+	}
+	if len(reqEvent.HiddenSignals) != 1 {
+		t.Fatalf("requirements event HiddenSignals = %+v, want 1 (blank-quote entry dropped)", reqEvent.HiddenSignals)
+	}
+	if reqEvent.HiddenSignals[0].Quote != "fast-paced, high ownership" {
+		t.Errorf("HiddenSignals[0].Quote = %q, want the sanitized quote", reqEvent.HiddenSignals[0].Quote)
+	}
+
+	// The final served analysis carries the same sanitized signals.
+	if len(final.HiddenSignals) != 1 || final.HiddenSignals[0].Insight != "expect a self-driven pace" {
+		t.Errorf("final.HiddenSignals = %+v, want the sanitized signal to survive to the served analysis", final.HiddenSignals)
+	}
+}
+
+func TestAnalyzeStream_NilClientIsNoOp(t *testing.T) {
+	got, err := NewAnalyzer(nil).AnalyzeStream(context.Background(), sampleInput(), func(Event) {
+		t.Error("no events expected from a nil client")
+	})
+	if err != nil || got != nil {
+		t.Fatalf("nil stream = (%v,%v), want (nil,nil)", got, err)
+	}
+}
+
+func TestStagePrompts_CarryTheirInputs(t *testing.T) {
+	in := sampleInput()
+	reqs := []Requirement{{Text: "Go", Priority: "required", Status: "covered"}}
+	if s := stage1UserPrompt(in, candidateContext(in.StructuredResume)); !strings.Contains(s, "Senior Go Engineer") || !strings.Contains(s, "5y Go at Acme") || !strings.Contains(s, "go") {
+		t.Error("stage1 prompt must carry job title, CV text, and the anchor")
+	}
+	if s := stage2UserPrompt(in, reqs, candidateContext(in.StructuredResume)); !strings.Contains(s, "We ship fridges") || !strings.Contains(s, "covered") {
+		t.Error("stage2 prompt must carry company_info and the Stage-1 match")
+	}
+	// Stage 2 must carry the job geography and the candidate's location preferences so
+	// the model can score location & work-mode fit.
+	if s := stage2UserPrompt(in, reqs, candidateContext(in.StructuredResume)); !strings.Contains(s, "Berlin") || !strings.Contains(s, "onsite") || !strings.Contains(s, "São Paulo") {
+		t.Error("stage2 prompt must carry job geography + candidate location preferences")
+	}
+	v := recruiterVerdict{TitleAlignment: dimScore{Score: 80}, Recommendation: "Apply."}
+	if s := stage3UserPrompt(in, reqs, v, candidateContext(in.StructuredResume)); !strings.Contains(s, "Apply.") {
+		t.Error("stage3 prompt must carry the Stage-2 verdict to audit")
+	}
+}

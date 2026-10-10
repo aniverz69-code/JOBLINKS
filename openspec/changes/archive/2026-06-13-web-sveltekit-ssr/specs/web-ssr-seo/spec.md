@@ -1,0 +1,91 @@
+## ADDED Requirements
+
+### Requirement: Public pages are server-rendered
+
+The frontend SHALL render the public read pages — the jobs list (`/jobs`), job
+detail (`/jobs/:slug`), companies list (`/companies`), and company detail
+(`/companies/:slug`) — on the server, so the initial HTML response contains the
+page's primary content (job titles/descriptions, company info) before any
+client JavaScript runs. The page SHALL then hydrate on the client to become
+interactive. The data needed for SSR SHALL be fetched server-side against the
+backend API, forwarding the incoming request's session cookie so an
+authenticated request renders the correct content.
+
+#### Scenario: Job detail content is in the initial HTML
+
+- **WHEN** a crawler or client requests `GET /jobs/:slug` for an existing job
+- **THEN** the returned HTML body already contains the job's title, company, and
+  description text (not an empty `<div id="app"></div>` shell)
+
+#### Scenario: Listing content is in the initial HTML
+
+- **WHEN** a crawler or client requests `GET /jobs` or `GET /companies`
+- **THEN** the returned HTML body already contains the first page of rendered
+  rows
+
+#### Scenario: A missing job server-renders an error state
+
+- **WHEN** the backend returns 404 for the requested slug
+- **THEN** the server responds with an error page (not a 200 empty shell), and
+  the response status reflects that the resource is not found
+
+### Requirement: Per-route document metadata
+
+Each server-rendered page SHALL emit route-specific document `<head>` metadata in
+its initial HTML: a descriptive `<title>`, a `<meta name="description">`, a
+canonical URL, and Open Graph / Twitter Card tags. The job-detail page's title
+and description SHALL derive from the job (e.g. title and company), replacing the
+single static `freehire` title used for every URL.
+
+#### Scenario: Job page has a job-specific title and canonical
+
+- **WHEN** `GET /jobs/:slug` is requested for an existing job
+- **THEN** the HTML `<head>` contains a `<title>` built from the job's title and
+  company, a `<meta name="description">`, a `<link rel="canonical">` to the
+  job's canonical URL, and Open Graph tags
+
+#### Scenario: List pages carry their own metadata
+
+- **WHEN** a public list page (`/jobs`, `/companies`) is requested
+- **THEN** its `<head>` carries a page-appropriate title, description, and
+  canonical URL distinct from the job-detail metadata
+
+### Requirement: JobPosting structured data
+
+The job-detail page SHALL include a `JobPosting` JSON-LD `<script type="application/ld+json">`
+block in its server-rendered HTML, populated from the job's public fields
+(title, description, hiring organization, location/remote, posting date, and the
+application URL), so the posting is eligible for Google Jobs. Company pages
+SHALL include `Organization` JSON-LD.
+
+#### Scenario: Job page emits valid JobPosting JSON-LD
+
+- **WHEN** `GET /jobs/:slug` is requested for an existing job
+- **THEN** the HTML contains one `application/ld+json` script with `@type`
+  `JobPosting` whose `title`, `description`, `hiringOrganization`, and
+  `datePosted` reflect the job
+
+#### Scenario: A closed job reflects its status in structured data
+
+- **WHEN** the job carries a `closed_at`
+- **THEN** the `JobPosting` data conveys that the posting is no longer accepting
+  applications rather than presenting it as open
+
+### Requirement: robots.txt and sitemap
+
+The site SHALL serve a real `GET /robots.txt` (a valid robots file that allows
+crawling of public pages and references the sitemap) and a generated
+`GET /sitemap.xml` (valid XML enumerating the indexable job and company URLs).
+Neither SHALL return the HTML application shell.
+
+#### Scenario: robots.txt is a valid robots file
+
+- **WHEN** `GET /robots.txt` is requested
+- **THEN** the response is a `text/plain` robots file (not HTML) that references
+  the sitemap URL
+
+#### Scenario: sitemap enumerates public pages
+
+- **WHEN** `GET /sitemap.xml` is requested
+- **THEN** the response is valid XML listing job (`/jobs/:slug`) and company
+  (`/companies/:slug`) URLs derived from current data

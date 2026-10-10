@@ -1,0 +1,318 @@
+// CV-builder view types and pure editor helpers. The server owns the Document wire
+// shape (generated into contracts.ts); this module adds the list/detail response shapes
+// and the blank-entry factories the section form uses to add rows. Kept Svelte-free and
+// unit-testable.
+
+import type {
+  Delta as AtsDeltaWire,
+  Letter,
+  Score as JobMatchScore,
+  Document,
+  Margins,
+  Style,
+  ExperienceItem,
+  EducationItem,
+  SkillGroup,
+  Language,
+  Project,
+  Certification,
+  Analysis,
+  AutopilotEntry,
+} from './generated/contracts';
+import type { PeriodDate } from './types';
+import { formatPeriodDate, formatPeriodRange } from './periodDate';
+
+/** CV metadata (list rows and mutation responses). */
+export interface CvMeta {
+  /** A CV id is a random UUID the client treats as opaque — never parsed, never
+   *  compared for order, only passed back. */
+  id: string;
+  title: string;
+  template_id: string;
+  created_at: string;
+  updated_at: string;
+}
+
+/** The candidate's saved defaults for a NEW CV's template/typography/margins — or, when they
+ *  have never saved any, the system's standard CV defaults (never an absent/empty shape). */
+export interface CvAppearanceDefaults {
+  template_id: string;
+  style: Style;
+  margins: Margins;
+}
+
+/** The cover-letter surface's read shape. `present: false` is a pair never drafted — an empty
+ *  state, not an error. `stale` reports that the model or the vacancy's language moved since;
+ *  the letter stays readable, because it may already have been sent. */
+export interface CoverLetterView {
+  present: boolean;
+  stale?: boolean;
+  letter?: Letter;
+  /** The letter's evidence with claims already resolved server-side, in the letter's order.
+   *  `claim` is empty when the owner has since deleted that achievement. */
+  cited?: { id: string; claim?: string }[];
+  model?: string;
+}
+
+/** A CV with its full editable document. `agent_session_id` is the roy session bound to a
+ *  tailored CV (empty when none) — the workspace resumes it.
+ *
+ *  `autopilot_report` is the last unattended run's account of itself, one entry per
+ *  requirement. It rides on this read so the workspace panel renders from the CV it already
+ *  re-fetches after every turn, rather than by parsing the conversation. Whether a run can be
+ *  undone is no longer a flag here: the history feed carries its own edits, and undoing one is
+ *  undoing them. */
+export interface CvRecord extends CvMeta {
+  agent_session_id: string;
+  document: Document;
+  autopilot_report?: AutopilotEntry[];
+  /** Whether this CV's links are traced when it is rendered. Off unless the candidate asked. */
+  tracer_links_enabled: boolean;
+}
+
+/** One traced link of a CV, as its owner reads it.
+ *
+ *  `distinct_visitors` is absent — not zero — when the deployment cannot identify visitors at
+ *  all. Rendering an absent count as 0 would say "nobody" about any number of people. */
+export interface CvTracerLink {
+  source_path: string;
+  destination_url: string;
+  traced_url: string;
+  clicks: number;
+  bot_clicks: number;
+  distinct_visitors?: number;
+  last_click_at?: string;
+}
+
+/** A tailored CV in the /my/cvs re-open list: metadata plus the vacancy (slug, title, company)
+ *  and the bound agent session, so a row renders as a company card linking to its workspace. */
+export interface CvTailoredItem extends CvMeta {
+  job_slug: string;
+  job_title: string;
+  job_company: string;
+  agent_session_id: string;
+}
+
+/**
+ * Result of bootstrapping a tailoring session: the ids of the new vacancy-bound CV and the
+ * base it was copied from, the cached match analysis, and the id of the tailoring conversation
+ * the backend minted and bound to that CV. There is no credential — the agent runs inside the
+ * backend as the caller.
+ */
+export interface TailorResult {
+  tailor_cv_id: string;
+  base_cv_id: string;
+  analysis: Analysis | null;
+  session_id: string;
+  /** True exactly when this call just created the tailored CV — the workspace's signal to
+   *  start the autopilot run itself instead of offering the opening-action menu. */
+  cold_start_running: boolean;
+}
+
+/** Request body for replacing a CV. */
+export interface UpdateCvInput {
+  title: string;
+  template_id: string;
+  document: Document;
+}
+
+/** Request body for POST /api/v1/me/jd/resolve — exactly one of `job_slug`/`url`/`text`.
+ *  `title`/`company` are optional hints used only alongside `text` (they improve
+ *  classification/skill derivation but are not required). */
+export interface JdResolveInput {
+  job_slug?: string;
+  url?: string;
+  text?: string;
+  title?: string;
+  company?: string;
+}
+
+/** A CV template the user can pick in the gallery. `photo` marks the templates that print the
+ *  profile headshot — the gallery prompts for an upload when there is none. Mirrors
+ *  cv.TemplateInfo. */
+// The two-report comparison behind the tailoring ATS delta.
+/** @public */
+export type { Delta as AtsDelta, CategoryChange as AtsCategoryChange } from './generated/contracts';
+
+/** The tailoring ATS-delta response: what tailoring did to the CV's ATS readiness, measured on
+ *  the rendered artifact. `available` is false — with a `reason` and no `delta` — when the
+ *  comparison could not be made (no renderer, a failed compile), and the workspace then shows
+ *  nothing rather than an error. `base_cv_id` names the base CV compared against: the baseline is
+ *  that CV as it stands now, not a snapshot from when the copy was made. */
+export interface CvAtsDelta {
+  available: boolean;
+  reason?: string;
+  base_cv_id?: string;
+  delta?: AtsDeltaWire;
+}
+
+/** How well a tailored CV matches the vacancy it was written for, measured on that document
+ *  alone — no base CV, no banked profile. `available` is false, with a `reason` and no
+ *  `score`, when the score could not be produced (no renderer, a failed compile, or a vacancy
+ *  nothing could be matched against), and the workspace then shows nothing rather than an
+ *  error. Deterministic and free, so the workspace refreshes it after every saved edit. */
+export interface CvJobMatch {
+  available: boolean;
+  reason?: string;
+  score?: JobMatchScore;
+}
+
+export interface CvTemplate {
+  id: string;
+  label: string;
+  style: string;
+  photo: boolean;
+}
+
+/** A typeface the CV may use, as /cv-fonts reports it (mirrors cv.FontInfo). `note` names the
+ *  familiar face it matches ("Calibri metrics"); `css` is the stack the live preview renders
+ *  with. The list is fetched, never hard-coded — the server's registry is what the PDF obeys. */
+export interface CvFont {
+  id: string;
+  label: string;
+  note?: string;
+  css: string;
+}
+
+/** A fresh, fully-populated (but empty) document so the form can bind every section
+ *  without null-guards. The server still sanitizes on save, dropping the empties. */
+/** The half-inch-per-side page margins a fresh CV starts with (mirrors cv.DefaultMargins). */
+const DEFAULT_MARGIN = 0.5;
+function defaultMargins(): Margins {
+  return { top: DEFAULT_MARGIN, right: DEFAULT_MARGIN, bottom: DEFAULT_MARGIN, left: DEFAULT_MARGIN };
+}
+
+/** Fill each margin side, defaulting any missing or non-positive value to DEFAULT_MARGIN —
+ *  mirrors the backend's zero-to-default rule so preview and PDF agree. */
+function toMargins(m?: Partial<Margins>): Margins {
+  return {
+    top: m?.top || DEFAULT_MARGIN,
+    right: m?.right || DEFAULT_MARGIN,
+    bottom: m?.bottom || DEFAULT_MARGIN,
+    left: m?.left || DEFAULT_MARGIN,
+  };
+}
+
+/** An all-unset style. Deliberately NOT the mirror of defaultMargins(): every field stays
+ *  empty/zero, which is what tells the renderer to use the active template's own typography.
+ *  Filling these in would send concrete values back on the next autosave and freeze whichever
+ *  template happened to be selected into the document. */
+function emptyStyle(): Style {
+  return { font_family: '', font_size: 0, line_height: 0 };
+}
+
+export function emptyDocument(): Document {
+  return {
+    margins: defaultMargins(),
+    style: emptyStyle(),
+    header: { full_name: '', email: '', phone: '', location: '', links: [] },
+    summary: '',
+    experience: [],
+    education: [],
+    skills: [],
+    languages: [],
+    projects: [],
+    certifications: [],
+  };
+}
+
+/** Merge a possibly-partial document (from the API, where empty sections are omitted)
+ *  into a full shape the form can bind to. */
+export function toEditable(doc: Partial<Document>): Document {
+  const base = emptyDocument();
+  return {
+    margins: toMargins(doc.margins),
+    // Merged, not defaulted: an absent field stays at its unset sentinel.
+    style: { ...base.style, ...doc.style },
+    header: { ...base.header, ...doc.header, links: doc.header?.links ?? [] },
+    summary: doc.summary ?? '',
+    experience: (doc.experience ?? []).map((e) => ({ ...e, bullets: e.bullets ?? [], stack: e.stack ?? [] })),
+    education: doc.education ?? [],
+    skills: (doc.skills ?? []).map((s) => ({ ...s, items: s.items ?? [] })),
+    languages: doc.languages ?? [],
+    projects: (doc.projects ?? []).map((p) => ({ ...p, bullets: p.bullets ?? [] })),
+    certifications: doc.certifications ?? [],
+  };
+}
+
+export const blankExperience = (): ExperienceItem => ({
+  role: '',
+  company: '',
+  location: '',
+  start: undefined,
+  end: undefined,
+  current: false,
+  summary: '',
+  bullets: [''],
+  stack: [],
+});
+
+export const blankEducation = (): EducationItem => ({
+  institution: '',
+  degree: '',
+  field: '',
+  start: undefined,
+  end: undefined,
+});
+
+export const blankSkillGroup = (): SkillGroup => ({ group: '', items: [] });
+
+export const blankLanguage = (): Language => ({ name: '', level: '' });
+
+export const blankProject = (): Project => ({ name: '', link: '', bullets: [''] });
+
+export const blankCertification = (): Certification => ({ name: '', issuer: '', year: undefined });
+
+/** The title to show for a CV whose title is blank. */
+export function cvTitle(title: string): string {
+  return title.trim() || 'Untitled CV';
+}
+
+// ---- Preview projections ----
+// Pure string composers that mirror the classic-ats Typst template's layout rules, so the live
+// HTML preview reads the same as the rendered PDF. Dates are PeriodDate (see periodDate.ts,
+// the frontend counterpart of the renderer's own format-before-render step), and blank parts
+// are dropped rather than leaving stray separators.
+
+/** A period range: "start – end" (formatPeriodRange), or '' if neither side (nor current) is set. */
+export function dateRange(start?: PeriodDate, end?: PeriodDate, current?: boolean): string {
+  return formatPeriodRange(start, end, current);
+}
+
+const joinNonEmpty = (parts: (string | undefined)[], sep: string): string =>
+  parts.map((p) => (p ?? '').trim()).filter((p) => p !== '').join(sep);
+
+/** An experience role header: "Company | Location | Role (start – end)", blanks dropped. */
+export function experienceHeader(
+  e: Pick<ExperienceItem, 'company' | 'location' | 'role' | 'start' | 'end' | 'current'>,
+): string {
+  const head = joinNonEmpty([e.company, e.location, e.role], ' | ');
+  const dr = dateRange(e.start, e.end, e.current);
+  if (!dr) return head;
+  return head ? `${head} (${dr})` : `(${dr})`;
+}
+
+/** An inline education line: "Degree, Field | Institution (start – end)", blanks dropped. */
+export function educationLine(ed: Pick<EducationItem, 'degree' | 'field' | 'institution' | 'start' | 'end'>): string {
+  const degree = joinNonEmpty([ed.degree, ed.field], ', ');
+  let line = joinNonEmpty([degree, ed.institution], ' | ');
+  const dr = dateRange(ed.start, ed.end);
+  if (dr) line = line ? `${line} (${dr})` : `(${dr})`;
+  return line;
+}
+
+/** A language label: "Name (Level)" or just "Name". */
+export function languageLabel(l: Pick<Language, 'name' | 'level'>): string {
+  const name = (l.name ?? '').trim();
+  const level = (l.level ?? '').trim();
+  return level ? `${name} (${level})` : name;
+}
+
+/** An inline certification line: "Name — Issuer (Year)", trailing pieces dropped when blank. */
+export function certificationLine(c: Pick<Certification, 'name' | 'issuer' | 'year'>): string {
+  let line = (c.name ?? '').trim();
+  if ((c.issuer ?? '').trim()) line = `${line} — ${(c.issuer ?? '').trim()}`;
+  const year = formatPeriodDate(c.year);
+  if (year) line = `${line} (${year})`;
+  return line;
+}

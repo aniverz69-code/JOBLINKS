@@ -1,0 +1,97 @@
+---
+title: Why we didn't fine-tune a model
+date: 2026-07-13
+summary: We set out to train a cheap model to classify companies. The experiment killed the idea — and pointed at a better fix hiding in data we already had.
+type: article
+tags:
+  - engineering
+  - enrichment
+  - companies
+draft: false
+---
+
+Every job we ingest gets run through an LLM that fills in structured fields — seniority,
+work mode, salary, what kind of company it is. That LLM is metered: we pay per token. So
+the question came up naturally — could we replace the cheap-and-boring classification work
+with a small model we run ourselves on a CPU, for basically free?
+
+It's a reasonable plan. We already have the perfect training set: every field the LLM has
+ever filled in is a labelled example. Distill the big model into a tiny one, run it locally,
+stop paying. We picked the hardest, most valuable field to test the idea on — **company
+type** (product, startup, outsource, agency, in-house, government) — because it's the one
+field a dictionary can't derive, so it's the one that would actually justify a model.
+
+## The experiment
+
+We pulled ~38,000 companies with their LLM labels, and fine-tuned a small multilingual
+encoder on a laptop. Then we measured how often it agreed with the teacher on jobs it hadn't
+seen.
+
+It plateaued at a macro-F1 of **0.42** — below the score you'd get by ignoring the input
+entirely and guessing "product" every time. The per-class picture explained why: the model
+nailed the distinctive categories (a government employer, an agency) and completely fell
+apart on the middle — product vs in-house vs outsource vs startup.
+
+And here's the tell: the model ran in **26 milliseconds per company** on the CPU. Speed was
+never the problem. Quality was. A faster model wouldn't help. A bigger model wouldn't help
+much either.
+
+## The problem wasn't the model — it was the question
+
+We stopped and checked something we should have checked first: is the *teacher* even right?
+
+On the clear cases, absolutely. Every single job from the US federal job system got labelled
+"government" — 100% correct, because the signal is unambiguous. But then we looked at YC
+companies, which are startups by definition. The LLM called 77% of them "product" and 22%
+"startup".
+
+That's not the LLM being wrong. That's the **question** being wrong. A YC company *is* a
+product company *and* a startup — those aren't opposites. "Company type" quietly jams two
+unrelated ideas into one field: what a company *does* (builds a product, sells services) and
+how far along it *is* (startup, scaleup, enterprise). Forcing a single label onto that means
+there's no correct answer — not for the LLM, not for a distilled model, not for a person.
+
+Our model didn't fail because it was small. It failed because we asked it to reproduce a
+coin flip.
+
+## The fix was in data we already had
+
+Once you separate the two axes, one of them turns out to be easy — and it needs no model at
+all.
+
+A company's **stage** is knowable from facts we already store: whether it went through Y
+Combinator, its headcount, when it was founded, whether it hires through government job
+systems. So we compute it directly, with a handful of rules, once per company:
+
+- Hires through the federal job system, or marked a government org → **government**
+- 1,000+ people → **enterprise** (a public YC alumnus at that size is an enterprise, not a
+  startup — the historical badge doesn't override the headcount)
+- Still an active YC company, or small and recently founded → **startup**
+- Somewhere in the middle → **scaleup**
+- Not enough signal → **nothing**, honestly left blank
+
+No LLM. No per-job cost. No model to train, serve, or retrain. It runs inside a database
+refresh we already do every few hours. And when we can't tell, we say so — a company with no
+signal simply doesn't get a stage, instead of being shoved into the wrong bucket to look
+confident.
+
+You can [filter companies by stage](/companies) now.
+
+The other axis — product vs services — we left alone. There's no clean signal for it in our
+data (a company's listed industries are too noisy to trust), so pretending we can classify it
+would just be the original mistake in a new coat. It waits for a better signal.
+
+## The takeaway
+
+The instinct to reach for a model is strong, and the economics looked right. But the spike
+paid for itself by killing the plan cheaply: a day of experiments instead of a pipeline we'd
+have had to maintain forever.
+
+Two questions are worth asking before training anything:
+
+1. **Is this already deterministic?** If the reliable answers come from facts you already
+   store, a rule is cheaper, faster, and easier to trust than any model.
+2. **Does the question even have an answer?** If the labels are ambiguous to a human, no
+   model will fix that. Fix the question first.
+
+The cheapest model is the one you never train.

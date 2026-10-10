@@ -1,0 +1,106 @@
+package atsdetect
+
+import (
+	"net/url"
+	"regexp"
+	"strings"
+
+	"github.com/strelov1/freehire/internal/ingest/atsboard"
+)
+
+// FromURL classifies a single outbound job-application URL into the (provider, board)
+// pair one of our source adapters can crawl, returning ok=false when the URL is not a
+// supported ATS or its shape does not expose the exact board id the adapter expects
+// (e.g. an ADP vanity path, a Join job link, or a Workable per-job shortlink). Unlike
+// Detect, which scans arbitrary HTML, this parses one known URL — the shape an
+// aggregator's apply link gives us directly.
+//
+// The shared table answers first. internal/ingest/atsboard is the ONE definition of "which board
+// does this URL address", read by the contribution flow, link resolution and boardresolve;
+// this package used to carry its own copy of eleven of those hosts, and the two had already
+// drifted in both directions — atsdetect read a SmartRecruiters portal segment as the board,
+// while atsboard read a lowercase Workday locale and a per-job "/job" path as career sites.
+// Delegating also means an ATS added to atsboard is immediately visible to the harvest tools,
+// which was the standing cost of the split.
+//
+// What stays here are the five shapes atsboard deliberately EXCLUDES. That exclusion is not an
+// oversight to correct: atsboard is the accept-set for internal/ingest/contribution, which PAYS for
+// onboarded boards, so widening it is a money-affecting decision that needs its own proposal.
+// These five are harvest-only, and the harvest path validates every candidate against the
+// platform's API before committing it. iCIMS used to be a sixth: it joined atsboard once the
+// board-contribution reward itself was retired (nothing pays for an onboarded board any more,
+// so the risk this split was guarding against no longer applies), and its local case here
+// became dead code shadowed by the delegation above — see TestLocalShapesStayOutsideTheSharedTable.
+func FromURL(rawurl string) (provider, board string, ok bool) {
+	if src, brd, _, found := atsboard.Recognize(rawurl); found {
+		return src, brd, true
+	}
+
+	u, err := url.Parse(rawurl)
+	if err != nil {
+		return "", "", false
+	}
+	host := strings.ToLower(u.Hostname())
+	if host == "" {
+		return "", "", false
+	}
+	segs := pathSegments(u.Path)
+
+	switch {
+	case strings.HasSuffix(host, ".oraclecloud.com"):
+		if site := segAfter(segs, "sites"); site != "" {
+			return "oracle", host + "/" + site, true
+		}
+	case strings.HasSuffix(host, ".taleo.net"):
+		// board is the tenant host + the public careersection number, e.g.
+		// "valero.taleo.net/2" from /careersection/2/jobsearch.ftl.
+		if section := segAfter(segs, "careersection"); section != "" {
+			return "taleo", host + "/" + section, true
+		}
+	case host == "www.governmentjobs.com", host == "www.schooljobs.com":
+		// board is "<domain>/<agency>"; the two domains are separate tenant spaces.
+		if agency := segAfter(segs, "careers"); agency != "" {
+			return "neogov", strings.TrimPrefix(host, "www.") + "/" + agency, true
+		}
+	case host == "www.comeet.com", host == "comeet.com":
+		// board is "<slug>/<companyUID>" — Comeet's adapter needs both halves, so the slug alone
+		// is not a shorter board id but one the crawl rejects. The uid's fixed shape ("B1.001")
+		// is what proves the path names a board: comeet.com also serves the vendor's own pages,
+		// whose second segment would otherwise read as a company uid.
+		if len(segs) >= 3 && segs[0] == "jobs" && comeetUID.MatchString(segs[2]) {
+			return "comeet", segs[1] + "/" + segs[2], true
+		}
+	case host == "www.paycomonline.net", host == "paycomonline.net":
+		// board is the 32-hex client key in /v4/ats/web.php/portal/<clientkey>/...
+		if key := segAfter(segs, "portal"); key != "" {
+			return "paycom", key, true
+		}
+	}
+	return "", "", false
+}
+
+// comeetUID matches a Comeet company UID: two alphanumerics, a dot, three more ("B1.001",
+// "32.00E"). Requiring the shape is what separates a board URL from any other comeet.com path.
+var comeetUID = regexp.MustCompile(`^[0-9A-Za-z]{2}\.[0-9A-Za-z]{3}$`)
+
+// pathSegments splits a URL path into its non-empty segments.
+func pathSegments(p string) []string {
+	var out []string
+	for _, s := range strings.Split(p, "/") {
+		if s != "" {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+// segAfter returns the path segment following the first occurrence of key, or "" when
+// key is absent or terminal.
+func segAfter(segs []string, key string) string {
+	for i, s := range segs {
+		if s == key && i+1 < len(segs) {
+			return segs[i+1]
+		}
+	}
+	return ""
+}

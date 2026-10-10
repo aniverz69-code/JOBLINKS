@@ -1,0 +1,580 @@
+package sources
+
+import (
+	"os"
+	"slices"
+	"time"
+)
+
+// SelfClosingProviders returns the provider names in reg that manage their own closes and
+// must be skipped by the post-run unseen sweep (see selfClosing). cmd/ingest consults this
+// when deciding which providers to sweep.
+func SelfClosingProviders(reg map[string]Source) []string {
+	var out []string
+	for name, src := range reg {
+		if _, ok := src.(selfClosing); ok {
+			out = append(out, name)
+		}
+	}
+	return out
+}
+
+// FullCatalogProviders returns the provider names in reg that list their whole catalogue each
+// run and so may be swept by source rather than by crawled company (see fullCatalog).
+func FullCatalogProviders(reg map[string]Source) []string {
+	var out []string
+	for name, src := range reg {
+		if _, ok := src.(fullCatalog); ok {
+			out = append(out, name)
+		}
+	}
+	return out
+}
+
+// SweepGraceWindows returns the post-run sweep window each adapter in reg declares in place of
+// the default — wider for a slice-crawled source that can't yet tell drift from removal, narrower
+// for a full-board source whose unseen reading is already evidence (see sweepGrace). cmd/ingest
+// consults this when computing a provider's cutoff; a provider absent from the map is swept on
+// the default window.
+func SweepGraceWindows(reg map[string]Source) map[string]time.Duration {
+	out := make(map[string]time.Duration)
+	for name, src := range reg {
+		if s, ok := src.(sweepGrace); ok {
+			out[name] = s.sweepGrace()
+		}
+	}
+	return out
+}
+
+// FullBoardListingProviders returns, as a set, the provider names in reg whose adapter is
+// registered as structurally proving it lists a board to completion (see fullBoardListing).
+// cmd/ingest consults this as the sweep's fourth board-scope qualification gate: a provider
+// absent from this set never contributes to the board-scoped close, however its crawl went.
+func FullBoardListingProviders(reg map[string]Source) map[string]bool {
+	out := make(map[string]bool)
+	for name, src := range reg {
+		if _, ok := src.(fullBoardListing); ok {
+			out[name] = true
+		}
+	}
+	return out
+}
+
+// AggregatorProviders returns the sorted provider names in reg that aggregate postings
+// from many companies (see aggregator). The cross-source dedup pass uses this to tell an
+// aggregator copy (which may be suppressed) from a first-party ATS posting (which wins).
+func AggregatorProviders(reg map[string]Source) []string {
+	var out []string
+	for name, src := range reg {
+		if _, ok := src.(aggregator); ok {
+			out = append(out, name)
+		}
+	}
+	slices.Sort(out)
+	return out
+}
+
+// BoardKeyedProviders returns the sorted provider names in reg whose adapter is addressed by
+// a board id — every adapter that is not boardless. A caller that wants to say something about
+// ONE board (cmd/harvest-boards validating a candidate) needs this: a boardless adapter serves
+// the same catalogue whatever board it is handed, so it would answer for a board that does not
+// exist, and confirm every candidate put to it.
+func BoardKeyedProviders(reg map[string]Source) []string {
+	var out []string
+	for name, src := range reg {
+		if _, boardless := src.(boardless); !boardless {
+			out = append(out, name)
+		}
+	}
+	slices.Sort(out)
+	return out
+}
+
+// FilterableProviders returns the sorted provider keys the source facet offers.
+func FilterableProviders() []string { return filterableProviders(Taxonomy()) }
+
+// filterableProviders selects the source-facet provider keys from a registry. A
+// single-company boardless platform is redundant with the company filter and excluded;
+// a board-based platform or a multi-company aggregator stays listed.
+func filterableProviders(registry map[string]Source) []string {
+	var out []string
+	for key, src := range registry {
+		if _, isBoardless := src.(boardless); isBoardless {
+			if _, isAggregator := src.(aggregator); !isAggregator {
+				continue
+			}
+		}
+		out = append(out, key)
+	}
+	slices.Sort(out)
+	return out
+}
+
+// Taxonomy assembles the registry for classification rather than crawling: every adapter this
+// binary knows about, with its markers, whatever credentials the environment holds. Callers
+// that ask what KIND of source a provider is — the source facet, the status page's provider
+// kind, the cross-source dedup pass's aggregator set — use this, so their answers do not vary
+// by host. It carries no transport, so nothing reached through it may Fetch; crawlers call All
+// with a real client and get the credential-gated registry instead.
+func Taxonomy() map[string]Source { return All(nil) }
+
+// All assembles the registered adapters into a provider-keyed registry, sharing one
+// HTTP client across them. Adding a platform is a new adapter plus one line here.
+// A nil client builds the transport-free taxonomy registry — call Taxonomy for that.
+func All(c HTTPClient) map[string]Source {
+	// SEEK, JobStreet and JobsDB share the same frontend/GraphQL infrastructure and our
+	// crawl egresses from one IP, so their detail requests must compete for ONE token bucket.
+	// Two independent pacedSeekPoster calls would silently double the measured safe rate.
+	seekNetworkDetail := pacedSeekPoster(c)
+	registry := reg(
+		NewGreenhouse(c),
+		NewLever(c),
+		NewAshby(c),
+		NewWorkable(c),
+		NewWorkableMarketplace(c),
+		NewRecruitee(c),
+		// Rate-paced (pacedSmartRecruitersGetter): all 5,204 boards share one metered API host,
+		// and unpaced the run's own aggregate volume 429s nearly all of them. See pacer.go.
+		NewSmartRecruiters(pacedSmartRecruitersGetter(c)),
+		NewISmartRecruit(c),
+		// Keka: Indian HR/ATS SaaS, board = subdomain; one request to the platform's own
+		// job-listing API returns every open posting, fully detailed.
+		NewKeka(c),
+		NewGupy(c),
+		NewSolides(c),
+		NewPersonio(c),
+		NewPeopleForce(c),
+		NewCatsone(c),
+		NewOpencats(c),
+		NewOdoo(c),
+		NewTalentLyft(c),
+		NewPinpoint(c),
+		NewRippling(c),
+		NewBambooHR(c),
+		NewWorkday(c),
+		NewHuntflow(c),
+		NewInhire(c),
+		NewHiBob(c),
+		NewGem(c),
+		NewSuccessFactors(c),
+		NewSelfRecruit(c),
+		// Paced: its per-posting detail fan-out fired ~37k requests in 10 minutes and Teamtailor
+		// 403'd nearly half the fleet (see teamtailorRequestInterval).
+		NewTeamtailor(pacedHTMLGetter(c, teamtailorRequestInterval, teamtailorRequestBurst)),
+		NewHurma(c),
+		NewICIMS(c),
+		// careerspage is rate-paced (pacedHTMLGetter); the proxied path paces it too.
+		NewCareerPage(pacedHTMLGetter(c, careerspageRequestInterval, careerspageRequestBurst)),
+		NewCleverstaff(c),
+		NewNorthstone(c),
+		NewBriefHQ(c),
+		NewDjinni(c),
+		NewTalentAdore(c),
+		NewLoxo(c),
+		NewHireology(c),
+		NewIsolvedHire(c),
+		NewApplicantPro(c),
+		NewPaylocity(c),
+		NewJibe(c),
+		// Rate-paced (pacedPhenomGetter): all ~95 boards share Phenom People's platform
+		// infrastructure, and the run's own aggregate volume 403s a large fraction of them
+		// unpaced. See pacer.go.
+		NewPhenom(pacedPhenomGetter(c)),
+		NewAvature(c),
+		NewComeet(c),
+		NewCornerstone(c),
+		NewRadancy(c),
+		NewJazzHR(c),
+		NewWPYoast(c),
+		NewBreezy(c),
+		NewHerp(c),
+		NewHrmos(c),
+		NewJoin(pacedJoinGetter(c)),
+		NewRapyd(c),
+		NewCareerPlug(c),
+		NewHRMDirect(c),
+		NewAppliTrack(c),
+		NewPaycom(c),
+		NewPaycor(c),
+		NewLuxoft(c),
+		NewEPAM(c),
+		// Rate-paced (pacedADPGetter): all ~2,800 boards share one ADP host, and the run's own
+		// aggregate volume 429s most of them unpaced. See pacer.go.
+		NewADP(pacedADPGetter(c)),
+		// ADP MyJobs: ADP's OTHER career-site product, addressed by site slug rather than by
+		// Workforce Now's cid+ccId pair, so a company on it is unreachable through NewADP above.
+		// Rate-paced on a limiter of its OWN, not the one above — see pacedADPMyJobsGetter for
+		// why sharing would be an assertion nothing has measured.
+		NewADPMyJobs(pacedADPMyJobsGetter(c)),
+		NewITechArt(c),
+		NewVention(c),
+		// Detail hydration is rate-paced (pacedHTMLGetter) to hold the run's request rate
+		// under ClinchTalent's per-IP AWS-WAF challenge window; the sitemap fetch is a single
+		// request and needs no pacing.
+		NewClinch(c, pacedHTMLGetter(c, clinchRequestInterval, clinchRequestBurst)),
+		NewOracle(c),
+		NewEightfold(c),
+		NewFreshteam(c),
+		NewSoftgarden(c),
+		NewBetterteam(c),
+		// White-labelled ATS: the board is the full careers host, because the same tenant is
+		// served under the vendor's domain and under each reseller's.
+		NewHiringThing(c),
+		NewEarcu(c),
+		NewPageUp(c),
+		NewNeogov(c),
+		NewDeel(c),
+		NewScalis(c),
+		NewVouch(c),
+		NewRecruitingSolutions(c),
+		NewUKG(c),
+		// UKG Ready (formerly Kronos Workforce Ready) — a different UKG product from the one
+		// NewUKG crawls, on its own regional pod hosts.
+		NewUKGReady(c),
+		// Workstream: the hourly/frontline ATS (restaurants, retail, care homes), board = the
+		// employer's eight-hex career-site id. Rate-paced on every path: its AWS API Gateway
+		// origin meters by request rate per IP (see workstreamRequestInterval).
+		NewWorkstream(pacedHTMLGetter(c, workstreamRequestInterval, workstreamRequestBurst)),
+		// jobappnetwork (talentReef): another hourly/frontline-leaning ATS, board = the
+		// employer's numeric client id from its own public apply-link URL shape.
+		NewJobAppNetwork(c),
+		NewSenior(c),
+		NewTrakstar(c),
+		NewFactorial(c),
+		// gr8people: another vendor served under two marketing domains (gr8people.com and
+		// workgr8.com — see atsboard's matching two rows), board = the tenant's whole host.
+		NewGr8People(c),
+		// werecruit: board = "<locale>/<tenant>", the locale is load-bearing (see AGENTS.md).
+		NewWerecruit(c),
+		NewZoho(c),
+		NewTraffit(c),
+		NewErecruiter(c),
+		NewQuickin(c),
+		NewSpark(c),
+		NewMindsight(c),
+		NewEnlizt(c),
+		NewJobvite(c),
+		NewBullhorn(c),
+		NewManatal(c),
+		NewJobscore(c),
+		NewCrelate(c),
+		// Ashby boards whose public Posting API is disabled, served via the embed GraphQL.
+		NewAshbyGraphQL(c),
+		// VC talent network, board = portfolio company slug: listed only for the early-stage
+		// companies that host their application there instead of on an ATS of their own.
+		NewSpeedrun(c),
+		// Multi-company aggregators (boardless): one global feed, company per posting.
+		NewTecla(c),
+		NewTeamex(c),
+		NewTopco(c),
+		NewGetmatch(c),
+		NewGetmanfred(c),
+		// Joppy: Spain-only tech board with no search API, walked via its own sitemap directory —
+		// every company's page carries that company's open postings in full, no detail request.
+		NewJoppy(c),
+		NewEchoJobs(c),
+		NewHabrCareer(c),
+		NewGeekjob(c),
+		NewGetro(c),
+		// Dover: boarded ATS (board = company slug), public JSON API with no bot protection on
+		// the data endpoints — only the browser apply-submission flow gates behind Turnstile.
+		// Paced (pacedDoverGetter): an unpaced multi-board run drew 22 429s from 31 boards
+		// within ~2s (see doverRequestInterval's incident note in pacer.go).
+		NewDover(pacedDoverGetter(c)),
+		NewJobylon(c),
+		NewWorkAtAStartup(c),
+		NewJobStash(c),
+		NewArbeitnow(c),
+		NewRemoteOK(c),
+		NewJobicy(c),
+		NewWeWorkRemotely(c),
+		NewNoDesk(c),
+		NewCryptocurrencyJobs(c),
+		NewJobspresso(c),
+		NewStartupAndVC(c),
+		// Hacker News "Ask HN: Who is hiring?": the two newest monthly threads, read whole
+		// through the Algolia HN API — one global feed, company per comment.
+		NewHackerNews(c),
+		browserUASource(c, NewFourDayWeek),
+		NewFunctionalWorks(c),
+		NewTheHub(c),
+		NewCompleo(c),
+		NewInstaffo(c),
+		NewTechTree(c),
+		NewGetonbrd(c),
+		NewVagas(c),
+		// GeekHunter: Brazilian tech-recruitment ATS, board = company slug; listing and detail
+		// both come from parsing the page's own schema.org ld+json blocks.
+		NewGeekHunter(c),
+		// Recrutei: Brazilian multi-tenant ATS, board = tenant slug; listing is one POST to the
+		// platform's own internal frontend API, detail comes from the page's ld+json block.
+		NewRecrutei(c),
+		// PyjamaHR: Indian multi-tenant ATS, board = tenant slug; listing and detail are both
+		// plain keyless GETs to the platform's own internal frontend API (api.pyjamahr.com).
+		NewPyjamahr(c),
+		// RecruiterFlow: recruiting-agency board = agency slug; the whole listing is embedded
+		// as a bare JS variable on the page, detail comes from the page's ld+json block.
+		NewRecruiterflow(c),
+		NewMyCareersFuture(c),
+		NewWorkingNomads(c),
+		NewPowerToFly(c),
+		NewHimalayas(c),
+		NewRemotive(c),
+		NewRemotedotcom(c),
+		// wellfound needs no fingerprint-spoofing transport of its own (unlike bayt/gulftalent
+		// below) — its pages sit behind a full Cloudflare JS challenge that only the hosted
+		// Firecrawl tier can pass, wired in firecrawlProviders. Without that credential this
+		// entry still exists (classification/dedup must know about it) but every crawl attempt
+		// simply 403s on the challenge response, the same shape bayt/gulftalent already have.
+		NewWellfound(c),
+		NewRemotli(c),
+		NewLandingJobs(c),
+		NewTheMuse(c),
+		NewNoFluffJobs(c),
+		NewWantapply(c),
+		NewInfoJobs(c),
+		NewJobtech(c),
+		NewJobnet(c),
+		NewJobdanmark(c),
+		NewEmagine(c, limitedEmagineGetter(c)),
+		NewTyomarkkinatori(c),
+		NewLikeit(c),
+		NewArbeitsagentur(c),
+		// EURES: the EU's cross-border public employment portal, aggregating national PES
+		// and partner-board feeds across ~31 EU/EFTA countries. Board-based (board =
+		// country), aggregator-marked (see eures.go for the confirmed re-listing evidence).
+		NewEures(c),
+		// International single-company adapters (boardless).
+		NewTelegramCareers(c),
+		NewAmazon(c),
+		NewGoogle(c),
+		NewApple(c),
+		NewLumenalta(c),
+		// Staffy: a single recruiting agency's own board, boardless like Lumenalta; both the
+		// listing and detail pages are fully static server-rendered HTML.
+		NewStaffy(c),
+		NewDataArt(c),
+		// JettyCloud: its postings exist only on its own careers site — the employer runs no
+		// ATS a crawl can reach, so this adapter is the only way the catalogue can carry it.
+		NewJettyCloud(c),
+		NewOnstrider(c, os.Getenv("ONSTRIDER_REFERRAL_HANDLE")),
+		NewAlignerr(c, os.Getenv("ALIGNERR_REFERRAL_CODE")),
+		NewTalentHR(c),
+		NewMicro1(c, os.Getenv("MICRO1_REFERRAL_CODE")),
+		NewBairesDev(c, os.Getenv("BAIRESDEV_REFERRER_CODE")),
+		// RU federal open-data aggregator: board-based, sharded per region (board = OKATO code).
+		// Concurrency-limited: its gov API degrades under the pipeline's board concurrency (500s +
+		// read-timeouts), so its in-flight requests are capped to a gentle few.
+		NewTrudvsem(limitedTrudvsemGetter(c)),
+		// hh.ru: multi-company aggregator, enumerated by professional_role (board), reading the
+		// server-rendered search page's embedded state.
+		NewHH(c),
+		// SolidJobs: Polish job board, multi-company aggregator enumerated by division (board),
+		// same keyword-as-board shape as whatjobs.
+		NewSolidJobs(c),
+		// SchoolSpring: the US K-12 education job board, multi-company aggregator over one central
+		// keyless API, enumerated by search keyword (board) because 0.4% of its 80k postings are
+		// technical and the platform's own category taxonomy cannot select them. Hydrating.
+		NewSchoolSpring(c),
+		// SEEK: the dominant AU/NZ job board, multi-company aggregator enumerated by ICT
+		// subclassification (board) with the market in region, reading its frontend search API and
+		// hydrating descriptions from its GraphQL endpoint. Keyless.
+		// Its GraphQL detail endpoint meters by a per-IP request budget, so only that path is
+		// rate-paced; the search listing stays on the bare client.
+		NewSeek(c, seekNetworkDetail),
+		NewJobStreet(c, seekNetworkDetail),
+		// Japan Dev: curated Japan technology aggregator. One public sitemap lists posting URLs;
+		// detail pages carry structured Nuxt SSR state and official ATS apply links when available.
+		NewJapanDev(c),
+		// EDJOIN: California's K-12 education board, multi-company aggregator enumerated by
+		// job type (board) over one central index, hydrating bodies from each posting page's
+		// schema.org block. The board is a job type and not a district on purpose — see
+		// edjoin.go.
+		NewEdjoin(c),
+		// Profession.hu: Hungary's dominant job board, multi-company aggregator enumerated
+		// by the platform's own category sitemap (board) and hydrating each posting page.
+		// The board is a category and not an employer on purpose — the two IT categories
+		// are the technical slice of a general-population board. See profession.go.
+		// It gets a client of its own: the platform mishandles a connection it has
+		// already answered on, which fails the crawl outright and — worse — sometimes
+		// answers with a truncated sitemap instead. See singleUseConnSource.
+		singleUseConnSource(c, NewProfession),
+		// RU-domestic single-company adapters (boardless, except Yandex which selects
+		// host+language by board).
+		NewYandex(c),
+		// Yandex Crowd: gig/support catalogue at crowd.yandex.ru, one JSON blob per landing page.
+		NewYandexCrowd(c),
+		NewOzon(c),
+		NewAvito(c),
+		NewRWB(c),
+		NewSber(c),
+		// Alfa-Bank's careers API serves a certificate issued by the Russian Trusted Root
+		// CA, which no standard trust store carries, so it fails the TLS handshake on the
+		// shared client. It gets its own client that trusts that one extra root — see
+		// NewRussianTrustedRootClient for why the scope is one adapter and not the fleet.
+		NewAlfaBank(NewRussianTrustedRootClient()),
+		NewLamoda(c),
+		NewKuper(c),
+		NewAviasales(c),
+		NewDodo(c),
+		NewDomclick(c),
+		NewMtslink(c),
+		NewTBank(c),
+		NewMTS(c),
+		NewVK(c),
+		NewTwoGIS(c),
+	)
+	// usajobs, reed, whatjobs and adzuna are the keyed sources: each needs a credential read from
+	// the environment, never from a board file. The credential gates the CRAWL registry only — a
+	// host without it must not register a provider whose every board would fail to authenticate,
+	// so its board file fails config validation before a request goes out. The taxonomy path
+	// (c == nil, see Taxonomy) registers all four regardless, empty credential included.
+	// Conflating the two classified whatjobs — a CPC reseller of first-party ATS postings — as
+	// an ATS on every keyless host, so none of its copies was ever suppressed.
+	if key := os.Getenv("USAJOBS_API_KEY"); c == nil || key != "" {
+		registry["usajobs"] = NewUSAJobs(c, key)
+	}
+	if key := os.Getenv("REED_API_KEY"); c == nil || key != "" {
+		registry["reed"] = NewReed(c, key)
+	}
+	// Adzuna's credential is an app_id/app_key pair rather than a single key; both must be set.
+	if appID, appKey := os.Getenv("ADZUNA_APP_ID"), os.Getenv("ADZUNA_APP_KEY"); c == nil || (appID != "" && appKey != "") {
+		registry["adzuna"] = NewAdzuna(c, appID, appKey)
+	}
+	// whatjobs' credential is a publisher id rather than an API key, and it is per-country — one
+	// account per market, each under its own provider name (whatjobsMarkets). Rather than one
+	// WHATJOBS_<CC>_PUBLISHER_ID variable per market (which would keep growing as markets are
+	// added), every account's id lives in the single WHATJOBS_PUBLISHER_IDS variable, a
+	// comma-separated "code:id" list keyed by whatjobsMarket.code (e.g. "us:7065,br:7076"). All
+	// configured accounts share ONE in-flight cap: the feed rate-limits the pipeline's parallel
+	// board crawl by simultaneity (8 of 10 boards 429'd on the first prod run) though it serves
+	// sequential requests fine, and that trigger reads as edge-wide rather than per-account, so
+	// every provider must contend for the same semaphore rather than each getting its own budget.
+	// On the taxonomy path there is nothing to wrap.
+	whatjobsIDs := parseWhatJobsPublisherIDs(os.Getenv("WHATJOBS_PUBLISHER_IDS"))
+	var wjGetter JSONGetter
+	if c != nil {
+		wjGetter = limitedWhatJobsGetter(c)
+	}
+	for _, m := range whatjobsMarkets {
+		id := whatjobsIDs[m.code]
+		if c == nil {
+			registry[m.provider] = NewWhatJobsMarket(nil, id, m.code)
+		} else if id != "" {
+			registry[m.provider] = NewWhatJobsMarket(wjGetter, id, m.code)
+		}
+	}
+	// taleo and aijobs both need a cookie-persisting session (a searchjobs POST authorized
+	// by a careersection GET's session cookie; a CSRF-protected listing POST authorized by
+	// a plain GET's csrftoken cookie) rather than the shared jar-less client — see
+	// cookieSessionSource.
+	registry["taleo"] = cookieSessionSource[taleoHTTP](c, NewTaleo)
+	// dayforce needs the same: its listing POST is authorized by a double-submit CSRF pair,
+	// so the token a bootstrap GET mints must ride back as BOTH a header and the cookie the
+	// jar-less shared client would drop.
+	registry["dayforce"] = cookieSessionSource[dayforceHTTP](c, NewDayforce)
+	aijobsMaxNewPerRun := aijobsMaxNewPerRunFromEnv()
+	registry["aijobs"] = cookieSessionSource[aijobsHTTP](c, func(h aijobsHTTP) Source {
+		return NewAijobs(h, aijobsMaxNewPerRun)
+	})
+	// HumanBit's listing page is a single, unpaginated ~5.6 MB payload that measured ~18s to
+	// fetch — past the standard 15s client timeout, which made every crawl fail
+	// intermittently with "context deadline exceeded" in production. Swap in the
+	// long-timeout transport only when there is a real client to serve; the taxonomy path
+	// (c == nil, e.g. FilterableProviders) must stay transport-free, per the invariant
+	// Taxonomy documents.
+	if c == nil {
+		registry["humanbit"] = NewHumanBit(nil)
+	} else {
+		registry["humanbit"] = NewHumanBit(NewLongTimeoutClient())
+	}
+	// meta/uber/gusto are NOT served by the shared client: Meta's edge 400s the default Go
+	// TLS+HTTP/2 fingerprint and Uber's and Gusto's Cloudflare edges challenge it, so all three
+	// need the shared Chrome-fingerprint transport (fingerprintHTTP, also used by the
+	// bayt/gulftalent aggregators and by jobleads — whose search edge rejects the plain Go
+	// fingerprint the same way and serves a Chrome one 200, keyless). Build it only when there
+	// is a real client to serve (the c == nil marker/listing path — e.g. FilterableProviders —
+	// must stay transport-free, so these register with a nil client there; Provider()/boardless()
+	// never touch it). If the deterministic transport build ever fails, all six are left
+	// unregistered so config validation fails fast on their board entries, rather than
+	// registering a client guaranteed to be rejected by the edge.
+	if c == nil {
+		registry["meta"] = NewMetaCareers(nil)
+		registry["bayt"] = NewBayt(nil)
+		registry["gulftalent"] = NewGulfTalent(nil)
+		registry["uber"] = NewUber(nil)
+		registry["gusto"] = NewGusto(nil)
+		// jobleads must register on the taxonomy path too: classification (AggregatorProviders,
+		// the source facet) reads this registry, and an aggregator it does not know is never
+		// suppressed in the cross-source dedup.
+		registry["jobleads"] = NewJobleads(nil)
+	} else if fp, err := newFingerprintHTTP(); err == nil {
+		registry["meta"] = NewMetaCareers(fp)
+		registry["bayt"] = NewBayt(fp)
+		registry["gulftalent"] = NewGulfTalent(fp)
+		registry["uber"] = NewUber(fp)
+		registry["gusto"] = NewGusto(fp)
+		// The search and detail paths are both paced through one limiter per run, wired here
+		// so every board competes for the same bucket (see pacedJobleadsPoster).
+		registry["jobleads"] = NewJobleads(pacedJobleadsPoster(fp))
+	}
+	return registry
+}
+
+// cookieSessionSource builds a registry entry for an adapter whose API is session- or
+// CSRF-cookie-authenticated (taleo, aijobs) and so cannot share the shared jar-less
+// client. On a real crawl (c != nil) it hands build a fresh cookie-jar client; on the
+// transport-free taxonomy path (c == nil, e.g. FilterableProviders) it hands build a true
+// nil transport, since T is an interface type parameter and its zero value is nil —
+// Provider()/marker assertions never touch it.
+func cookieSessionSource[T any](c HTTPClient, build func(T) Source) Source {
+	if c == nil {
+		var zero T
+		return build(zero)
+	}
+	return build(any(newCookieClient()).(T))
+}
+
+// singleUseConnSource builds a registry entry for an adapter whose platform mishandles a
+// reused HTTP connection (profession) and so cannot share the pooled client. It mirrors
+// cookieSessionSource exactly, including its nil-transport case: on the taxonomy path
+// (c == nil) it hands build a true nil, since T is an interface type parameter whose zero
+// value is nil and Provider()/marker assertions never touch it.
+//
+// The failure it answers is worth stating, because it does not present as a transport
+// problem: over a pooled connection the platform answers the first request or two and then
+// returns a bare EOF, and one of the answers it does give can be a truncated body — a
+// sitemap that parses cleanly as a much shorter one. Pacing does not help and a retry
+// cannot, since the retry reuses the same pool.
+func singleUseConnSource[T any](c HTTPClient, build func(T) Source) Source {
+	if c == nil {
+		var zero T
+		return build(zero)
+	}
+	return build(any(newSingleUseConnClient()).(T))
+}
+
+// browserUASource builds a registry entry for an adapter whose platform refuses any client
+// that identifies itself, on a path that platform's own robots.txt allows (4dayweek). It
+// mirrors cookieSessionSource exactly, including its nil-transport case for the taxonomy path.
+// See browserUserAgent for the measurement, and for the line this does NOT cross.
+func browserUASource[T any](c HTTPClient, build func(T) Source) Source {
+	if c == nil {
+		var zero T
+		return build(zero)
+	}
+	return build(any(newBrowserUAClient()).(T))
+}
+
+// reg indexes sources by provider key. A duplicate key means two adapters claim the
+// same platform — a programming error — so it panics rather than silently dropping one.
+func reg(sources ...Source) map[string]Source {
+	m := make(map[string]Source, len(sources))
+	for _, s := range sources {
+		if _, dup := m[s.Provider()]; dup {
+			panic("sources: duplicate provider " + s.Provider())
+		}
+		m[s.Provider()] = s
+	}
+	return m
+}

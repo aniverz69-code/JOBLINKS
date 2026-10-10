@@ -1,0 +1,134 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+
+/* Tokens, the design-system source scan, and the Tailwind theme bridge. Owned
+   by the package (design-system/src/theme.css) so Storybook and the app render
+   from one definition — see design-system/AGENTS.md. */
+@import "freehire-design-system/theme.css";
+
+/* Typography plugin: the `prose` classes style the mdsvex-rendered blog post body
+   (web/src/routes/blog/[slug]). Opt-in, so no other page is affected. */
+@plugin "@tailwindcss/typography";
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+  }
+  html,
+  body {
+    height: 100%;
+  }
+  /* Tell the browser which palette this page is in, so the parts of the UI IT draws
+     match the parts we draw. A native <select>'s open menu, the scrollbars, the focus
+     ring on a form control and the date/colour pickers are all rendered by the OS, and
+     without this they follow the OS setting instead of ours: a visitor whose Mac is in
+     dark mode got a black dropdown menu hanging over a white page.
+
+     It is declared here rather than beside any one control because there is no way to
+     style a native menu — `color-scheme` is the whole of the API. Paired with the `.dark`
+     class app.html sets before first paint, so the two never disagree. */
+  html {
+    color-scheme: light;
+  }
+  html.dark {
+    color-scheme: dark;
+  }
+  body {
+    @apply bg-background text-foreground font-sans antialiased;
+  }
+  /* Mobile Safari zooms toward any focused input whose text is < 16px, yanking
+     the viewport. 16px on small screens disables that zoom; the denser 14px
+     returns at sm+. Centralized here so every input is covered and no call site
+     has to remember the rule. */
+  input {
+    @apply text-base sm:text-sm;
+  }
+}
+
+/* Scroll a strip without the browser drawing a rail across it. The tracking board's
+   columns, a tab bar, a row of cards: each has to stay scrollable on a viewport too
+   narrow to hold it, but a scrollbar set to "always show" sits ON the content and
+   covers the bottom of whatever it overlays. This hides the rail only — the element
+   still scrolls, so it goes alongside an `overflow-*`, never instead of one. The two
+   declarations are the same rule for two engines, not a fallback pair. */
+@utility no-scrollbar {
+  scrollbar-width: none;
+  &::-webkit-scrollbar {
+    display: none;
+  }
+}
+
+/* Shiki dual-theme code highlighting for the API docs. One SSR render emits both
+   palettes as CSS vars; the light values apply by default and the dark values
+   swap in under the .dark theme class. The block chrome (padding, scroll) is
+   owned by the surrounding figure, so Shiki's own <pre> background is dropped. */
+.docs-shiki .shiki,
+.docs-shiki .shiki span {
+  color: var(--shiki-light);
+  background-color: transparent;
+}
+.dark .docs-shiki .shiki,
+.dark .docs-shiki .shiki span {
+  color: var(--shiki-dark);
+}
+.docs-shiki .shiki {
+  margin: 0;
+  background: transparent !important;
+}
+
+/* Dotted hero backdrop, shared across landing pages (the pattern HomeView pioneered
+   for /, and /about reuses). A faint dot grid faded toward the edges with a radial
+   mask, so it frames a hero without competing with the copy — visible in both themes
+   because it rides --muted-foreground. Opt in by adding `dot-grid` to a section (it
+   sets its own positioning context); pair with `-mx-4 px-4` to bleed full-width. */
+.dot-grid {
+  position: relative;
+}
+.dot-grid::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  background-image: radial-gradient(var(--muted-foreground) 1px, transparent 1.2px);
+  background-size: 22px 22px;
+  opacity: 0.16;
+  -webkit-mask-image: radial-gradient(ellipse 90% 75% at 25% 0%, #000 18%, transparent 80%);
+  mask-image: radial-gradient(ellipse 90% 75% at 25% 0%, #000 18%, transparent 80%);
+}
+/* The centred variant, for a hero that is one thing in the middle of the screen
+   rather than a left column beside a visual — the homepage's search box.
+   Horizontally, and ONLY horizontally: the ellipse, its stops and its anchor to the
+   top of the section are the ones above, unchanged.
+
+   It first moved the anchor down to the middle of the section as well, which read
+   worse than the original on every screen: it put the densest dots directly behind
+   the heading and the search box — the one thing the mask exists to prevent — and
+   left the top of the page bare, so the page started empty and got busy as you read
+   down. Anchored at the top the texture is a sky that fades into the copy, which is
+   what /about does and why it looks settled.
+
+   Pair it with `dot-grid`, which still sets the positioning context. */
+.dot-grid-centred::before {
+  -webkit-mask-image: radial-gradient(ellipse 90% 75% at 50% 0%, #000 18%, transparent 80%);
+  mask-image: radial-gradient(ellipse 90% 75% at 50% 0%, #000 18%, transparent 80%);
+}
+
+/* CLI promo strip: hidden before first paint for a visitor who already closed it.
+   The banner is server-rendered on purpose — it lives in the document flow, so
+   mounting it after hydration would shove the page down under someone mid-read. The
+   no-flash script in app.html sets this class from localStorage; the component then
+   catches up on mount and drops the node. See $lib/cliPromo.ts. */
+.cli-banner-dismissed [data-cli-banner] {
+  display: none;
+}
+
+/* Onboarding nudge: same arrangement as the strip above, for the same reason. It
+   sits directly above the job feed, so rendering it only after hydration pushed
+   every row down by 74px on a first visit — CrUX measured CLS 0.28 on the mobile
+   home page, with 31% of visits in "poor", while lab Lighthouse saw only 0.066
+   because it never replays a returning visitor's localStorage. Server-rendered
+   now; this class hides it before first paint for anyone who already dismissed or
+   completed it, and JobsView drops the node on mount. See $lib/onboarding.ts. */
+.onboarding-seen [data-onboarding-banner] {
+  display: none;
+}

@@ -1,0 +1,92 @@
+# Accounts conventions
+
+Account resolution and the credential lifecycle: password register/login, mailed six-digit
+codes, password reset/change, and mapping an external sign-in identity onto a local user.
+
+## Scope boundary
+
+Four packages split this surface — keep the split:
+
+- **`internal/identity/accounts`** (here) — the *policy*: who an identity resolves to, what a valid
+  password is, when a code is burnt.
+- **`internal/identity/auth`** — the *primitives*: bcrypt, JWT issue/verify, cookie transport,
+  middleware. See [../auth/AGENTS.md](../auth/AGENTS.md).
+- **`internal/identity/auth/oauth`** — provider registry and the authorization-code flow.
+- **`internal/api/handler`** — HTTP shape and rate limiting; handlers never re-implement policy.
+
+## Always true
+
+- **Identity-first, then verified-email, never anything else.** `ResolveOAuthAccount` tries
+  `(provider, provider_user_id)` first, and only then falls back to email — and only when
+  the provider reports it **verified**. An unverified or empty email is `ErrNoVerifiedEmail`
+  and resolves to nothing. This is the anti-takeover gate; do not add a path around it.
+- **The seizure rule.** When a provider-verified identity arrives for an address held by an
+  *unverified, password-backed* account, that account is **seized**: `password_hash = NULL`,
+  `email_verified = true`, `token_version + 1`, **and every row in `api_keys` deleted** (see
+  `migrations`/`users.sql`). The password someone set on an address they never proved is
+  destroyed rather than silently joined — otherwise registering against a stranger's address
+  would pre-hijack their future OAuth sign-in.
+- **`token_version` does not reach API keys — the takeover statements delete them.** A key is
+  matched against `api_keys.token_hash` and `expires_at` and never joins `users`, so bumping
+  the generation leaves it live. That is intentional for `logout-all` and a password change
+  (a key is a durable programmatic credential, not a session), and wrong for the two events
+  where the account changes hands: `SeizeUnverifiedAccount` and `ResetUserPassword` therefore
+  carry a `DELETE FROM api_keys` as a data-modifying CTE, so the revocation cannot be
+  separated from the takeover. A new takeover-shaped path must do the same; bumping the
+  version alone would leave a never-expiring bearer credential in the previous holder's hands.
+- **Every credential change bumps `token_version`.** Set/reset password and seizure all
+  increment it, which strands every outstanding JWT. That coupling is the entire revocation
+  story for a stateless token — a new credential write path that skips the bump silently
+  leaves old sessions alive.
+- **Login is constant-work.** An unknown email still spends a bcrypt check against
+  `dummyPasswordHash`, so response timing doesn't disclose whether an account exists.
+  `TestLogin_UserNotFound_SpendsDummyCheck` pins it.
+- **Password bounds are bcrypt's, not a style choice.** `maxPasswordLen = 72` because bcrypt
+  silently truncates past 72 bytes — accepting a longer one would ignore its tail.
+- **Codes are keyed `(user_id, purpose)`**, at most one outstanding per purpose, so a pending
+  email verification and a pending password reset never overwrite each other. TTL 15 min,
+  5 wrong guesses, 60 s resend cooldown.
+- **A fourth purpose (`internal/ingest/employer`'s `PurposeVerifyWorkEmail`) shares this same
+  store through generic `Service.IssueCode`/`ConfirmCode`**, factored out of the
+  already-purpose-parameterized private `issueCode`/`consumeCodeTx`. `IssueCode` takes
+  delivery as an explicit `send func(ctx, email, code) error` rather than a `CodeMailer`
+  method, so a caller outside this package's own three purposes needs no change to
+  `CodeMailer` to add one. `ConfirmCode` is a standalone sibling of `ConfirmVerification`,
+  not something `ConfirmVerification` itself calls: `ConfirmVerification` bundles the
+  code-consume and `MarkEmailVerified` in one transaction (see the next bullet), and routing
+  it through a `ConfirmCode` that commits on its own would split that atomicity. **A new
+  purpose also needs its own migration**: `user_email_codes.purpose` carries a CHECK
+  constraint (migration 0041) that must be widened (see migration 0176 for the template) —
+  the Go constant alone is not enough, and the failure mode without it is a 500 on every call
+  for the new purpose, not a compile error.
+- `ErrInvalidCode` deliberately covers wrong / consumed / burnt without distinguishing them.
+- **Every code flow runs in a transaction, and the pool that opens it is a REQUIRED
+  constructor argument.** The five-attempt limit is enforced by reading the outstanding code
+  `FOR UPDATE` and writing under that lock, and a reset is "spend the code + write the
+  password + bump `token_version`" or nothing. `NewQueriesCodeStore` took the pool
+  *variadically* until 2026-09-06, so `Begin` could answer `(nil, nil)` and the service
+  carried eight `if tx != nil` branches to tolerate it — which made both guarantees a
+  property of the construction. It has already shipped that way once (`a55cc537`: both call
+  sites omitted the pool, so none of it ever ran). `TestNewQueriesCodeStoreRequiresThePool`
+  pins the signature, because the wrong construction has no runtime shape to assert on.
+- **A failed guess commits.** `ConfirmVerification` and `ResetPassword` commit the
+  transaction on `ErrInvalidCode` before returning it: the bumped attempt counter is what
+  bounds guessing, and rolling it back with the refusal would make the limit unreachable.
+- OAuth callbacks race: `ResolveOAuthAccount` handles both `ErrIdentityConflict` (same
+  identity, concurrent callback) and `ErrEmailRace` (different identity, same verified
+  email) by retrying rather than failing. Both paths are unit-tested — preserve them if you
+  touch the resolution order.
+- **A lazily allocated username never starts the 30-day change cooldown.** `EnsureUsername`/
+  `EnsureUsernameFromBase` write `username` but leave `username_updated_at` `NULL`; only
+  `ClaimUsername` (an explicit, user-initiated pick) sets it, and the cooldown is evaluated
+  only against a non-`NULL` value. Setting it on the lazy path would lock a user who never
+  knew a username existed out of picking their own for a month.
+- **`ClaimUsername` never substitutes a suffixed alternative.** A taken, reserved, or
+  invalid desired name is rejected outright — only `EnsureUsername`'s system-generated
+  default goes through `Candidate`'s collision-suffix search. A user who typed a specific
+  name asked for exactly that one.
+
+## Limitations
+
+- No magic-link sign-in, no identity unlinking (the repository seam exists, the UI doesn't).
+- The rate limiter on credential endpoints fails open on Redis errors (`internal/api/ratelimit`, Redis-backed GCRA — a Redis outage means no throttling, only log warnings).

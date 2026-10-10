@@ -1,0 +1,23 @@
+---
+title: Filter companies by stage
+date: 2026-07-13
+summary: A new Company stage filter separates startups, scaleups, enterprises, and government employers on the companies page.
+type: changelog
+tags:
+  - companies
+  - filters
+draft: false
+---
+
+Whether you want an early startup or a large enterprise says a lot about the job — the
+pace, the team size, how much is already built. So there's now a **Company stage** filter
+on the [companies page](/companies): Startup, Scaleup, Enterprise, or Government.
+
+The stage is worked out deterministically from what we already know about each company —
+whether it's a YC company, its headcount, its founding year, and whether it hires through
+government job systems. A public giant that went through YC years ago counts as an
+enterprise, not a startup.
+
+It's honest about what it doesn't know: a company we can't confidently place has no stage
+and simply won't show up under a stage filter, rather than being guessed into the wrong
+bucket. Pick a stage on [/companies](/companies) to try it.

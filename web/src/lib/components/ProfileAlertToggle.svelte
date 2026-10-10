@@ -1,0 +1,149 @@
+<script lang="ts">
+  import { Check, User } from '@lucide/svelte';
+  import { ApiError } from '$lib/api';
+  import { filtersFromProfile, filtersToParams } from '$lib/filters';
+  import { notifications } from '$lib/notifications.svelte';
+  import { savedSearches } from '$lib/savedSearches.svelte';
+  import { cn } from '$lib/ui';
+  import type { SavedSearch, UserProfile } from '$lib/types';
+
+  // The built-in "notify me about jobs matching my profile" toggle: flipping it on
+  // creates the exact saved search the modal's "Apply my profile" action would stage
+  // (see stagedFilters.svelte.ts's applyProfile / filtersFromProfile), marks it
+  // derived_from_profile so at most one exists per user (the server's partial unique
+  // index is the actual invariant), and subscribes it over email — always deliverable
+  // with no linking step, unlike telegram/push (which the account's notification
+  // settings may list as a preferred channel without the user ever having connected
+  // them — see ReminderSettings.svelte/CompanyFollowButton.svelte's `linked` gate).
+  // The user can add another channel from the Search alerts tab afterward. Flipping
+  // the toggle off deletes the saved search, and its subscriptions go with it.
+  //
+  // On/off is read from the server's rows rather than a separate flag, and it reads
+  // BOTH of them — the search and its email subscription. The Search alerts tab renders
+  // this same search's per-channel chips right below this toggle, so turning the Email
+  // chip off there must not leave this one still claiming the alert is on.
+  let { profile }: { profile: UserProfile } = $props();
+
+  const profileSearch = $derived(savedSearches.items.find((s) => s.derived_from_profile) ?? null);
+  const enabled = $derived(
+    profileSearch !== null && notifications.forSavedSearch(profileSearch.id, 'email') !== undefined,
+  );
+  // Until both stores have answered, "off" would be a guess rather than a reading, and
+  // acting on a guess is how the toggle wrote past a subscription that already existed.
+  const ready = $derived(savedSearches.loaded && notifications.loaded);
+
+  let saveState = $state<'idle' | 'saving' | 'saved' | 'error'>('idle');
+  let saveError = $state<string | null>(null);
+  let savedTimer: ReturnType<typeof setTimeout> | undefined;
+
+  $effect(() => {
+    void savedSearches.ensureLoaded();
+    void notifications.ensureLoaded();
+  });
+
+  function flash() {
+    saveState = 'saved';
+    clearTimeout(savedTimer);
+    savedTimer = setTimeout(() => {
+      if (saveState === 'saved') saveState = 'idle';
+    }, 1500);
+  }
+
+  async function enable() {
+    saveState = 'saving';
+    saveError = null;
+    // Only a search THIS call created may be rolled back below; an existing one is the
+    // user's, and re-enabling after they turned the Email chip off must not delete it.
+    let created: SavedSearch | undefined;
+    try {
+      // Reuse the profile search when there is one — the server's partial unique index
+      // permits exactly one, so re-creating it would conflict rather than re-subscribe.
+      let search = profileSearch;
+      if (!search) {
+        const query = filtersToParams(filtersFromProfile(profile)).toString();
+        search = created = await savedSearches.create('My profile', query, true);
+      }
+      // Through the store, not api.createSubscription: this page also renders this
+      // search's per-channel chips (AlertChannels), which read the store. Writing past
+      // it drew the Email chip "off" over a live subscription — tapping it 409'd.
+      await notifications.subscribe(search.id, 'email');
+      flash();
+    } catch (e) {
+      // The search may have been created before the subscribe call failed — clean it up
+      // so a half-done enable leaves no saved search the user never asked for.
+      if (created) {
+        try {
+          await savedSearches.remove(created.id);
+        } catch {
+          // best-effort; the toggle's error state still surfaces the original failure.
+        }
+      }
+      saveState = 'error';
+      saveError = e instanceof ApiError ? e.message : 'Could not enable the alert.';
+    }
+  }
+
+  async function disable() {
+    if (!profileSearch) return;
+    saveState = 'saving';
+    saveError = null;
+    try {
+      await savedSearches.remove(profileSearch.id);
+      flash();
+    } catch (e) {
+      saveState = 'error';
+      saveError = e instanceof ApiError ? e.message : 'Could not disable the alert.';
+    }
+  }
+
+  function toggle() {
+    void (enabled ? disable() : enable());
+  }
+</script>
+
+<section class="rounded-xl border border-border bg-card p-4">
+  <div class="flex items-center gap-3">
+    <div class="grid size-9 shrink-0 place-items-center rounded-lg bg-brand-muted text-brand-strong">
+      <User class="size-4.5" aria-hidden="true" />
+    </div>
+    <div class="min-w-0 flex-1">
+      <h2 class="text-sm font-semibold leading-tight">Jobs matching my profile</h2>
+      <p class="text-xs text-muted-foreground">
+        Get notified when a new job matches your role, skills and location preferences.
+      </p>
+    </div>
+
+    {#if saveState === 'saving'}
+      <span class="text-xs text-muted-foreground">Saving…</span>
+    {:else if saveState === 'saved'}
+      <span class="flex items-center gap-1 text-xs text-brand-strong"><Check class="size-3.5" aria-hidden="true" /> Saved</span>
+    {:else if saveState === 'error'}
+      <span class="text-xs text-destructive">{saveError}</span>
+    {/if}
+
+    {@render toggleSwitch(enabled, 'Notify me about jobs matching my profile', toggle, saveState === 'saving' || !ready)}
+  </div>
+</section>
+
+{#snippet toggleSwitch(on: boolean, label: string, onToggle: () => void, disabled: boolean)}
+  <button
+    type="button"
+    role="switch"
+    aria-checked={on}
+    aria-label={label}
+    onclick={onToggle}
+    {disabled}
+    class={cn(
+      'relative inline-flex h-6 w-11 shrink-0 items-center rounded-full transition-colors disabled:opacity-50',
+      'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-ring focus-visible:ring-offset-2 focus-visible:ring-offset-card',
+      on ? 'bg-brand' : 'bg-muted',
+    )}
+  >
+    <span
+      class={cn(
+        'inline-block size-5 rounded-full bg-white shadow-sm transition-transform',
+        on ? 'translate-x-[22px]' : 'translate-x-0.5',
+      )}
+    ></span>
+  </button>
+{/snippet}

@@ -1,0 +1,730 @@
+import { describe, it, expect } from 'vitest';
+import {
+  emptyFacet,
+  emptyFilters,
+  filtersToParams,
+  filtersFromParams,
+  filtersWithParts,
+  displayQuery,
+  activeFilterCount,
+  canonicalQuery,
+  savedSearchQuery,
+  signOf,
+  facetSetSign,
+  facetCycle,
+  facetPick,
+  facetToggleSign,
+  facetAdd,
+  facetRemove,
+  defaultSortFor,
+  effectiveSort,
+  matchSortNeedsSkills,
+  sortOptionsFor,
+  selectedSortFor,
+  type FacetState,
+  type JobFilters,
+  type JobSort,
+} from './facetModel';
+import { must } from './utils';
+
+// A JobFilters carrying a query and an EXPLICITLY chosen ordering — the pair the sort
+// default depends on. Pass `null` for "the caller has not chosen one".
+function withQuery(q: string, sort: JobSort | null): JobFilters {
+  return { ...emptyFilters(), q, sort };
+}
+
+// A JobFilters seeded with one facet's state, for serialization tests.
+function withSkills(st: Partial<FacetState>): JobFilters {
+  const f = emptyFilters();
+  f.facets.skills = { include: [], exclude: [], matchAll: false, ...st };
+  return f;
+}
+
+// The skills facet is always present (emptyFacets seeds every FACET), so this read
+// is safe; the helper drops the index-signature `| undefined` for terser asserts.
+const sk = (f: JobFilters): FacetState => must(f.facets.skills);
+
+describe('emptyFacet', () => {
+  it('is two empty sets and OR mode', () => {
+    expect(emptyFacet()).toEqual({ include: [], exclude: [], matchAll: false });
+  });
+});
+
+describe('filtersToParams', () => {
+  it('serializes include to one comma-joined bare param and exclude to <param>_exclude', () => {
+    const p = filtersToParams(withSkills({ include: ['nodejs', 'react'], exclude: ['php', 'java'] }));
+    expect(p.getAll('skills')).toEqual(['nodejs,react']);
+    expect(p.getAll('skills_exclude')).toEqual(['php,java']);
+  });
+
+  it('emits <param>_mode=and only when matchAll and more than one included value', () => {
+    expect(filtersToParams(withSkills({ include: ['go', 'rust'], matchAll: true })).get('skills_mode')).toBe('and');
+    expect(filtersToParams(withSkills({ include: ['go'], matchAll: true })).get('skills_mode')).toBeNull();
+    expect(filtersToParams(withSkills({ include: ['go', 'rust'], matchAll: false })).get('skills_mode')).toBeNull();
+  });
+
+  it('omits a facet with no values', () => {
+    expect(filtersToParams(emptyFilters()).toString()).toBe('');
+  });
+
+  // q_fields is how a title suggestion's click restricts `q` to the title field (see
+  // apiSuggestions.ts) — it has to survive filtersToParams or it never reaches the
+  // list's own reload, pagination, or facet-count requests, all of which read the
+  // filter state through this function rather than the original navigation URL.
+  it('serializes qFields as a comma-joined q_fields param', () => {
+    const p = filtersToParams({ ...emptyFilters(), qFields: ['title'] });
+    expect(p.get('q_fields')).toBe('title');
+  });
+
+  it('omits q_fields when unset', () => {
+    expect(filtersToParams(emptyFilters()).has('q_fields')).toBe(false);
+  });
+});
+
+describe('filtersFromParams', () => {
+  it('reads the bare param into include and <param>_exclude into exclude', () => {
+    const f = filtersFromParams(new URLSearchParams('skills=nodejs&skills_exclude=php&skills_exclude=.net'));
+    expect(sk(f).include).toEqual(['nodejs']);
+    expect(sk(f).exclude).toEqual(['php', '.net']);
+  });
+
+  it('reads <param>_mode=and into matchAll', () => {
+    const f = filtersFromParams(new URLSearchParams('skills=go&skills=rust&skills_mode=and'));
+    expect(sk(f).matchAll).toBe(true);
+  });
+
+  it('drops a value from include when it also appears in exclude (exclude wins)', () => {
+    const f = filtersFromParams(new URLSearchParams('skills=php&skills_exclude=php'));
+    expect(sk(f).include).toEqual([]);
+    expect(sk(f).exclude).toEqual(['php']);
+  });
+
+  it('de-duplicates repeated URL values', () => {
+    const f = filtersFromParams(new URLSearchParams('skills=go&skills=go'));
+    expect(sk(f).include).toEqual(['go']);
+  });
+
+  it('splits a comma-joined value into multiple included values', () => {
+    const f = filtersFromParams(new URLSearchParams('skills=go,react'));
+    expect(sk(f).include).toEqual(['go', 'react']);
+  });
+
+  it('splits a comma-joined value in <param>_exclude too', () => {
+    const f = filtersFromParams(new URLSearchParams('skills_exclude=java,cpp'));
+    expect(sk(f).exclude).toEqual(['java', 'cpp']);
+  });
+
+  it('still parses the old repeated-key form (backward compatibility)', () => {
+    const f = filtersFromParams(new URLSearchParams('skills=go&skills=react&skills=aws'));
+    expect(sk(f).include).toEqual(['go', 'react', 'aws']);
+  });
+
+  it('unions a comma-joined entry with a repeated key for the same param', () => {
+    const f = filtersFromParams(new URLSearchParams('skills=go,react&skills=aws'));
+    expect(sk(f).include).toEqual(['go', 'react', 'aws']);
+  });
+
+  it('drops stray/doubled commas without producing an empty value', () => {
+    const f = filtersFromParams(new URLSearchParams('skills=go,,react,'));
+    expect(sk(f).include).toEqual(['go', 'react']);
+  });
+
+  it('reads q_fields into qFields', () => {
+    expect(filtersFromParams(new URLSearchParams('q_fields=title')).qFields).toEqual(['title']);
+  });
+
+  it('reads a missing q_fields as null, not an empty array', () => {
+    expect(filtersFromParams(new URLSearchParams('')).qFields).toBeNull();
+  });
+});
+
+describe('filtersToParams / filtersFromParams round-trip', () => {
+  it('round-trips a multi-value facet through the new comma-joined serialization', () => {
+    const f = withSkills({ include: ['go', 'react', 'aws'], exclude: ['java'] });
+    const back = filtersFromParams(filtersToParams(f));
+    expect(sk(back).include).toEqual(['go', 'react', 'aws']);
+    expect(sk(back).exclude).toEqual(['java']);
+  });
+
+  it('round-trips an old-style repeated-key URL to the same filter state as the new form', () => {
+    const oldStyle = filtersFromParams(new URLSearchParams('skills=go&skills=react'));
+    const newStyle = filtersFromParams(new URLSearchParams('skills=go,react'));
+    expect(oldStyle).toEqual(newStyle);
+  });
+
+  it('round-trips qFields', () => {
+    const f = { ...emptyFilters(), qFields: ['title'] };
+    expect(filtersFromParams(filtersToParams(f)).qFields).toEqual(['title']);
+  });
+});
+
+// A completion from the suggestions endpoint composes a phrase — see the doc comment
+// on filtersWithParts. qFields travels with q as ONE discrete replacement: applying a
+// suggestion with no title part must clear whatever restriction a PREVIOUS suggestion
+// left behind, not merge with it.
+describe('filtersWithParts', () => {
+  it('sets q and every named facet in one write', () => {
+    const got = filtersWithParts(emptyFilters(), [['category', 'backend']], 'Backend Engineer');
+    expect(got.q).toBe('Backend Engineer');
+    expect(got.facets.category?.include).toEqual(['backend']);
+  });
+
+  it('sets qFields when given', () => {
+    const got = filtersWithParts(emptyFilters(), [], '"Founding Engineer"', ['title']);
+    expect(got.qFields).toEqual(['title']);
+  });
+
+  it('clears a previous qFields when applying a suggestion with none of its own', () => {
+    const withRestriction = { ...emptyFilters(), qFields: ['title'] };
+    const got = filtersWithParts(withRestriction, [['category', 'backend']], 'Backend Engineer');
+    expect(got.qFields).toBeNull();
+  });
+});
+
+describe('experienceYearsMax', () => {
+  it('is absent from the URL when unset', () => {
+    expect(filtersToParams(emptyFilters()).has('experience_years_max')).toBe(false);
+  });
+
+  it('serializes a bound and reads it back', () => {
+    const f = emptyFilters();
+    f.experienceYearsMax = 3;
+    const p = filtersToParams(f);
+    expect(p.get('experience_years_max')).toBe('3');
+    expect(filtersFromParams(p).experienceYearsMax).toBe(3);
+  });
+
+  // Zero is the entry-level selector, not "unset". A falsy guard here would drop the
+  // one bound juniors need, and the URL would silently widen back to the whole
+  // catalogue while the control still showed the leftmost stop.
+  it('serializes a zero bound rather than treating it as unset', () => {
+    const f = emptyFilters();
+    f.experienceYearsMax = 0;
+    const p = filtersToParams(f);
+    expect(p.get('experience_years_max')).toBe('0');
+    expect(filtersFromParams(p).experienceYearsMax).toBe(0);
+  });
+
+  // `Number(' ')` is 0 and `' '` is truthy, so a whitespace-only value slips past a
+  // naive presence check and lands on the entry-level filter — a shared or
+  // hand-edited link would narrow to almost nothing without saying why.
+  it('reads a junk, blank or negative URL value back as no bound', () => {
+    for (const raw of ['', ' ', '%20', 'abc', '-1', '2.5']) {
+      const back = filtersFromParams(new URLSearchParams(`experience_years_max=${raw}`));
+      expect(back.experienceYearsMax, `experience_years_max=${raw}`).toBeNull();
+    }
+  });
+
+  it('counts as one active filter, including at zero', () => {
+    const f = emptyFilters();
+    f.experienceYearsMax = 0;
+    expect(activeFilterCount(f)).toBe(1);
+  });
+});
+
+describe('salary bounds', () => {
+  it('serializes each bound under its own param and reads both back', () => {
+    const f = emptyFilters();
+    f.salaryMin = 100000;
+    f.salaryMax = 150000;
+    const p = filtersToParams(f);
+    expect(p.get('salary_min')).toBe('100000');
+    expect(p.get('salary_max')).toBe('150000');
+    const back = filtersFromParams(p);
+    expect(back.salaryMin).toBe(100000);
+    expect(back.salaryMax).toBe(150000);
+  });
+
+  it('writes nothing for an unset ceiling, and leaves the floor alone without one', () => {
+    expect(filtersToParams(emptyFilters()).has('salary_max')).toBe(false);
+    expect(filtersFromParams(new URLSearchParams('salary_max=150000')).salaryMin).toBeNull();
+    expect(filtersFromParams(new URLSearchParams('salary_min=100000')).salaryMax).toBeNull();
+  });
+
+  // The /jobs loader forwards the address bar to the search API verbatim, so a bound
+  // the server reads and this parser does not is applied to the first page with no
+  // control showing it — then dropped for good by the next filter change, which
+  // re-serializes from this model. Go reads both params with strconv.Atoi.
+  it('rejects the forms strconv.Atoi rejects, so the two ends cannot disagree', () => {
+    for (const raw of ['', ' ', 'abc', '1e5', '1.5', '0x10', ' 150000', '150000 ', 'Infinity']) {
+      const p = new URLSearchParams();
+      p.set('salary_min', raw);
+      p.set('salary_max', raw);
+      const f = filtersFromParams(p);
+      expect(f.salaryMin, `salary_min=${JSON.stringify(raw)}`).toBeNull();
+      expect(f.salaryMax, `salary_max=${JSON.stringify(raw)}`).toBeNull();
+    }
+  });
+
+  // ...and keeps every value it accepts, zero included: the server applies
+  // `salary_max=0`, so reading it as unset here would leave an empty list that no
+  // chip explains.
+  it('keeps the integer forms strconv.Atoi accepts', () => {
+    for (const [raw, want] of [
+      ['150000', 150000],
+      ['+150000', 150000],
+      ['0150000', 150000],
+      ['0', 0],
+    ] as const) {
+      const p = new URLSearchParams();
+      p.set('salary_max', raw);
+      expect(filtersFromParams(p).salaryMax, raw).toBe(want);
+    }
+  });
+
+  it('counts the range as one active filter, however many ends are set', () => {
+    const none = activeFilterCount(emptyFilters());
+    const f = emptyFilters();
+    f.salaryMax = 150000;
+    expect(activeFilterCount(f)).toBe(none + 1);
+    f.salaryMin = 100000;
+    expect(activeFilterCount(f)).toBe(none + 1);
+  });
+});
+
+describe('autoApplyAvailable', () => {
+  it('is absent from the URL when unset', () => {
+    expect(filtersToParams(emptyFilters()).has('auto_apply_available')).toBe(false);
+  });
+
+  it('serializes true and reads it back', () => {
+    const f = emptyFilters();
+    f.autoApplyAvailable = true;
+    const p = filtersToParams(f);
+    expect(p.get('auto_apply_available')).toBe('true');
+    expect(filtersFromParams(p).autoApplyAvailable).toBe(true);
+  });
+
+  // True-or-absent, like the backend facet it drives: turning the checkbox off
+  // must remove the param entirely, never write `auto_apply_available=false` —
+  // the index never carries an explicit false, so that value would silently
+  // filter to nothing instead of clearing the filter.
+  it('never serializes false — omits the param instead', () => {
+    const f = emptyFilters();
+    f.autoApplyAvailable = false;
+    expect(filtersToParams(f).has('auto_apply_available')).toBe(false);
+  });
+
+  it('counts as one active filter when true', () => {
+    const f = emptyFilters();
+    f.autoApplyAvailable = true;
+    expect(activeFilterCount(f)).toBe(1);
+  });
+});
+
+describe('the retired role facet', () => {
+  // `role` is gone from FACETS, so emptyFilters no longer seeds it and the generic
+  // param path has nothing to serialize. A stale `role=` in a URL is simply not read —
+  // the API reports it through meta.ignored_params instead.
+  it('is not a declared facet, so a stale param round-trips to nothing', () => {
+    expect(emptyFilters().facets.role).toBeUndefined();
+
+    const back = filtersFromParams(new URLSearchParams('role=senior_backend&category=backend'));
+    expect(back.facets.role).toBeUndefined();
+    expect(must(back.facets.category).include).toEqual(['backend']);
+  });
+});
+
+describe('canonicalQuery', () => {
+  it('is idempotent for a mixed include/exclude query', () => {
+    const q = 'skills=nodejs&skills_exclude=php';
+    const once = canonicalQuery(q);
+    expect(canonicalQuery(once)).toBe(once);
+    expect(new URLSearchParams(once).getAll('skills')).toEqual(['nodejs']);
+    expect(new URLSearchParams(once).getAll('skills_exclude')).toEqual(['php']);
+  });
+});
+
+// The ordering is a view preference, not part of WHICH jobs a saved search is about.
+// The digest matcher already reads a stored query for `q` and the filter only and
+// orders by its own clock (internal/engage/notify/match.go), so two sets differing
+// only by sort deliver identical mail — they are duplicates, and the key must say so.
+describe('savedSearchQuery', () => {
+  it('drops the ordering from the saved-search key', () => {
+    expect(new URLSearchParams(savedSearchQuery(withQuery('go', 'views'))).get('sort')).toBeNull();
+    expect(new URLSearchParams(savedSearchQuery(withQuery('go', 'newest'))).get('sort')).toBeNull();
+    expect(new URLSearchParams(savedSearchQuery(withQuery('go', 'match'))).get('sort')).toBeNull();
+  });
+
+  it('keeps every filter that decides which jobs are in the set', () => {
+    const q = savedSearchQuery({ ...withSkills({ include: ['go'] }), sort: 'views' });
+    expect(new URLSearchParams(q).getAll('skills')).toEqual(['go']);
+    expect(new URLSearchParams(q).get('sort')).toBeNull();
+  });
+
+  // The point of the fix: picking an ordering must not fork the saved search it came
+  // from into a second set that mails the same jobs.
+  it('makes two orderings of one filter set the same saved search', () => {
+    expect(savedSearchQuery(withQuery('go', 'views'))).toBe(savedSearchQuery(withQuery('go', 'newest')));
+    expect(canonicalQuery('q=go&sort=view_count')).toBe(canonicalQuery('q=go'));
+  });
+});
+
+describe('activeFilterCount', () => {
+  it('counts included and excluded values plus scalar filters', () => {
+    const f = withSkills({ include: ['a', 'b'], exclude: ['c'] });
+    f.visa = true;
+    f.salaryMin = 100000;
+    expect(activeFilterCount(f)).toBe(5); // 2 include + 1 exclude + visa + salary
+  });
+});
+
+describe('sign transitions (pure)', () => {
+  const inc = (): FacetState => ({ include: ['go'], exclude: [], matchAll: false });
+
+  it('signOf reports the value state', () => {
+    expect(signOf(emptyFacet(), 'go')).toBe('off');
+    expect(signOf({ include: ['go'], exclude: [], matchAll: false }, 'go')).toBe('include');
+    expect(signOf({ include: [], exclude: ['go'], matchAll: false }, 'go')).toBe('exclude');
+  });
+
+  it('facetSetSign moves a value between sets and does not mutate the input', () => {
+    const st = inc();
+    const next = facetSetSign(st, 'go', 'exclude');
+    expect(next).toEqual({ include: [], exclude: ['go'], matchAll: false });
+    expect(st).toEqual({ include: ['go'], exclude: [], matchAll: false }); // unchanged
+    expect(facetSetSign(next, 'go', 'off')).toEqual({ include: [], exclude: [], matchAll: false });
+  });
+
+  it('facetCycle goes off -> include -> exclude -> off', () => {
+    let st = emptyFacet();
+    st = facetCycle(st, 'go');
+    expect(signOf(st, 'go')).toBe('include');
+    st = facetCycle(st, 'go');
+    expect(signOf(st, 'go')).toBe('exclude');
+    st = facetCycle(st, 'go');
+    expect(signOf(st, 'go')).toBe('off');
+  });
+
+  it('facetPick adds to include, and removes when already selected in either set', () => {
+    expect(signOf(facetPick(emptyFacet(), 'go'), 'go')).toBe('include');
+    expect(signOf(facetPick({ include: ['go'], exclude: [], matchAll: false }, 'go'), 'go')).toBe('off');
+    expect(signOf(facetPick({ include: [], exclude: ['go'], matchAll: false }, 'go'), 'go')).toBe('off');
+  });
+
+  it('facetToggleSign flips include and exclude', () => {
+    expect(signOf(facetToggleSign({ include: ['go'], exclude: [], matchAll: false }, 'go'), 'go')).toBe('exclude');
+    expect(signOf(facetToggleSign({ include: [], exclude: ['go'], matchAll: false }, 'go'), 'go')).toBe('include');
+  });
+
+  it('facetAdd adds to include, no-op on blank or existing value', () => {
+    expect(facetAdd(emptyFacet(), '  go ').include).toEqual(['go']);
+    expect(facetAdd(inc(), 'go')).toEqual(inc()); // duplicate
+    expect(facetAdd(emptyFacet(), '   ')).toEqual(emptyFacet()); // blank
+    expect(facetAdd({ include: [], exclude: ['go'], matchAll: false }, 'go').exclude).toEqual(['go']); // already excluded -> no-op
+  });
+
+  it('facetRemove clears the value from both sets', () => {
+    expect(facetRemove({ include: ['go'], exclude: [], matchAll: false }, 'go')).toEqual(emptyFacet());
+    expect(facetRemove({ include: [], exclude: ['go'], matchAll: false }, 'go')).toEqual(emptyFacet());
+  });
+});
+
+// The sort vocabulary is `relevance` / `newest` / `match`, and its DEFAULT depends on
+// whether there is query text — mirroring the endpoint, which orders by relevance under
+// a query and by posting date without one (internal/api/handler/search.go). Serializing
+// the default therefore means writing nothing: the absence of `sort` is exactly how the
+// backend already spells both defaults. Every unrecognised value — including the retired
+// `sort=cv` — reads as that default rather than erroring, because shared links and saved
+// searches still carry old ones.
+describe('sort', () => {
+  it('ignores a legacy sort=cv param — falls back to the default feed, not an error', () => {
+    expect(filtersFromParams(new URLSearchParams('sort=cv'))).toEqual(filtersFromParams(new URLSearchParams('')));
+  });
+
+  // An unrecognised value is not a choice, so it parses to `null` — "unchosen" — and
+  // resolves through the contextual default like any other link that names no ordering.
+  it('reads an unknown sort value as no choice at all', () => {
+    expect(filtersFromParams(new URLSearchParams('sort=bogus')).sort).toBeNull();
+    expect(effectiveSort(filtersFromParams(new URLSearchParams('sort=bogus')))).toBe('newest');
+    expect(effectiveSort(filtersFromParams(new URLSearchParams('q=go&sort=bogus')))).toBe('relevance');
+  });
+
+  it('defaults to newest while browsing and to relevance under a query', () => {
+    expect(defaultSortFor('')).toBe('newest');
+    expect(defaultSortFor('go')).toBe('relevance');
+    expect(effectiveSort(filtersFromParams(new URLSearchParams('')))).toBe('newest');
+    expect(effectiveSort(filtersFromParams(new URLSearchParams('q=go')))).toBe('relevance');
+  });
+
+  it('writes nothing for either contextual default', () => {
+    expect(filtersToParams(emptyFilters()).get('sort')).toBeNull();
+    expect(filtersToParams(withQuery('go', 'relevance')).get('sort')).toBeNull();
+    expect(new URLSearchParams(savedSearchQuery(withSkills({ include: ['go'] }))).get('sort')).toBeNull();
+  });
+
+  // The bug this replaces: `newest` was the unconditional default, so it was never
+  // serialized, so a text search carried no `sort` and the server ranked by relevance
+  // while the control still read "Newest".
+  it('sends newest explicitly once it stops being the default', () => {
+    expect(filtersToParams(withQuery('go', 'newest')).get('sort')).toBe('posted_at');
+    expect(filtersFromParams(new URLSearchParams('q=go&sort=posted_at')).sort).toBe('newest');
+  });
+
+  it('round-trips the match sort', () => {
+    expect(filtersFromParams(new URLSearchParams('sort=match')).sort).toBe('match');
+    expect(filtersToParams({ ...emptyFilters(), sort: 'match' }).get('sort')).toBe('match');
+  });
+
+  it('keeps a match sort alongside the other filters', () => {
+    const f = filtersFromParams(new URLSearchParams('sort=match&countries=DE'));
+    expect(f.sort).toBe('match');
+    expect(must(f.facets.countries).include).toEqual(['DE']);
+  });
+
+  // A signed-out visitor opening a shared match link must keep the param: the server
+  // degrades the ordering for them, and signing in should then just work.
+  it('preserves the match sort through a params round trip', () => {
+    const f = filtersFromParams(new URLSearchParams('sort=match'));
+    expect(filtersToParams(f).get('sort')).toBe('match');
+  });
+
+  // Relevance has nothing to rank against once the query goes. The collapse is a pure
+  // function rather than an effect so the control and the serializer read one rule.
+  it('collapses relevance to newest when the query is empty', () => {
+    expect(effectiveSort(withQuery('', 'relevance'))).toBe('newest');
+    expect(effectiveSort(withQuery('go', 'relevance'))).toBe('relevance');
+    expect(effectiveSort(withQuery('', 'match'))).toBe('match');
+  });
+
+  it('serializes a stranded relevance selection as the browse default', () => {
+    expect(filtersToParams(withQuery('', 'relevance')).get('sort')).toBeNull();
+  });
+
+  // The bug the review caught: storing the RESOLVED default made "the browse feed
+  // defaulted to newest" look identical to "the caller asked for newest", so typing
+  // into the search box carried sort=posted_at into a text search and date-ordered it.
+  // An unchosen ordering is null, and null follows the query.
+  it('does not pin an unchosen ordering when a query is typed', () => {
+    const browsing = filtersFromParams(new URLSearchParams(''));
+    expect(browsing.sort).toBeNull();
+    expect(effectiveSort(browsing)).toBe('newest');
+
+    const searching = { ...browsing, q: 'golang' };
+    expect(effectiveSort(searching)).toBe('relevance');
+    expect(filtersToParams(searching).get('sort')).toBeNull();
+  });
+
+  // Why that matters beyond the ordering: savedSearchQuery is filtersToParams(...),
+  // so a spurious sort param makes the live filters compare unequal to the saved
+  // search they came from — which reads as "dirty" and creates a duplicate on save.
+  it('keeps a typed query comparing equal to the saved search it came from', () => {
+    const saved = savedSearchQuery(filtersFromParams(new URLSearchParams('q=go')));
+    const typed = savedSearchQuery({ ...filtersFromParams(new URLSearchParams('')), q: 'go' });
+
+    expect(typed).toBe(saved);
+  });
+
+  it('still sends an explicitly chosen newest under a query', () => {
+    expect(filtersToParams(withQuery('go', 'newest')).get('sort')).toBe('posted_at');
+  });
+
+  // Most viewed is never a contextual default, so it always serializes, and it round
+  // trips through the wire name the endpoint accepts.
+  it('round trips most-viewed through sort=view_count', () => {
+    expect(filtersToParams(withQuery('', 'views')).get('sort')).toBe('view_count');
+    expect(filtersToParams(withQuery('go', 'views')).get('sort')).toBe('view_count');
+    expect(filtersFromParams(new URLSearchParams('sort=view_count')).sort).toBe('views');
+  });
+
+  // `relevance` collapses to `newest` when the query empties because it has nothing left
+  // to rank against. `views` ranks by a stored figure, so it must survive that — the
+  // ordering the caller chose is still perfectly servable.
+  it('keeps most-viewed when the query is cleared', () => {
+    expect(effectiveSort(withQuery('', 'views'))).toBe('views');
+    expect(filtersToParams(withQuery('', 'views')).get('sort')).toBe('view_count');
+  });
+});
+
+// The option list is the sort control's visibility rule, kept pure and out of the
+// component so it can be tested at all — the same argument that put effectiveSort here.
+describe('sort options', () => {
+  // Match is offered to everyone now, including a visitor with no skills on file. It
+  // used to be hidden from them, which answered "why can I not sort by fit?" with
+  // nothing at all; the feed explains what the ordering needs instead (see
+  // matchSortNeedsSkills).
+  it('offers relevance only under a query, and match always', () => {
+    expect(sortOptionsFor('').map((o) => o.value)).toEqual(['newest', 'views', 'match']);
+    expect(sortOptionsFor('go').map((o) => o.value)).toEqual([
+      'relevance',
+      'newest',
+      'views',
+      'match',
+    ]);
+  });
+
+  // `views` ranks by a stored figure, so unlike `relevance` it needs no query text.
+  it('offers most-viewed unconditionally', () => {
+    for (const q of ['', 'go']) {
+      expect(sortOptionsFor(q).map((o) => o.value)).toContain('views');
+    }
+  });
+
+  // `relevance` is the one ordering that can still be asked for and not offered: it
+  // ranks against query text, and a shared link can arrive without any. The control must
+  // name what the server will actually serve — a select with nothing selected would be a
+  // blank control over a real ordering.
+  it('shows what the server will serve when the chosen ordering cannot be offered', () => {
+    expect(selectedSortFor(withQuery('', 'relevance'))).toBe('newest');
+    expect(selectedSortFor(withQuery('go', 'relevance'))).toBe('relevance');
+    expect(selectedSortFor(withQuery('', 'match'))).toBe('match');
+  });
+
+  it('always names an option that exists', () => {
+    for (const q of ['', 'go']) {
+      for (const sort of ['match', 'relevance', 'views', 'newest'] as const) {
+        const f = withQuery(q, sort);
+        expect(sortOptionsFor(q).map((o) => o.value)).toContain(selectedSortFor(f));
+      }
+    }
+  });
+});
+
+// Choosing a role suggestion under the header search box replaces the typed text
+// with the role facet. Both happen in ONE state change: applied separately, the
+// search would briefly AND a half-typed query against the role and return fewer
+// jobs than either filter alone — a suggestion that empties the page.
+describe('the two date bounds', () => {
+  // They are two questions, not two spellings of one: `posted_within_days` bounds the
+  // date the SOURCE states (which some boards restate every crawl) and
+  // `open_within_days` bounds when we first saw the posting. A test that only checked
+  // the round trip would pass with the two wired to the same field.
+  it('serializes each bound under its own param', () => {
+    const f = emptyFilters();
+    f.openWithinDays = 30;
+    f.postedWithinDays = 3;
+    const p = filtersToParams(f);
+    expect(p.get('open_within_days')).toBe('30');
+    expect(p.get('posted_within_days')).toBe('3');
+  });
+
+  it('reads each bound back independently', () => {
+    const f = filtersFromParams(new URLSearchParams('open_within_days=30&posted_within_days=3'));
+    expect(f.openWithinDays).toBe(30);
+    expect(f.postedWithinDays).toBe(3);
+  });
+
+  it('leaves the other bound null when only one is given', () => {
+    expect(filtersFromParams(new URLSearchParams('open_within_days=7')).postedWithinDays).toBeNull();
+    expect(filtersFromParams(new URLSearchParams('posted_within_days=7')).openWithinDays).toBeNull();
+  });
+
+  it('writes nothing for an unset open bound', () => {
+    expect(filtersToParams(emptyFilters()).has('open_within_days')).toBe(false);
+  });
+
+  // The same guard the backend applies: a value that cannot be a positive day count
+  // imposes no bound, rather than narrowing the list to nothing.
+  it('reads a non-positive or non-integer open bound as no bound', () => {
+    for (const raw of ['', '0', '-3', 'soon', '2.5', ' ']) {
+      const f = filtersFromParams(new URLSearchParams(`open_within_days=${encodeURIComponent(raw)}`));
+      expect(f.openWithinDays, `open_within_days=${JSON.stringify(raw)}`).toBeNull();
+    }
+  });
+
+  // The two parsers must agree on what a day count LOOKS like, not just on what it
+  // means. Go reads these params with strconv.Atoi, which rejects exponent, decimal and
+  // hex forms; Number() accepts all three. A link carrying ?open_within_days=1e2 would
+  // otherwise show an active "Last 100 days" chip over a list the server never bounded.
+  it('rejects the forms strconv.Atoi rejects, so the two ends cannot disagree', () => {
+    for (const raw of ['1e2', '1.0', '0x10', '7 ', ' 7', '007.0', 'Infinity']) {
+      const p = new URLSearchParams();
+      p.set('open_within_days', raw);
+      p.set('posted_within_days', raw);
+      const f = filtersFromParams(p);
+      expect(f.openWithinDays, `open_within_days=${JSON.stringify(raw)}`).toBeNull();
+      expect(f.postedWithinDays, `posted_within_days=${JSON.stringify(raw)}`).toBeNull();
+    }
+  });
+
+  // ...while the forms Atoi DOES accept keep working: leading zeros and a leading `+`
+  // both parse in Go, so rejecting them here would be the same divergence mirrored.
+  it('keeps the integer forms strconv.Atoi accepts', () => {
+    for (const [raw, want] of [
+      ['007', 7],
+      ['+7', 7],
+      ['7', 7],
+    ] as const) {
+      const p = new URLSearchParams();
+      p.set('open_within_days', raw);
+      expect(filtersFromParams(p).openWithinDays, raw).toBe(want);
+    }
+  });
+
+  // The Go side drops a bound past a century because the day-to-duration arithmetic
+  // wraps above ~106,751 days (see maxWithinDays). The parser mirrors it so the chip
+  // never claims a bound the server refused.
+  it('drops a bound further back than the server will honour', () => {
+    for (const raw of ['36501', '106752', '200000', '2147483647']) {
+      const p = new URLSearchParams();
+      p.set('open_within_days', raw);
+      expect(filtersFromParams(p).openWithinDays, raw).toBeNull();
+    }
+    const at = new URLSearchParams();
+    at.set('open_within_days', '36500');
+    expect(filtersFromParams(at).openWithinDays).toBe(36500);
+  });
+
+  it('counts each bound toward the filter badge', () => {
+    const none = activeFilterCount(emptyFilters());
+    const f = emptyFilters();
+    f.openWithinDays = 30;
+    expect(activeFilterCount(f)).toBe(none + 1);
+    f.postedWithinDays = 3;
+    expect(activeFilterCount(f)).toBe(none + 2);
+  });
+});
+
+// The feed's answer to "I picked Match and it did not rank anything". The ordering needs
+// the viewer's own skills; without them the server degrades to newest and, told nothing,
+// the visitor reads that as the sort being broken.
+describe('matchSortNeedsSkills', () => {
+  it('asks for skills only when match is the ordering in force', () => {
+    expect(matchSortNeedsSkills(withQuery('', 'match'), false)).toBe(true);
+    expect(matchSortNeedsSkills(withQuery('', 'newest'), false)).toBe(false);
+    expect(matchSortNeedsSkills(withQuery('', 'views'), false)).toBe(false);
+  });
+
+  it('stays quiet once the viewer has skills to rank against', () => {
+    expect(matchSortNeedsSkills(withQuery('', 'match'), true)).toBe(false);
+  });
+
+  // A query plus ?sort=match still means match: `relevance` is only the DEFAULT under a
+  // query, not an override of a stated one.
+  it('asks under a query too', () => {
+    expect(matchSortNeedsSkills(withQuery('go', 'match'), false)).toBe(true);
+  });
+
+  // Nobody asked for match here, so there is nothing to explain.
+  it('says nothing when no ordering was stated', () => {
+    expect(matchSortNeedsSkills(emptyFilters(), false)).toBe(false);
+  });
+});
+
+// A title suggestion's click wraps `q` in Meilisearch's quoting syntax (see
+// apiSuggestions.ts's quoteForTitleSearch) so the search engine matches it
+// correctly — but that wrapper is a query-construction detail, not what the
+// visitor typed, and must never reach a filter chip, the search box, or an
+// analytics event as literal quote marks.
+describe('displayQuery', () => {
+  it('strips a matching pair of wrapping quotes', () => {
+    expect(displayQuery('"Founding Engineer"')).toBe('Founding Engineer');
+  });
+
+  it('leaves unquoted text untouched', () => {
+    expect(displayQuery('Founding Engineer')).toBe('Founding Engineer');
+  });
+
+  it('leaves a lone quote character untouched', () => {
+    expect(displayQuery('"')).toBe('"');
+  });
+
+  it('leaves a quote at only one end untouched', () => {
+    expect(displayQuery('"Founding Engineer')).toBe('"Founding Engineer');
+    expect(displayQuery('Founding Engineer"')).toBe('Founding Engineer"');
+  });
+
+  it('leaves the empty string untouched', () => {
+    expect(displayQuery('')).toBe('');
+  });
+});

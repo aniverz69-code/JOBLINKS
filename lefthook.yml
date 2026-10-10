@@ -1,0 +1,227 @@
+pre-commit:
+  parallel: true
+  commands:
+    go-fmt:
+      glob: "*.go"
+      run: |
+        files=$(gofmt -l {staged_files})
+        if [ -n "$files" ]; then
+          echo "Not gofmt-clean:"
+          echo "$files"
+          exit 1
+        fi
+    go-vet:
+      glob: "*.go"
+      run: go vet ./...
+    # Ratchet mode: only fails on issues in lines this commit touches, not
+    # the pre-existing backlog. Same policy as CI (see .golangci.yml).
+    golangci-lint:
+      glob: "*.go"
+      run: golangci-lint run --new-from-rev=HEAD --allow-parallel-runners ./...
+    # Warn-only: govulncheck currently fails against HEAD from Go-toolchain
+    # stdlib CVEs (e.g. GO-2026-6088, fixed only in go1.26.6 — go.mod pins
+    # 1.25.12), not from anything a commit's diff introduces, so it can't
+    # hard-block yet without blocking every Go commit repo-wide. Flip to a
+    # failing command once the toolchain is bumped past the fix. Mirrors the
+    # path scope of .github/workflows/govulncheck.yml's pull_request trigger.
+    govulncheck:
+      glob:
+        - "**/*.go"
+        - "go.mod"
+        - "go.sum"
+      run: |
+        if ! command -v govulncheck >/dev/null 2>&1; then
+          echo "govulncheck not installed (go install golang.org/x/vuln/cmd/govulncheck@latest) - skipping"
+          exit 0
+        fi
+        govulncheck ./... || echo "govulncheck reported findings above (non-blocking for now, see lefthook.yml)"
+    # internal/platform/db is generated and committed, so a query edited without
+    # regenerating ships the OLD Go with every check green — nothing else here reads
+    # both halves. Same shape of check as design-system's check:dist, except that an
+    # untracked file counts too: a *new* generated file that was never committed is
+    # untracked rather than modified, and a plain diff misses it.
+    #
+    # Globbed on the migrations as well as the queries. A renamed column is the other
+    # way to make the generated code wrong, and sqlc.yaml decides what is generated at
+    # all — a config that stops matching disables this check while it still reports
+    # success.
+    sqlc-drift:
+      glob: "{migrations/*.sql,internal/platform/db/queries/*.sql,sqlc.yaml}"
+      # An explicit `if` rather than `A && B || C`, which reads like "if A and B, else C"
+      # and is not: a *failing* `make sqlc` would fall into C and report the code as
+      # stale, a message pointing away from the real problem.
+      #
+      # The question here is "did regenerating leave anything UNSTAGED", which is not the
+      # question CI asks. `git status --porcelain` reports two columns — index against
+      # HEAD, and worktree against index — so the bare form would count the staged
+      # generated changes being committed as drift, and block the very commit that fixes
+      # it. CI keeps the bare form correctly: a fresh clone has an empty index, so there
+      # the two questions have the same answer.
+      run: |
+        set -e
+        make sqlc
+        unstaged="$(git diff --name-only -- internal/platform/db)"
+        untracked="$(git ls-files --others --exclude-standard -- internal/platform/db)"
+        if [ -n "$unstaged$untracked" ]; then
+          printf '%s\n' $unstaged $untracked
+          echo 'Generated code was stale — make sqlc has just fixed it; stage the result.'
+          exit 1
+        fi
+
+    # Expand/contract for migrations, which was prose in AGENTS.md and read by nothing.
+    # It is here rather than only in CI because the mistakes it catches — a UNIQUE
+    # constraint that takes ACCESS EXCLUSIVE on a live table, a constraint added without
+    # NOT VALID — are cheap to fix while writing the migration and expensive once the
+    # file carries a version number someone else has applied.
+    #
+    # lefthook filters {staged_files} by the glob, so the script receives migrations and
+    # nothing else. Read .squawk.toml for why the invocation is split in two.
+    sql-migrations:
+      glob: "migrations/*.sql"
+      run: node scripts/check-migrations.mjs {staged_files}
+
+    # This repository navigates by document — AGENTS.md is a table of links into the
+    # blocks, each block links into its packages — and nothing has ever read those links.
+    # A rename breaks them silently, and a broken one is worse than a missing one: it
+    # sends the reader somewhere confidently.
+    #
+    # NO GLOB, THOUGH IT IS A CHECK ABOUT MARKDOWN. What breaks a link is renaming its
+    # TARGET, which is usually a .go or a .svelte file — a glob on *.md would miss exactly
+    # the commit that does the damage. A quarter of a second over the whole repository, so
+    # the precision is not worth the hole.
+    doc-links:
+      run: node scripts/check-doc-links.mjs
+
+    # THE ONLY HOOK HERE THAT PREVENTS SOMETHING RATHER THAN REPORTING IT.
+    #
+    # Everything else in this file is a convenience: it fails locally so CI does not
+    # have to, and skipping it costs a red run. This one is different. Once a
+    # credential reaches the remote it is leaked — it is in the history, in every
+    # clone and in the runner's cache — and the only real response is to revoke it.
+    # Rewriting history does not un-leak anything. This hook is the last moment at
+    # which that has not happened yet.
+    #
+    # .github/workflows/gitleaks.yml is NOT a redundant copy: it scans the whole
+    # history and cannot be bypassed, so it covers whoever never ran `lefthook
+    # install` or reached for --no-verify. But by the time it speaks the leak is
+    # real. Two controls, two moments, neither replaces the other.
+    #
+    # No glob — a secret is not a file type, and the one that matters will be in
+    # whatever nobody thought to list. `--staged` reads the index, so it sees
+    # exactly what is about to be committed rather than the working tree around it.
+    #
+    # Unlike govulncheck above, a missing binary FAILS. A scanner that quietly
+    # skips is worse than no scanner: it makes the commit look examined.
+    gitleaks:
+      run: |
+        if ! command -v gitleaks >/dev/null 2>&1; then
+          echo 'gitleaks is not installed (brew install gitleaks), and this hook will'
+          echo 'not pretend a commit was scanned when it was not. Install it, or use'
+          echo '--no-verify knowing CI scans the history anyway.'
+          exit 1
+        fi
+        gitleaks git --staged --no-banner
+    # A PACKAGE'S OWN ROOT IS NOT UNDER `**/`. The second pattern in each pair is
+    # what reaches vite.config.ts, svelte.config.js, eslint.config.js and — in web —
+    # cluster.js, which is the process that actually serves the site in production.
+    # Thirteen such files sat outside every hook here, checked one at a time with
+    # `lefthook run pre-commit --file`: only gitleaks fired, because it has no glob.
+    #
+    # NO `.oxlintrc.json` IN THESE TWO, THOUGH IT IS IN design-system-lint BELOW, AND
+    # the difference is what the command does with its glob. These two pass
+    # {staged_files} to eslint, which does not read that file and answers "File ignored
+    # because no matching configuration was supplied" — a warning where the intent was a
+    # check, so the glob would add noise and cover nothing. design-system-lint runs
+    # `pnpm run lint` over its whole package, which is `oxlint && eslint .`, so there
+    # the config genuinely decides the outcome. The web and extension CI jobs run that
+    # same whole-package lint on every push, which is what covers a rule switched off
+    # here.
+    web-lint:
+      root: "web/"
+      glob:
+        - "web/**/*.{js,ts,svelte}"
+        - "web/*.{js,ts,svelte}"
+      run: pnpm exec eslint {staged_files}
+    extension-lint:
+      root: "extension/"
+      glob:
+        - "extension/**/*.{js,ts,svelte}"
+        - "extension/*.{js,ts,svelte}"
+      run: pnpm exec eslint {staged_files}
+    # The remaining design-system-* commands mirror the fast checks from the
+    # `design-system` CI job (see .github/workflows/ci.yml) so a broken commit
+    # fails locally instead of burning a CI run. build-storybook and its CSS
+    # assertion are deliberately left out — too slow for pre-commit — so CI
+    # still catches those for anyone who skips hooks.
+    design-system-lint:
+      root: "design-system/"
+      glob:
+        - "design-system/**/*.{js,ts,svelte}"
+        - "design-system/*.{js,ts,svelte}"
+        - "design-system/.oxlintrc.json"
+      run: pnpm run lint
+    # svelte.config.js and vitest.setup.ts are read by `svelte-kit sync`, which is the
+    # first thing `check` runs, so a change to either can only be caught here.
+    design-system-check:
+      root: "design-system/"
+      glob:
+        - "design-system/**/*.{svelte,ts}"
+        - "design-system/*.{svelte,ts}"
+        - "design-system/{tsconfig.json,svelte.config.js}"
+      run: pnpm run check
+    design-system-test:
+      root: "design-system/"
+      glob:
+        - "design-system/src/**"
+        - "design-system/scripts/**"
+      run: pnpm run test
+    # check:dist rebuilds tokens/*.json -> dist/ and diffs — catches a token
+    # edited without `pnpm build`, which otherwise ships stale CSS with every
+    # check green.
+    design-system-dist:
+      root: "design-system/"
+      glob:
+        - "design-system/tokens/**"
+        - "design-system/scripts/build-tokens.mjs"
+        - "design-system/dist/**"
+      run: pnpm run check:dist
+    # BOTH PATTERNS, AND THE PAIR IS THE POINT. `**/` requires a separator, so
+    # `design-system/src/**/*.svelte` matches src/email/email-preview.svelte and
+    # NOT src/alert.svelte — which is 25 of the 26 primitives, every one of them a
+    # direct child of src/. Measured with lefthook 1.13.6: `--file
+    # design-system/src/alert.svelte` reported "skip, no matching staged files"
+    # while the nested path ran.
+    design-system-docs:
+      root: "design-system/"
+      glob:
+        - "design-system/docs/**"
+        - "design-system/src/*.svelte"
+        - "design-system/src/**/*.svelte"
+        - "design-system/src/*.stories.ts"
+      run: pnpm run validate:docs
+
+    # NO `root:` ON THESE TWO, AND THAT IS LOAD-BEARING. `root` does not merely set
+    # the working directory: lefthook first discards every staged file outside it,
+    # and only then applies the glob. So a command with `root: design-system/` can
+    # never be triggered by a change under web/, however its glob is written — and
+    # these two are the only commands here whose radius spans both sides. A colour
+    # literal or an unreachable primitive can be introduced from either, which is
+    # what the comment above them used to claim they caught. They did not: measured
+    # with lefthook 1.13.6, `--file web/src/lib/logo.ts` skipped both.
+    #
+    # `pnpm --dir` from the repository root instead, where every path means what it
+    # says. Not `--filter`: design-system and web are separate packages with their
+    # own lockfiles, not a pnpm workspace.
+    design-system-tokens:
+      glob:
+        - "design-system/src/*.svelte"
+        - "design-system/src/**/*.svelte"
+        - "design-system/scripts/check-token-coverage.mjs"
+        - "web/src/**/*.{svelte,ts,js}"
+      run: pnpm --dir design-system run check:tokens
+    design-system-adoption:
+      glob:
+        - "design-system/src/index.ts"
+        - "design-system/scripts/check-adoption.mjs"
+        - "web/src/**/*.{svelte,ts,js}"
+      run: pnpm --dir design-system run check:adoption

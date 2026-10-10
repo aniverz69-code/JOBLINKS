@@ -1,0 +1,31 @@
+package classify
+
+import "testing"
+
+// TestParse1C covers 1С category resolution: a title whose only role signal is 1С reads as backend
+// (server-side enterprise dev), but a more specific role word in the title still wins because the
+// 1С aliases sit last in the precedence table.
+func TestParse1C(t *testing.T) {
+	cases := []struct {
+		title   string
+		wantCat string
+	}{
+		{"Программист 1С", "backend"},
+		{"1С-разработчик", "backend"},
+		{"1C Developer", "backend"},
+		// A 1C analyst is a systems/business analyst on that platform — the fuller
+		// spellings the catalogue carries say so ("Системный аналитик 1С", "Аналитик
+		// 1С:ERP"). It read as data_analytics only because a bare "аналитик"
+		// fall-through used to claim every unrecognised analyst; that entry is gone
+		// and this one is explicit.
+		{"Аналитик 1С", "business_analysis"},
+		{"Аналитик 1С:ERP", "business_analysis"},
+		{"Системный аналитик 1С", "business_analysis"},
+		{"Тестировщик 1С", "qa"}, // qa wins over 1С→backend
+	}
+	for _, c := range cases {
+		if got := Parse(c.title).Category; got != c.wantCat {
+			t.Errorf("Parse(%q).Category = %q, want %q", c.title, got, c.wantCat)
+		}
+	}
+}

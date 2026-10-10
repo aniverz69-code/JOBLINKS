@@ -1,0 +1,159 @@
+package safehttp
+
+import (
+	"context"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"strings"
+	"testing"
+	"time"
+)
+
+func TestBlockedClassifiesAddresses(t *testing.T) {
+	cases := []struct {
+		ip   string
+		want bool
+	}{
+		{"127.0.0.1", true},       // loopback
+		{"::1", true},             // loopback v6
+		{"10.0.0.5", true},        // RFC1918
+		{"172.16.3.4", true},      // RFC1918
+		{"192.168.1.1", true},     // RFC1918
+		{"169.254.169.254", true}, // cloud metadata (link-local)
+		{"169.254.1.1", true},     // link-local
+		{"100.64.0.1", true},      // CGNAT / RFC6598 (cloud infra addressing)
+		{"100.127.255.255", true}, // CGNAT upper bound
+		{"0.0.0.0", true},         // unspecified
+		{"fc00::1", true},         // unique local v6
+		{"192.0.0.1", true},       // IETF protocol assignments
+		{"192.0.2.1", true},       // documentation (TEST-NET-1)
+		{"198.18.0.1", true},      // benchmarking
+		{"198.19.255.255", true},  // benchmarking upper bound
+		{"198.51.100.1", true},    // documentation (TEST-NET-2)
+		{"203.0.113.1", true},     // documentation (TEST-NET-3)
+		{"240.0.0.1", true},       // reserved
+		{"255.255.255.255", true}, // limited broadcast
+		{"8.8.8.8", false},        // public
+		{"1.1.1.1", false},        // public
+		{"93.184.216.34", false},  // public
+	}
+	for _, tc := range cases {
+		ip := net.ParseIP(tc.ip)
+		if ip == nil {
+			t.Fatalf("bad test ip %q", tc.ip)
+		}
+		if got := blocked(ip); got != tc.want {
+			t.Errorf("blocked(%s) = %v, want %v", tc.ip, got, tc.want)
+		}
+	}
+}
+
+func TestNewTransportWithProxy(t *testing.T) {
+	// Nil proxy must yield the direct transport (no Proxy set), identical to NewTransport.
+	if got := NewTransportWithProxy(time.Second, nil); got.Proxy != nil {
+		t.Error("nil proxy should leave Transport.Proxy unset")
+	}
+
+	// A non-nil proxy must be wired so every request resolves to it.
+	proxy, _ := url.Parse("http://user:pass@proxy.example:8080")
+	tr := NewTransportWithProxy(time.Second, proxy)
+	if tr.Proxy == nil {
+		t.Fatal("expected Transport.Proxy to be set")
+	}
+	got, err := tr.Proxy(httptest.NewRequestWithContext(context.Background(), http.MethodGet, "http://target.example/x", nil))
+	if err != nil {
+		t.Fatalf("proxy func: %v", err)
+	}
+	if got.String() != proxy.String() {
+		t.Errorf("proxy = %q, want %q", got, proxy)
+	}
+	// The guarded dialer is retained even with a proxy (it vets the proxy's IP).
+	if tr.DialContext == nil {
+		t.Error("proxied transport dropped the guarded DialContext")
+	}
+}
+
+func TestClientRefusesLoopback(t *testing.T) {
+	// A server on 127.0.0.1 represents an internal target an SSRF would try to reach.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	client := NewClient(5 * time.Second)
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, srv.URL, nil)
+	if err != nil {
+		t.Fatalf("NewRequestWithContext: %v", err)
+	}
+	resp, err := client.Do(req)
+	if err == nil {
+		resp.Body.Close()
+		t.Fatal("expected the guarded client to refuse a loopback target, got nil error")
+	}
+	if !strings.Contains(err.Error(), "blocked") {
+		t.Errorf("error %q does not mention the block", err)
+	}
+}
+
+func TestClientReachesPublicViaControl(t *testing.T) {
+	// A dialer whose Control passes (public IP) must still connect. We can't bind a
+	// public IP locally, so assert the guard lets a public address through by calling
+	// the control hook directly via a custom resolver-free dial to a public literal.
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	// Dial a public, non-routable-in-test address: it should fail with a network
+	// error (timeout/unreachable), NOT the safehttp block error.
+	d := GuardedDialer(200 * time.Millisecond)
+	_, err := d.DialContext(ctx, "tcp", "8.8.8.8:9")
+	if err != nil && strings.Contains(err.Error(), "blocked") {
+		t.Errorf("public address was blocked: %v", err)
+	}
+}
+
+// TestGuardedDialerRefusesLoopback covers the exported GuardedDialer directly: it is the
+// SSRF seam reused by transports that bypass NewClient (e.g. the Meta tls-client client,
+// which dials through it via WithDialer). A loopback target must be refused at connect time.
+func TestGuardedDialerRefusesLoopback(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	_, port, err := net.SplitHostPort(strings.TrimPrefix(srv.URL, "http://"))
+	if err != nil {
+		t.Fatalf("parse test server addr: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+
+	_, err = GuardedDialer(200*time.Millisecond).DialContext(ctx, "tcp", net.JoinHostPort("127.0.0.1", port))
+	if err == nil {
+		t.Fatal("expected GuardedDialer to refuse a loopback target, got nil error")
+	}
+	if !strings.Contains(err.Error(), "blocked") {
+		t.Errorf("error %q does not mention the block", err)
+	}
+}
+
+// TestNewTransportWithoutKeepAliveDoesNotReuseConnections pins the one transport that
+// opens a fresh connection per request, and keeps the guard while doing it.
+//
+// It exists for a platform whose server mishandles a reused connection. Measured against
+// profession.hu from the production host on 2026-09-06: over one keep-alive transport the
+// first two requests answered and every later one failed with EOF, and one of the two that
+// "answered" returned 379 bytes where the document is 76,403 — a truncated body a caller
+// cannot tell from a short sitemap. The same five requests over this transport all
+// answered in full.
+func TestNewTransportWithoutKeepAliveDoesNotReuseConnections(t *testing.T) {
+	tr := NewTransportWithoutKeepAlive(5 * time.Second)
+	if !tr.DisableKeepAlives {
+		t.Error("DisableKeepAlives is false; the transport would pool connections")
+	}
+	// The guard is the reason this package exists, so a transport that dropped it while
+	// fixing connection reuse would be a worse bug than the one it fixes.
+	if tr.DialContext == nil {
+		t.Error("DialContext is nil; the transport would dial unguarded")
+	}
+}

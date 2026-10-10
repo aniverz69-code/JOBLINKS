@@ -1,0 +1,196 @@
+version: "2"
+
+run:
+  timeout: 5m
+  # Without these, golangci-lint never parses the 222 //go:build integration files,
+  # and the depguard rules below are blind exactly where the layering test used to be.
+  build-tags:
+    - integration
+    - llmlive
+
+linters:
+  default: standard
+  enable:
+    - bodyclose
+    - sqlclosecheck
+    - noctx
+    - unconvert
+    - misspell
+    - depguard
+  settings:
+    depguard:
+      rules:
+        # Generated from internal/platform/arch/layering/blocks.go — one rule per
+        # block, denying every block at or above its layer. Same-layer pairs are denied
+        # in both directions: two blocks that can see each other are one block under two
+        # names. internal/platform/arch/layering holds the same table and reports the
+        # whole graph at once; this reports the offending import line.
+        block-platform:
+          files: ["**/internal/platform/**"]
+          deny:
+            - pkg: github.com/strelov1/freehire/internal/dict
+              desc: "platform is layer 1; dict is layer 2. A block imports only blocks strictly below it."
+            - pkg: github.com/strelov1/freehire/internal/ai
+              desc: "platform is layer 1; ai is layer 3. A block imports only blocks strictly below it."
+            - pkg: github.com/strelov1/freehire/internal/identity
+              desc: "platform is layer 1; identity is layer 3. A block imports only blocks strictly below it."
+            - pkg: github.com/strelov1/freehire/internal/candidate
+              desc: "platform is layer 1; candidate is layer 4. A block imports only blocks strictly below it."
+            - pkg: github.com/strelov1/freehire/internal/job
+              desc: "platform is layer 1; job is layer 5. A block imports only blocks strictly below it."
+            - pkg: github.com/strelov1/freehire/internal/application
+              desc: "platform is layer 1; application is layer 6. A block imports only blocks strictly below it."
+            - pkg: github.com/strelov1/freehire/internal/search
+              desc: "platform is layer 1; search is layer 6. A block imports only blocks strictly below it."
+            - pkg: github.com/strelov1/freehire/internal/engage
+              desc: "platform is layer 1; engage is layer 7. A block imports only blocks strictly below it."
+            - pkg: github.com/strelov1/freehire/internal/ingest
+              desc: "platform is layer 1; ingest is layer 7. A block imports only blocks strictly below it."
+            - pkg: github.com/strelov1/freehire/internal/api
+              desc: "platform is layer 1; api is layer 8. A block imports only blocks strictly below it."
+        block-dict:
+          files: ["**/internal/dict/**"]
+          deny:
+            - pkg: github.com/strelov1/freehire/internal/ai
+              desc: "dict is layer 2; ai is layer 3. A block imports only blocks strictly below it."
+            - pkg: github.com/strelov1/freehire/internal/identity
+              desc: "dict is layer 2; identity is layer 3. A block imports only blocks strictly below it."
+            - pkg: github.com/strelov1/freehire/internal/candidate
+              desc: "dict is layer 2; candidate is layer 4. A block imports only blocks strictly below it."
+            - pkg: github.com/strelov1/freehire/internal/job
+              desc: "dict is layer 2; job is layer 5. A block imports only blocks strictly below it."
+            - pkg: github.com/strelov1/freehire/internal/application
+              desc: "dict is layer 2; application is layer 6. A block imports only blocks strictly below it."
+            - pkg: github.com/strelov1/freehire/internal/search
+              desc: "dict is layer 2; search is layer 6. A block imports only blocks strictly below it."
+            - pkg: github.com/strelov1/freehire/internal/engage
+              desc: "dict is layer 2; engage is layer 7. A block imports only blocks strictly below it."
+            - pkg: github.com/strelov1/freehire/internal/ingest
+              desc: "dict is layer 2; ingest is layer 7. A block imports only blocks strictly below it."
+            - pkg: github.com/strelov1/freehire/internal/api
+              desc: "dict is layer 2; api is layer 8. A block imports only blocks strictly below it."
+        block-ai:
+          files: ["**/internal/ai/**"]
+          deny:
+            - pkg: github.com/strelov1/freehire/internal/identity
+              desc: "ai is layer 3; identity is layer 3. A block imports only blocks strictly below it."
+            - pkg: github.com/strelov1/freehire/internal/candidate
+              desc: "ai is layer 3; candidate is layer 4. A block imports only blocks strictly below it."
+            - pkg: github.com/strelov1/freehire/internal/job
+              desc: "ai is layer 3; job is layer 5. A block imports only blocks strictly below it."
+            - pkg: github.com/strelov1/freehire/internal/application
+              desc: "ai is layer 3; application is layer 6. A block imports only blocks strictly below it."
+            - pkg: github.com/strelov1/freehire/internal/search
+              desc: "ai is layer 3; search is layer 6. A block imports only blocks strictly below it."
+            - pkg: github.com/strelov1/freehire/internal/engage
+              desc: "ai is layer 3; engage is layer 7. A block imports only blocks strictly below it."
+            - pkg: github.com/strelov1/freehire/internal/ingest
+              desc: "ai is layer 3; ingest is layer 7. A block imports only blocks strictly below it."
+            - pkg: github.com/strelov1/freehire/internal/api
+              desc: "ai is layer 3; api is layer 8. A block imports only blocks strictly below it."
+        block-identity:
+          files: ["**/internal/identity/**"]
+          deny:
+            - pkg: github.com/strelov1/freehire/internal/ai
+              desc: "identity is layer 3; ai is layer 3. A block imports only blocks strictly below it."
+            - pkg: github.com/strelov1/freehire/internal/candidate
+              desc: "identity is layer 3; candidate is layer 4. A block imports only blocks strictly below it."
+            - pkg: github.com/strelov1/freehire/internal/job
+              desc: "identity is layer 3; job is layer 5. A block imports only blocks strictly below it."
+            - pkg: github.com/strelov1/freehire/internal/application
+              desc: "identity is layer 3; application is layer 6. A block imports only blocks strictly below it."
+            - pkg: github.com/strelov1/freehire/internal/search
+              desc: "identity is layer 3; search is layer 6. A block imports only blocks strictly below it."
+            - pkg: github.com/strelov1/freehire/internal/engage
+              desc: "identity is layer 3; engage is layer 7. A block imports only blocks strictly below it."
+            - pkg: github.com/strelov1/freehire/internal/ingest
+              desc: "identity is layer 3; ingest is layer 7. A block imports only blocks strictly below it."
+            - pkg: github.com/strelov1/freehire/internal/api
+              desc: "identity is layer 3; api is layer 8. A block imports only blocks strictly below it."
+        block-candidate:
+          files: ["**/internal/candidate/**"]
+          deny:
+            - pkg: github.com/strelov1/freehire/internal/job
+              desc: "candidate is layer 4; job is layer 5. A block imports only blocks strictly below it."
+            - pkg: github.com/strelov1/freehire/internal/application
+              desc: "candidate is layer 4; application is layer 6. A block imports only blocks strictly below it."
+            - pkg: github.com/strelov1/freehire/internal/search
+              desc: "candidate is layer 4; search is layer 6. A block imports only blocks strictly below it."
+            - pkg: github.com/strelov1/freehire/internal/engage
+              desc: "candidate is layer 4; engage is layer 7. A block imports only blocks strictly below it."
+            - pkg: github.com/strelov1/freehire/internal/ingest
+              desc: "candidate is layer 4; ingest is layer 7. A block imports only blocks strictly below it."
+            - pkg: github.com/strelov1/freehire/internal/api
+              desc: "candidate is layer 4; api is layer 8. A block imports only blocks strictly below it."
+        block-job:
+          files: ["**/internal/job/**"]
+          deny:
+            - pkg: github.com/strelov1/freehire/internal/application
+              desc: "job is layer 5; application is layer 6. A block imports only blocks strictly below it."
+            - pkg: github.com/strelov1/freehire/internal/search
+              desc: "job is layer 5; search is layer 6. A block imports only blocks strictly below it."
+            - pkg: github.com/strelov1/freehire/internal/engage
+              desc: "job is layer 5; engage is layer 7. A block imports only blocks strictly below it."
+            - pkg: github.com/strelov1/freehire/internal/ingest
+              desc: "job is layer 5; ingest is layer 7. A block imports only blocks strictly below it."
+            - pkg: github.com/strelov1/freehire/internal/api
+              desc: "job is layer 5; api is layer 8. A block imports only blocks strictly below it."
+        block-application:
+          files: ["**/internal/application/**"]
+          deny:
+            - pkg: github.com/strelov1/freehire/internal/search
+              desc: "application is layer 6; search is layer 6. A block imports only blocks strictly below it."
+            - pkg: github.com/strelov1/freehire/internal/engage
+              desc: "application is layer 6; engage is layer 7. A block imports only blocks strictly below it."
+            - pkg: github.com/strelov1/freehire/internal/ingest
+              desc: "application is layer 6; ingest is layer 7. A block imports only blocks strictly below it."
+            - pkg: github.com/strelov1/freehire/internal/api
+              desc: "application is layer 6; api is layer 8. A block imports only blocks strictly below it."
+        block-search:
+          files: ["**/internal/search/**"]
+          deny:
+            - pkg: github.com/strelov1/freehire/internal/application
+              desc: "search is layer 6; application is layer 6. A block imports only blocks strictly below it."
+            - pkg: github.com/strelov1/freehire/internal/engage
+              desc: "search is layer 6; engage is layer 7. A block imports only blocks strictly below it."
+            - pkg: github.com/strelov1/freehire/internal/ingest
+              desc: "search is layer 6; ingest is layer 7. A block imports only blocks strictly below it."
+            - pkg: github.com/strelov1/freehire/internal/api
+              desc: "search is layer 6; api is layer 8. A block imports only blocks strictly below it."
+        block-engage:
+          files: ["**/internal/engage/**"]
+          deny:
+            - pkg: github.com/strelov1/freehire/internal/ingest
+              desc: "engage is layer 7; ingest is layer 7. A block imports only blocks strictly below it."
+            - pkg: github.com/strelov1/freehire/internal/api
+              desc: "engage is layer 7; api is layer 8. A block imports only blocks strictly below it."
+        block-ingest:
+          files: ["**/internal/ingest/**"]
+          deny:
+            - pkg: github.com/strelov1/freehire/internal/engage
+              desc: "ingest is layer 7; engage is layer 7. A block imports only blocks strictly below it."
+            - pkg: github.com/strelov1/freehire/internal/api
+              desc: "ingest is layer 7; api is layer 8. A block imports only blocks strictly below it."
+    errcheck:
+      # Best-effort cleanup calls whose error has no actionable recipient: a deferred
+      # Close/RemoveAll/Rollback runs after the operation it's cleaning up already
+      # succeeded or failed for its own, already-handled reason.
+      exclude-functions:
+        - (io.Closer).Close
+        - os.RemoveAll
+        - (github.com/jackc/pgx/v5.Tx).Rollback
+    misspell:
+      # Real words in other languages (board-ingest dictionaries, non-English test
+      # fixtures), not English typos.
+      ignore-rules:
+        - administrativo
+        - processos
+        - operacional
+        - indonesien
+        - profissional
+        - educacional
+
+formatters:
+  enable:
+    - gofmt
+    - goimports

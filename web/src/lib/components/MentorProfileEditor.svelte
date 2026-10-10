@@ -1,0 +1,399 @@
+<script lang="ts">
+  import { onMount } from 'svelte';
+  import { resolve } from '$app/paths';
+  import { api } from '$lib/api';
+  import {
+    browserTimezone,
+    companyLabel,
+    profileInputFromProfile,
+    seedFormFromSuggestions,
+    seniorityLabel,
+  } from '$lib/mentorship';
+  import { SENIORITY_VALUES } from '$lib/generated/contracts';
+  import { errorMessage } from '$lib/utils';
+  import { previewMentorSlug, resolveMentorSlugForSubmit } from '$lib/mentorSlugPreview';
+  import { Badge, Button, Card, Input } from '$lib/ui';
+  import CompanyPicker from './CompanyPicker.svelte';
+  import TokenInput from '$lib/components/facets/TokenInput.svelte';
+  import type { MentorProfileInput, OwnMentorProfile } from '$lib/types';
+
+  let { profile = $bindable() }: { profile: OwnMentorProfile | null } = $props();
+
+  // Matches internal/engage/mentorship's slugPattern. Used only to hint at an invalid
+  // MANUALLY-typed address — the backend is still the one that refuses it on submit.
+  const slugPattern = /^[a-z0-9]+(-[a-z0-9]+)*$/;
+
+  // The browser's zone as the default for a NEW profile only. An existing one keeps what
+  // the mentor chose: their availability is resolved through it, and silently re-reading
+  // it from the machine they happen to be on would move every stated hour.
+  const browserZone = browserTimezone();
+
+  function blank(): MentorProfileInput {
+    return {
+      company_slug: '',
+      slug: '',
+      name: '',
+      headline: '',
+      bio: '',
+      topics: [],
+      languages: [],
+      timezone: browserZone,
+      session_minutes: 60,
+      buffer_before_minutes: 0,
+      buffer_after_minutes: 15,
+      notice_minutes: 120,
+      horizon_days: 30,
+      meeting_url: '',
+      show_photo: false,
+      seniority: '',
+    };
+  }
+
+  let form = $state<MentorProfileInput>(profile ? profileInputFromProfile(profile) : blank());
+  let saving = $state(false);
+  let error = $state('');
+
+  // Live-derives "Your URL" from the name while the mentor hasn't edited the URL
+  // directly — the moment they do, their choice stands even if they keep editing the
+  // name. Create mode only: an existing profile's slug never changes (see
+  // internal/engage/mentorship/profile.go:95-97), so there is nothing to preview.
+  let slugTouched = $state(false);
+  $effect(() => {
+    if (!profile && !slugTouched) {
+      form.slug = previewMentorSlug(form.name);
+    }
+  });
+
+  // Whether the caller has connected a calendar.events grant — the same status call
+  // /my/integrations makes, not a mentorship-specific endpoint. When true, a booking
+  // gets a real Meet link automatically and the static field below has nothing left to
+  // guarantee, so the backend accepts it empty (see mentorship.validateMeetingURL).
+  let hasMentorCalendar = $state(false);
+  onMount(async () => {
+    try {
+      const status = await api.gmailStatus();
+      hasMentorCalendar = status.mentor_calendar_connected === true;
+    } catch {
+      // Best-effort: the field falls back to its ordinary required state.
+    }
+  });
+
+  // A one-time prefill for a brand-new profile only: fetched once on mount, seeded into
+  // the still-blank form, and never touched again — every field stays an ordinary,
+  // independently editable input from here on. A failed fetch simply leaves the form at
+  // its ordinary blank defaults; it must never block rendering the form.
+  if (!profile) {
+    onMount(async () => {
+      try {
+        const suggestions = await api.mentorProfileSuggestions();
+        form = seedFormFromSuggestions(form, suggestions);
+      } catch {
+        // Best-effort: the form already has its ordinary blank defaults.
+      }
+    });
+  }
+
+  // Chip helpers for the two open-vocabulary lists. A duplicate (exact string match) is
+  // simply not added again rather than shown twice — the backend also dedupes on save,
+  // but a chip that visibly repeats itself while typing reads as broken.
+  function addTopic(value: string) {
+    const v = value.trim();
+    if (v && !form.topics.includes(v)) form.topics = [...form.topics, v];
+  }
+  function removeTopic(value: string) {
+    form.topics = form.topics.filter((t) => t !== value);
+  }
+  function addLanguage(value: string) {
+    const v = value.trim();
+    if (v && !form.languages.includes(v)) form.languages = [...form.languages, v];
+  }
+  function removeLanguage(value: string) {
+    form.languages = form.languages.filter((l) => l !== value);
+  }
+
+  // Also reachable while withdrawn: the fields stay editable so a mentor can correct
+  // something before resubmitting, and the update endpoint carries no status guard.
+  async function save() {
+    saving = true;
+    error = '';
+    try {
+      const body = {
+        ...form,
+        // The field shows the live preview so the mentor sees a plausible address, but
+        // that preview is not a submission unless they deliberately touched it — see
+        // resolveMentorSlugForSubmit.
+        slug: resolveMentorSlugForSubmit(form.slug, slugTouched),
+      };
+      profile = profile ? await api.updateMentorProfile(body) : await api.createMentorProfile(body);
+    } catch (e) {
+      error = errorMessage(e, 'The profile could not be saved.');
+    } finally {
+      saving = false;
+    }
+  }
+
+  // Withdrawal is destructive in a way pausing is not: it cancels every confirmed future
+  // booking and tells each seeker. So it asks first, and says what it will do.
+  let withdrawing = $state(false);
+  let confirmingWithdrawal = $state(false);
+
+  async function withdraw() {
+    withdrawing = true;
+    error = '';
+    try {
+      await api.withdrawMentorProfile();
+      // The profile is MARKED withdrawn, not deleted — past sessions and their reviews
+      // hang off the row, and the account's one-profile slot stays occupied by it. Local
+      // state reflects that rather than clearing to null: a null profile would offer the
+      // "Submit for review" form, whose POST would 409 against the still-occupied slot.
+      profile = profile && { ...profile, status: 'withdrawn', paused: false };
+      confirmingWithdrawal = false;
+    } catch (e) {
+      error = errorMessage(e, 'The profile could not be withdrawn.');
+    } finally {
+      withdrawing = false;
+    }
+  }
+
+  async function togglePause() {
+    if (!profile) return;
+    saving = true;
+    error = '';
+    try {
+      profile = await api.pauseMentorProfile(!profile.paused);
+    } catch (e) {
+      error = errorMessage(e, 'That could not be changed.');
+    } finally {
+      saving = false;
+    }
+  }
+
+  // Resubmitting is exactly what a first-time submission is: back to pending, no special
+  // treatment for having been a mentor before.
+  let reactivating = $state(false);
+
+  async function reactivate() {
+    reactivating = true;
+    error = '';
+    try {
+      profile = await api.reactivateMentorProfile();
+    } catch (e) {
+      error = errorMessage(e, 'The profile could not be resubmitted.');
+    } finally {
+      reactivating = false;
+    }
+  }
+</script>
+
+<Card class="flex flex-col gap-4 p-4">
+  <div class="flex flex-wrap items-center justify-between gap-2">
+    <h2 class="text-sm font-medium">Your mentor profile</h2>
+    {#if profile}
+      <div class="flex items-center gap-2">
+        <Badge variant={profile.status === 'approved' ? 'secondary' : 'outline'}>
+          {profile.status === 'approved' && profile.paused ? 'paused' : profile.status}
+        </Badge>
+        {#if profile.status === 'approved'}
+          <!-- Pausing needs no moderator, and confirmed bookings stand through it. -->
+          <Button variant="ghost" size="sm" disabled={saving} onclick={togglePause}>
+            {profile.paused ? 'Resume' : 'Pause'}
+          </Button>
+        {/if}
+      </div>
+    {/if}
+  </div>
+
+  {#if profile && profile.status === 'pending'}
+    <p class="text-muted-foreground text-sm">
+      A moderator reviews new profiles by hand. Yours is not in the directory yet.
+    </p>
+  {/if}
+
+  {#if profile}
+    <p class="text-muted-foreground text-sm">
+      Your timezone and session length live on the <a class="underline" href={resolve('/my/mentorship/schedule')}>schedule page</a> now, alongside when you're free.
+    </p>
+  {/if}
+
+  <div class="grid gap-3 sm:grid-cols-2">
+    <label class="text-sm">
+      <span class="text-muted-foreground">Your name, as seekers will see it</span>
+      <Input
+        bind:value={form.name}
+        class="mt-1 w-full"
+      />
+    </label>
+
+    {#if profile}
+      <!-- Neither field changes after creation — see profile.go:95-97 — so an existing
+           profile shows them as facts, not as disabled form controls. -->
+      <div class="text-sm">
+        <span class="text-muted-foreground">Company</span>
+        <!-- company_name is only populated on the JOINED reads (public profile,
+             directory) — the owner's own read carries the row as stored, so this falls
+             back to the slug exactly as ReferralsView.svelte already does. companyLabel's
+             own further fallback to "Independent" covers a mentor who chose no company
+             at all — see mentor-profile-optional-company. -->
+        <p class="mt-1">{companyLabel(profile.company_name, profile.company_slug)}</p>
+      </div>
+
+      <div class="text-sm">
+        <span class="text-muted-foreground">Your URL</span>
+        <p class="mt-1">/mentors/{profile.slug}</p>
+      </div>
+    {:else}
+      <label class="text-sm">
+        <span class="text-muted-foreground">Your company — optional</span>
+        <CompanyPicker onSelect={(c) => (form.company_slug = c?.slug ?? '')} />
+        <p class="text-muted-foreground mt-1 text-xs">
+          Leave blank if you're independent or your employer isn't listed.
+        </p>
+      </label>
+
+      <label class="text-sm">
+        <span class="text-muted-foreground">Your URL</span>
+        <input
+          bind:value={form.slug}
+          oninput={() => (slugTouched = true)}
+          class="border-input bg-background mt-1 w-full rounded-md border px-3 py-2 text-sm"
+        />
+        {#if form.slug && !slugPattern.test(form.slug)}
+          <p class="text-destructive mt-1 text-xs">
+            Lowercase letters, digits and single hyphens only.
+          </p>
+        {:else}
+          <p class="text-muted-foreground mt-1 text-xs">
+            Lowercase letters, digits and hyphens. Leave it blank to generate one from
+            your name.
+          </p>
+        {/if}
+      </label>
+    {/if}
+
+    <label class="text-sm">
+      <span class="text-muted-foreground">Headline</span>
+      <Input
+        bind:value={form.headline}
+        class="mt-1 w-full"
+      />
+    </label>
+
+    <label class="text-sm">
+      <span class="text-muted-foreground">Topics</span>
+      <div class="mt-1">
+        <TokenInput
+          tokens={form.topics}
+          onAdd={addTopic}
+          onRemove={removeTopic}
+          placeholder="Type a topic, press Enter"
+        />
+      </div>
+    </label>
+
+    <label class="text-sm">
+      <span class="text-muted-foreground">Languages</span>
+      <div class="mt-1">
+        <TokenInput
+          tokens={form.languages}
+          onAdd={addLanguage}
+          onRemove={removeLanguage}
+          placeholder="Type a language, press Enter"
+        />
+      </div>
+    </label>
+
+    <label class="text-sm sm:col-span-2">
+      <span class="text-muted-foreground">
+        {#if hasMentorCalendar}
+          Meeting link — optional. Your connected calendar mints a real Google Meet link
+          for every booking, so you only need this as a fallback.
+        {:else}
+          Meeting link — a room you own. Only booked seekers ever see it. Don't want to
+          paste one? Connect <a class="underline" href={resolve('/my/integrations')}
+            >Mentor calendar</a
+          > instead and we'll create a fresh Meet link for every booking.
+        {/if}
+      </span>
+      <Input
+        bind:value={form.meeting_url}
+        class="mt-1 w-full"
+      />
+    </label>
+
+    <label class="text-sm">
+      <span class="text-muted-foreground">Seniority — optional</span>
+      <select
+        bind:value={form.seniority}
+        class="border-input bg-background mt-1 h-9 w-full rounded-md border px-2 text-sm"
+      >
+        <option value="">Prefer not to say</option>
+        {#each SENIORITY_VALUES as value (value)}
+          <option {value}>{seniorityLabel(value)}</option>
+        {/each}
+      </select>
+    </label>
+
+    <label class="flex items-center gap-2 text-sm sm:col-span-2">
+      <input type="checkbox" bind:checked={form.show_photo} class="h-4 w-4" />
+      <span class="text-muted-foreground">
+        Show my account's CV photo on my public mentor card and profile. Off by default —
+        you decide whether that photo belongs here too.
+      </span>
+    </label>
+
+    <label class="text-sm sm:col-span-2">
+      <span class="text-muted-foreground">About you</span>
+      <textarea
+        bind:value={form.bio}
+        rows="4"
+        class="border-input bg-background mt-1 w-full rounded-md border px-3 py-2 text-sm"
+      ></textarea>
+    </label>
+  </div>
+
+  <div>
+    <Button disabled={saving} onclick={save}>
+      {saving ? 'Saving…' : profile ? 'Save changes' : 'Submit for review'}
+    </Button>
+  </div>
+
+  {#if profile}
+    <div class="border-t pt-4">
+      {#if profile.status === 'withdrawn'}
+        <p class="text-muted-foreground mb-2 text-sm">
+          You withdrew this profile. Resubmitting sends it back for review — like a first
+          submission, with no special treatment for having been a mentor before.
+        </p>
+        <Button variant="ghost" size="sm" disabled={reactivating} onclick={reactivate}>
+          {reactivating ? 'Submitting…' : 'Submit for review again'}
+        </Button>
+      {:else if confirmingWithdrawal}
+        <p class="text-sm font-medium">Withdraw your profile?</p>
+        <p class="text-muted-foreground mt-1 text-sm">
+          Every confirmed session still ahead is cancelled and each person told. Sessions
+          that already happened stay in your history.
+        </p>
+        <div class="mt-3 flex gap-2">
+          <Button variant="destructive" disabled={withdrawing} onclick={withdraw}>
+            {withdrawing ? 'Withdrawing…' : 'Withdraw'}
+          </Button>
+          <Button
+            variant="ghost"
+            disabled={withdrawing}
+            onclick={() => (confirmingWithdrawal = false)}
+          >
+            Keep it
+          </Button>
+        </div>
+      {:else}
+        <Button variant="ghost" size="sm" onclick={() => (confirmingWithdrawal = true)}>
+          Withdraw profile
+        </Button>
+      {/if}
+    </div>
+  {/if}
+
+  {#if error}
+    <p class="text-destructive text-sm">{error}</p>
+  {/if}
+</Card>

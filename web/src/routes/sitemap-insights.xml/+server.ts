@@ -1,0 +1,18 @@
+import { loadInsightsGate } from '$lib/server/insights';
+import { coveredCategories, rankedQualifyingRoles } from '$lib/insights';
+import { insightsPaths, urlsetXml, xmlResponse } from '$lib/sitemap';
+import type { RequestHandler } from './$types';
+
+// Sub-sitemap for the insights landing pages, referenced by the sitemap index. It
+// lists only categories that clear the data-quality gate (via coveredCategories),
+// so a thin/gated-out category never appears — matching what the pages actually
+// serve (uncovered → 404).
+export const GET: RequestHandler = async ({ url, fetch }) => {
+  const roles = await loadInsightsGate(fetch);
+  const categories = coveredCategories(roles).map((c) => c.category);
+  const leaves = rankedQualifyingRoles(roles).map((r): [string, string] => [r.category, r.seniority]);
+  const entries = insightsPaths(categories, leaves).map((path) => ({
+    loc: `${url.origin}${path}`,
+  }));
+  return xmlResponse(urlsetXml(entries));
+};

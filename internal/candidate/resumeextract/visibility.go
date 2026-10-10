@@ -1,0 +1,93 @@
+package resumeextract
+
+// This file holds the Talent Network public-profile projections (see
+// openspec/changes/talent-network-profile-visibility). It is deliberately NOT part of
+// structured.go: cmd/gen-contracts generates TypeScript from structured.go alone, and
+// these projections are pure Go-side view logic with no wire contract of their own yet
+// — the handler that serves them (a later task) decides what crosses the wire and gets
+// its own generated type then, rather than this file leaking one prematurely.
+
+// currentEmployerLabel is the generic label anonymous mode substitutes for a "current"
+// experience entry's employer name. This is the literal wording from design.md's
+// "Anonymous-mode masking is Professional() plus one extra step" decision — not a
+// placeholder to be reworded later.
+const currentEmployerLabel = "Current employer"
+
+// isCurrentEntry reports whether an experience entry is ongoing. Current is the model's
+// own signal, but the extraction contract defines an unstated End the same way ("for a
+// role that has not ended ... set current to true and end to null" — resumeextract.go's
+// systemPrompt), so a nil End is treated as ongoing too: a fail-closed guard against a
+// model that complies with end:null but slips on the accompanying current:true, since
+// under-masking a still-current employer is exactly what this feature exists to prevent.
+func isCurrentEntry(e Experience) bool {
+	return e.Current || e.End == nil
+}
+
+// stripProjectLinks blanks Link on a copy of every project entry, leaving name and
+// highlights untouched — a project's Link (often "github.com/<handle>" or a personal
+// portfolio domain) is a stronger de-anonymizing identifier than the name Professional()
+// already strips, so both public projections below must not carry it either. Masking
+// only the field, not the whole entry, mirrors Anonymous' own treatment of a masked
+// experience entry's employer: the rest of the project (name, highlights) is legitimate
+// signal.
+//
+// Copy before mutating: Professional's Projects slice shares its backing array with
+// s.Projects, and this must not mutate the caller's Structured (same concern Anonymous
+// already documents for Experience).
+func stripProjectLinks(projects []Project) []Project {
+	if len(projects) == 0 {
+		return projects
+	}
+	stripped := make([]Project, len(projects))
+	copy(stripped, projects)
+	for i := range stripped {
+		stripped[i].Link = ""
+	}
+	return stripped
+}
+
+// Anonymous is Structured's anonymous-mode projection for the Talent Network public
+// page: Professional() (already contact-free — no name/email/phone/links) with every
+// "current" experience entry's employer replaced by the generic label above, and every
+// project's Link stripped (stripProjectLinks — a project link is a stronger
+// de-anonymizing identifier than the name Professional() already withholds). All other
+// entries pass through unmodified: the design deliberately scopes the mask to the
+// current role(s), not the whole work history, since the rest of the history is useful
+// signal for anyone else the candidate shares the link with (see design.md, "Risks /
+// Trade-offs").
+//
+// The mask is content-based (Current), not positional: Structured.Experience's
+// ordering (newest-first vs. oldest-first) is nowhere documented or enforced by the LLM
+// extraction prompt or schema, so "the newest entry" cannot be determined reliably by
+// array position alone (see design.md, "Masking is content-based, not positional."). If
+// more than one entry reads as current (concurrent roles, or a
+// sloppily-filled CV), every matching entry is masked — there is no reliable signal for
+// picking "the real" one. If zero entries read as current, none are masked.
+func (s Structured) Anonymous() Professional {
+	p := s.Professional()
+	p.Projects = stripProjectLinks(p.Projects)
+
+	if len(p.Experience) == 0 {
+		return p
+	}
+
+	// Copy before mutating: Professional's Experience slice shares its backing array
+	// with s.Experience, and masking must not leak back into the caller's Structured.
+	masked := make([]Experience, len(p.Experience))
+	copy(masked, p.Experience)
+	for i := range masked {
+		if isCurrentEntry(masked[i]) {
+			masked[i].Company = currentEmployerLabel
+		}
+	}
+	p.Experience = masked
+
+	return p
+}
+
+// There was a Public projection here — Professional plus the candidate's name — for the
+// third visibility mode. Migration 0148 retired that mode: the product no longer asks a
+// candidate how much of themselves to disclose, so no caller can select a name-bearing
+// projection any more. It is deleted rather than kept "in case": a projection nothing may
+// reach is not a seam, it is one careless call away from publishing a name on a page that
+// promised not to.

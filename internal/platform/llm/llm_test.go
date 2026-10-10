@@ -1,0 +1,359 @@
+package llm
+
+import (
+	"context"
+	"errors"
+	"testing"
+	"time"
+
+	"github.com/tmc/langchaingo/llms"
+)
+
+// fakeModel is a stub llms.Model returning a canned response, capturing the
+// messages it was sent. genInfo, when set, is attached to the choice as
+// langchaingo's usage-token map.
+type fakeModel struct {
+	resp    string
+	err     error
+	genInfo map[string]any
+	gotMsgs []llms.MessageContent
+}
+
+func (f *fakeModel) GenerateContent(_ context.Context, msgs []llms.MessageContent, _ ...llms.CallOption) (*llms.ContentResponse, error) {
+	f.gotMsgs = msgs
+	if f.err != nil {
+		return nil, f.err
+	}
+	return &llms.ContentResponse{Choices: []*llms.ContentChoice{{Content: f.resp, GenerationInfo: f.genInfo}}}, nil
+}
+
+// streamModel drives the streaming callback: it applies the call options, feeds the
+// reasoning + content chunks through StreamingReasoningFunc, then returns the joined
+// content as the final response (mirroring a real streaming provider).
+type streamModel struct {
+	reasoning []string
+	content   []string
+}
+
+func (m *streamModel) GenerateContent(ctx context.Context, _ []llms.MessageContent, opts ...llms.CallOption) (*llms.ContentResponse, error) {
+	var co llms.CallOptions
+	for _, o := range opts {
+		o(&co)
+	}
+	full := ""
+	for i := range m.content {
+		reasoning := ""
+		if i < len(m.reasoning) {
+			reasoning = m.reasoning[i]
+		}
+		if co.StreamingReasoningFunc != nil {
+			if err := co.StreamingReasoningFunc(ctx, []byte(reasoning), []byte(m.content[i])); err != nil {
+				return nil, err
+			}
+		}
+		full += m.content[i]
+	}
+	return &llms.ContentResponse{Choices: []*llms.ContentChoice{{Content: full}}}, nil
+}
+func (*streamModel) Call(context.Context, string, ...llms.CallOption) (string, error) { return "", nil }
+
+func TestGenerateJSONStream_AccumulatesContentAndStreamsThinking(t *testing.T) {
+	m := &streamModel{
+		reasoning: []string{"The candidate ", "looks strong. "},
+		content:   []string{`{"score"`, `:80}`},
+	}
+	c := &Client{model: m, timeout: time.Second}
+
+	var thinking string
+	got, err := c.GenerateJSONStream(context.Background(), "sys", "usr", func(s string) { thinking += s })
+	if err != nil {
+		t.Fatalf("GenerateJSONStream: %v", err)
+	}
+	if got != `{"score":80}` {
+		t.Errorf("content = %q, want the accumulated JSON", got)
+	}
+	if thinking != "The candidate looks strong. " {
+		t.Errorf("thinking = %q, want the joined reasoning deltas", thinking)
+	}
+}
+
+// truncatingModel models what the production gateway actually does when our own per-call
+// deadline fires mid-stream: it stops emitting and hands back whatever accumulated so far,
+// reporting success. Prod logged exactly this shape — `dur=3m0.018s err=<nil>` — and the
+// truncated JSON then surfaced downstream as "unexpected end of JSON input", which names
+// neither the deadline nor the stage that blew it.
+//
+// content is what it hands back: half a JSON document for the JSON entry point, half a
+// sentence for the conversational one (chat_test.go) — the same fault, and the prose
+// half is the worse of the two because nothing downstream can tell it is incomplete.
+type truncatingModel struct{ content string }
+
+func (m truncatingModel) GenerateContent(ctx context.Context, _ []llms.MessageContent, _ ...llms.CallOption) (*llms.ContentResponse, error) {
+	<-ctx.Done()
+	return &llms.ContentResponse{Choices: []*llms.ContentChoice{{Content: m.content}}}, nil
+}
+func (truncatingModel) Call(context.Context, string, ...llms.CallOption) (string, error) {
+	return "", nil
+}
+
+// A stream cut short by our own deadline is a failure, whatever the provider claims.
+// Trusting the nil error hands a truncated document to the caller, turning a timeout we
+// control into a parse error that looks like a bad model response.
+func TestGenerateJSONStream_DeadlineIsAFailureEvenWhenProviderReportsSuccess(t *testing.T) {
+	c := &Client{model: truncatingModel{content: `{"score"`}, timeout: 20 * time.Millisecond}
+
+	got, err := c.GenerateJSONStream(context.Background(), "s", "u", nil)
+
+	if err == nil {
+		t.Fatalf("GenerateJSONStream returned %q with a nil error, want a deadline failure", got)
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("error = %v, want one wrapping context.DeadlineExceeded", err)
+	}
+	if got != "" {
+		t.Errorf("content = %q, want empty when the call failed", got)
+	}
+}
+
+func TestGenerateJSONStream_NoReasoningIsFine(t *testing.T) {
+	m := &streamModel{content: []string{`{"ok":`, `true}`}} // no reasoning deltas
+	c := &Client{model: m, timeout: time.Second}
+	calls := 0
+	got, err := c.GenerateJSONStream(context.Background(), "s", "u", func(string) { calls++ })
+	if err != nil {
+		t.Fatalf("GenerateJSONStream: %v", err)
+	}
+	if got != `{"ok":true}` {
+		t.Errorf("content = %q", got)
+	}
+	if calls != 0 {
+		t.Errorf("onThinking called %d times, want 0 when the model emits no reasoning", calls)
+	}
+}
+
+// captureTracer records the generations it observes.
+type captureTracer struct{ got []Generation }
+
+func (c *captureTracer) Observe(g Generation)           { c.got = append(c.got, g) }
+func (c *captureTracer) Shutdown(context.Context) error { return nil }
+
+func TestGenerateJSON_observesSuccessWithUsage(t *testing.T) {
+	f := &fakeModel{
+		resp:    `{"a":1}`,
+		genInfo: map[string]any{"PromptTokens": 1200, "CompletionTokens": 40, "TotalTokens": 1240},
+	}
+	ct := &captureTracer{}
+	c := &Client{model: f, timeout: time.Second, modelID: "qwen2.5-72b", tracer: ct, source: "enrich"}
+
+	if _, err := c.GenerateJSON(context.Background(), "sys", "usr"); err != nil {
+		t.Fatalf("GenerateJSON: %v", err)
+	}
+	if len(ct.got) != 1 {
+		t.Fatalf("observed %d generations, want 1", len(ct.got))
+	}
+	g := ct.got[0]
+	if g.Model != "qwen2.5-72b" || g.System != "sys" || g.User != "usr" || g.Output != `{"a":1}` {
+		t.Errorf("generation fields wrong: %+v", g)
+	}
+	if g.Source != "enrich" {
+		t.Errorf("source = %q, want enrich", g.Source)
+	}
+	if g.Usage == nil || g.Usage.Input != 1200 || g.Usage.Output != 40 || g.Usage.Total != 1240 {
+		t.Errorf("usage = %+v, want 1200/40/1240", g.Usage)
+	}
+	if !g.End.After(g.Start) && g.End != g.Start {
+		t.Errorf("timestamps not set: start=%v end=%v", g.Start, g.End)
+	}
+	if g.Err != nil {
+		t.Errorf("Err = %v, want nil on success", g.Err)
+	}
+}
+
+func TestGenerateJSON_observesSuccessOmitsUsageWhenAbsent(t *testing.T) {
+	f := &fakeModel{resp: `{"a":1}`} // no genInfo
+	ct := &captureTracer{}
+	c := &Client{model: f, timeout: time.Second, modelID: "m", tracer: ct, source: "enrich"}
+
+	if _, err := c.GenerateJSON(context.Background(), "s", "u"); err != nil {
+		t.Fatalf("GenerateJSON: %v", err)
+	}
+	if len(ct.got) != 1 || ct.got[0].Usage != nil {
+		t.Errorf("usage should be nil when the model reported none, got %+v", ct.got[0].Usage)
+	}
+}
+
+// The cached count is what makes one model's replayed prefix cheaper than another's,
+// and it is the one number a price page cannot tell you. langchaingo already surfaces
+// it; until now UsageFrom read past it.
+func TestUsageFromReadsTheCachedPromptCount(t *testing.T) {
+	u := UsageFrom(&llms.ContentChoice{GenerationInfo: map[string]any{
+		"PromptTokens":       1200,
+		"CompletionTokens":   40,
+		"TotalTokens":        1240,
+		"PromptCachedTokens": 900,
+	}})
+	if u == nil {
+		t.Fatal("usage is nil when the provider reported counts")
+	}
+	if u.CachedInput != 900 {
+		t.Errorf("CachedInput = %d, want 900", u.CachedInput)
+	}
+	if u.Input != 1200 || u.Output != 40 || u.Total != 1240 {
+		t.Errorf("the other counts moved: %+v", u)
+	}
+}
+
+// A provider that reports no cached count and one that served nothing from cache both
+// arrive here as zero — langchaingo writes the key from a zero-valued struct either way.
+// UsageFrom does not pretend to tell them apart; it reports the zero it was given, and
+// the distinction is drawn across a whole run by whoever needs it.
+func TestUsageFromReportsZeroCachedWhenTheProviderNamesNone(t *testing.T) {
+	u := UsageFrom(&llms.ContentChoice{GenerationInfo: map[string]any{
+		"PromptTokens":     10,
+		"CompletionTokens": 5,
+		"TotalTokens":      15,
+	}})
+	if u == nil {
+		t.Fatal("usage is nil when the provider reported the three ordinary counts")
+	}
+	if u.CachedInput != 0 {
+		t.Errorf("CachedInput = %d, want 0 when the key is absent", u.CachedInput)
+	}
+}
+
+// A cached count alone is not a usage. Reporting one would invent an input total of zero
+// for a call whose provider said nothing about tokens at all.
+func TestUsageFromStaysNilWhenOnlyTheCachedCountIsPresent(t *testing.T) {
+	if u := UsageFrom(&llms.ContentChoice{GenerationInfo: map[string]any{
+		"PromptCachedTokens": 900,
+	}}); u != nil {
+		t.Errorf("usage = %+v, want nil when no ordinary count was reported", u)
+	}
+}
+
+func TestGenerateJSON_observesErrorAndReturnsUnchangedError(t *testing.T) {
+	sentinel := errors.New("gateway boom")
+	f := &fakeModel{err: sentinel}
+	ct := &captureTracer{}
+	c := &Client{model: f, timeout: time.Second, modelID: "m", tracer: ct, source: "enrich"}
+
+	_, err := c.GenerateJSON(context.Background(), "s", "u")
+	if !errors.Is(err, sentinel) {
+		t.Errorf("returned error %v does not wrap the model error", err)
+	}
+	if len(ct.got) != 1 || ct.got[0].Err == nil {
+		t.Fatalf("expected one error generation, got %+v", ct.got)
+	}
+	if ct.got[0].Output != "" {
+		t.Errorf("error generation should have no output, got %q", ct.got[0].Output)
+	}
+}
+
+func TestGenerateJSON_nilTracerIsUnchanged(t *testing.T) {
+	// A client with no tracer must behave exactly as before: no panic, same result.
+	f := &fakeModel{resp: `{"a":1}`}
+	c := &Client{model: f, timeout: time.Second}
+	got, err := c.GenerateJSON(context.Background(), "s", "u")
+	if err != nil || got != `{"a":1}` {
+		t.Errorf("nil-tracer client: got %q err %v, want clean result", got, err)
+	}
+}
+
+func (f *fakeModel) Call(context.Context, string, ...llms.CallOption) (string, error) { return "", nil }
+
+func TestGenerateJSONStripsFenceAndSendsMessages(t *testing.T) {
+	f := &fakeModel{resp: "```json\n{\"a\":1}\n```"}
+	got, err := NewWithModel(f).GenerateJSON(context.Background(), "sys", "usr")
+	if err != nil {
+		t.Fatalf("GenerateJSON: %v", err)
+	}
+	if got != `{"a":1}` {
+		t.Errorf("content = %q, want fence-stripped JSON", got)
+	}
+	if len(f.gotMsgs) != 2 || f.gotMsgs[0].Role != llms.ChatMessageTypeSystem {
+		t.Errorf("must send system+user messages, got %d", len(f.gotMsgs))
+	}
+}
+
+func TestGenerateJSONPropagatesModelError(t *testing.T) {
+	c := NewWithModel(&fakeModel{err: errors.New("boom")})
+	if _, err := c.GenerateJSON(context.Background(), "s", "u"); err == nil {
+		t.Fatal("expected error from model, got nil")
+	}
+}
+
+// blockingModel hangs until its context is cancelled, modelling a stalled gateway.
+type blockingModel struct{}
+
+func (blockingModel) GenerateContent(ctx context.Context, _ []llms.MessageContent, _ ...llms.CallOption) (*llms.ContentResponse, error) {
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+func (blockingModel) Call(context.Context, string, ...llms.CallOption) (string, error) {
+	return "", nil
+}
+
+// A stalled gateway must not hang the caller: the per-call timeout cancels the
+// request so GenerateJSON returns an error instead of blocking forever.
+func TestGenerateJSONTimesOutOnStalledModel(t *testing.T) {
+	c := &Client{model: blockingModel{}, timeout: 20 * time.Millisecond}
+	done := make(chan error, 1)
+	go func() {
+		_, err := c.GenerateJSON(context.Background(), "s", "u")
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("GenerateJSON returned nil error, want a timeout error")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("GenerateJSON did not return; the per-call timeout did not fire")
+	}
+}
+
+func TestTruncateRunes(t *testing.T) {
+	// Within the limit: returned unchanged.
+	if got := TruncateRunes("héllo", 10); got != "héllo" {
+		t.Errorf("under limit: got %q", got)
+	}
+	// Over the limit: clamped to rune count, never splitting a multi-byte rune.
+	if got := TruncateRunes("héllo", 3); got != "hél" {
+		t.Errorf("over limit: got %q want %q", got, "hél")
+	}
+}
+
+func TestTrimTruncateRunes(t *testing.T) {
+	// Trims first, then clamps by runes, then trims the ragged cut edge.
+	if got := TrimTruncateRunes("  héllo world  ", 5); got != "héllo" {
+		t.Errorf("got %q, want %q", got, "héllo")
+	}
+	// A cut landing on whitespace leaves no trailing space.
+	if got := TrimTruncateRunes("abcd efgh", 5); got != "abcd" {
+		t.Errorf("got %q, want %q (trailing space after the cut trimmed)", got, "abcd")
+	}
+	// An all-whitespace input collapses to empty.
+	if got := TrimTruncateRunes("   ", 10); got != "" {
+		t.Errorf("got %q, want empty", got)
+	}
+}
+
+func TestStripJSONFence(t *testing.T) {
+	cases := map[string]string{
+		"```json\n{\"a\":1}\n```":        `{"a":1}`,
+		"```\n{\"a\":1}\n```":            `{"a":1}`,
+		"```JSON\n{\"a\":1}\n```":        `{"a":1}`,
+		"``` json\n{\"a\":1}\n```":       `{"a":1}`,
+		`{"a":1}`:                        `{"a":1}`,
+		"  {\"a\":1}  ":                  `{"a":1}`,
+		"```json\n{\"a\":1}\n```\n`":     `{"a":1}`,
+		"```json\n{\"a\":1}\n````":       `{"a":1}`,
+		"```json\n{\"a\":1}\n```\nDone.": `{"a":1}`,
+		"Here:\n```json\n{\"a\":1}\n```": `{"a":1}`,
+	}
+	for in, want := range cases {
+		if got := StripJSONFence(in); got != want {
+			t.Errorf("StripJSONFence(%q) = %q, want %q", in, got, want)
+		}
+	}
+}

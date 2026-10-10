@@ -1,0 +1,53 @@
+-- name: GetScreeningAnswers :one
+-- The caller's single screening-answers record, keyed by user_id. No matching row means
+-- the candidate has not stated any screening answer yet.
+SELECT * FROM screening_answers
+WHERE user_id = $1;
+
+-- name: EnsureScreeningAnswersRow :execrows
+-- Insert an all-unstated row for user_id if none exists yet; a no-op otherwise. Called
+-- before GetScreeningAnswersForUpdate in the same transaction so that query always has a
+-- row to lock — FOR UPDATE locks nothing on an absent row, which otherwise lets two
+-- concurrent first-time Updates for the same brand-new user both read Answers{} and race an
+-- unguarded INSERT ... ON CONFLICT DO UPDATE (see QueriesRepository.UpdateLocked). Two
+-- concurrent callers inserting the same user_id serialize on the table's own unique index:
+-- the second blocks until the first commits or rolls back, then sees the row (if committed)
+-- and does nothing, or proceeds normally (if rolled back) — never a duplicate, never an error.
+INSERT INTO screening_answers (user_id)
+VALUES ($1)
+ON CONFLICT (user_id) DO NOTHING;
+
+-- name: GetScreeningAnswersForUpdate :one
+-- Same as GetScreeningAnswers, but takes a row lock (SELECT ... FOR UPDATE) for the rest
+-- of the caller's transaction, so a concurrent Update for the same user_id blocks on this
+-- SELECT until the first transaction commits instead of both reading the same stale row
+-- and racing a lost update (see QueriesRepository.UpdateLocked). Always finds exactly one
+-- row: the caller runs EnsureScreeningAnswersRow first in the same transaction, so there is
+-- never a "no row to lock" case here.
+SELECT * FROM screening_answers
+WHERE user_id = $1
+FOR UPDATE;
+
+-- name: UpsertScreeningAnswers :one
+-- Create-or-replace the caller's one screening-answers record. Full-replace, mirroring
+-- UpsertUserProfile: the service reads the current row, merges caller-provided fields over
+-- it (omitted fields keep their stored value), and writes the merged result back whole —
+-- so the SQL layer stays a plain upsert and the partial-update semantics live in Go, where
+-- they are unit-testable without a database.
+INSERT INTO screening_answers (
+    user_id, authorized_countries, visa_sponsorship_needed,
+    desired_salary_amount, desired_salary_currency, desired_salary_period,
+    notice_period_days, willing_to_relocate, age_18_or_older
+)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+ON CONFLICT (user_id) DO UPDATE
+SET authorized_countries    = EXCLUDED.authorized_countries,
+    visa_sponsorship_needed = EXCLUDED.visa_sponsorship_needed,
+    desired_salary_amount   = EXCLUDED.desired_salary_amount,
+    desired_salary_currency = EXCLUDED.desired_salary_currency,
+    desired_salary_period   = EXCLUDED.desired_salary_period,
+    notice_period_days      = EXCLUDED.notice_period_days,
+    willing_to_relocate     = EXCLUDED.willing_to_relocate,
+    age_18_or_older         = EXCLUDED.age_18_or_older,
+    updated_at               = now()
+RETURNING *;

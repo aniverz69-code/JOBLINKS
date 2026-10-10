@@ -1,0 +1,278 @@
+package gmailsync
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net/http"
+	"net/url"
+	"strings"
+	"time"
+
+	"golang.org/x/oauth2"
+	"golang.org/x/oauth2/endpoints"
+
+	"github.com/strelov1/freehire/internal/platform/safehttp"
+)
+
+// GmailReadonlyScope is the restricted read scope; its consent screen requires Google
+// verification for public use (testing-mode test users until then). Exported alongside
+// CalendarScope because the connection row records what a grant covers, and the handler
+// that writes that record must spell it the same way the worker's filter reads it.
+const GmailReadonlyScope = "https://www.googleapis.com/auth/gmail.readonly"
+
+// CalendarScope is the read-only calendar scope, asked for on its own consent.
+//
+// Declared here because every Google scope this service requests lives here, and because
+// two copies of the string would part ways exactly once and silently: internal/application/calsync
+// filters connections on the scopes recorded at consent, so a filter spelling it
+// differently would find nobody and the worker would report a clean run with nothing to
+// do. Sensitive rather than restricted, which is a smaller verification burden than
+// gmail.readonly already carries — and no smaller a privacy one.
+const CalendarScope = "https://www.googleapis.com/auth/calendar.readonly"
+
+// CalendarEventsScope is the calendar WRITE scope, asked for on its own consent by a
+// mentor who wants a Meet link minted per booking — never inferred from CalendarScope,
+// which a candidate may hold for an unrelated, read-only purpose. Sensitive rather than
+// restricted, the same tier CalendarScope already carries, so this adds no new
+// verification burden beyond what gmail.readonly already does.
+const CalendarEventsScope = "https://www.googleapis.com/auth/calendar.events"
+
+const gmailProfileURL = "https://gmail.googleapis.com/gmail/v1/users/me/profile"
+
+// gmailHTTPTimeout bounds the OAuth exchange and Gmail API round-trips.
+const gmailHTTPTimeout = 15 * time.Second
+
+// Connector runs the "Connect Gmail" incremental OAuth flow on the existing
+// Google client: it builds the consent URL and exchanges the callback code for a
+// refresh token + the connected address. Distinct from the sign-in Provider
+// (which stores no tokens) — here we need offline access and a stored token.
+type Connector struct {
+	cfg *oauth2.Config
+	// calendarRedirect is the callback for the candidate's read-only calendar consent.
+	// Its own path, because Google matches the redirect exactly and the two flows land
+	// in different handlers.
+	calendarRedirect string
+	// mentorCalendarRedirect is the callback for a mentor's calendar.events write
+	// consent — its own path too, distinct from calendarRedirect: the two are separate
+	// consents for separate purposes on possibly the same account, and Google matching
+	// the wrong one back to the wrong handler would be worse than a third field here.
+	mentorCalendarRedirect string
+	// mentorBusyRedirect is the callback for a mentor's busy-sync consent. It reuses
+	// CalendarScope — Google has one read scope for the whole calendar, not a narrower
+	// one for free/busy alone — so this redirect, not the scope, is what tells the
+	// callback apart from the candidate's own read-only calendar flow at calendarRedirect.
+	mentorBusyRedirect string
+}
+
+// NewConnector builds the Gmail connector from the Google OAuth credentials. The
+// callback is origin + /api/v1/me/gmail/callback (register it on the client).
+func NewConnector(clientID, clientSecret, origin string) *Connector {
+	return &Connector{
+		cfg: &oauth2.Config{
+			ClientID:     clientID,
+			ClientSecret: clientSecret,
+			Endpoint:     endpoints.Google,
+			RedirectURL:  origin + "/api/v1/me/gmail/callback",
+			Scopes:       []string{GmailReadonlyScope},
+		},
+		calendarRedirect:       origin + "/api/v1/me/calendar/callback",
+		mentorCalendarRedirect: origin + "/api/v1/me/mentor-calendar/callback",
+		mentorBusyRedirect:     origin + "/api/v1/me/mentor-busy-sync/callback",
+	}
+}
+
+// AuthCodeURL builds the consent URL. offline + forced consent yield a refresh
+// token; include_granted_scopes keeps the user's existing sign-in grant
+// (incremental authorization).
+func (c *Connector) AuthCodeURL(state string) string {
+	return c.cfg.AuthCodeURL(state,
+		oauth2.AccessTypeOffline,
+		oauth2.SetAuthURLParam("prompt", "consent"),
+		oauth2.SetAuthURLParam("include_granted_scopes", "true"),
+	)
+}
+
+// scopedAuthCodeURL builds an incremental-auth consent URL for exactly one scope on its
+// own redirect — shared by every consent past the sign-in one, since each is a separate
+// cost and a separate decision, and only the scope and the redirect ever differ between
+// them.
+func scopedAuthCodeURL(cfg oauth2.Config, state, scope, redirect string) string {
+	cfg.Scopes = []string{scope}
+	cfg.RedirectURL = redirect
+	return cfg.AuthCodeURL(state,
+		oauth2.AccessTypeOffline,
+		oauth2.SetAuthURLParam("prompt", "consent"),
+		oauth2.SetAuthURLParam("include_granted_scopes", "true"),
+	)
+}
+
+// CalendarAuthCodeURL builds the consent URL for the calendar, on its own.
+//
+// Separate from AuthCodeURL because the two are separate costs and separate decisions: a
+// candidate who wants their mail read and not their calendar has to be able to say so,
+// and connecting a mailbox must never quietly ask for a diary. Incremental, so accepting
+// this keeps whatever they already granted — the returned refresh token then covers both.
+func (c *Connector) CalendarAuthCodeURL(state string) string {
+	return scopedAuthCodeURL(*c.cfg, state, CalendarScope, c.calendarRedirect)
+}
+
+// Exchange turns the callback code into a refresh token and the connected Gmail
+// address. It errors if Google returned no refresh token (consent not offline).
+func (c *Connector) Exchange(ctx context.Context, code string) (refreshToken, email string, scopes []string, err error) {
+	ctx = safehttp.GuardedOAuth2Context(ctx, gmailHTTPTimeout)
+	tok, err := c.cfg.Exchange(ctx, code)
+	if err != nil {
+		return "", "", nil, fmt.Errorf("gmail: exchange code: %w", err)
+	}
+	if tok.RefreshToken == "" {
+		return "", "", nil, errors.New("gmail: no refresh token (consent was not offline)")
+	}
+	email, err = c.fetchEmail(ctx, c.cfg.Client(ctx, tok))
+	if err != nil {
+		return "", "", nil, err
+	}
+	return tok.RefreshToken, email, GrantedScopes(tok), nil
+}
+
+// GrantedScopes reads what Google says the grant actually covers.
+//
+// Authoritative, and therefore recorded as-is rather than unioned with what we held
+// before. A union can only ever grow, so a candidate who revokes at Google and reconnects
+// mail alone would keep a calendar scope they no longer have — and cal-sync would take
+// the resulting 403 as a revoked grant and flip the SHARED status, breaking the mailbox
+// they had just reconnected, once per cron tick.
+//
+// A response without the field is not evidence of no scopes; the caller keeps what it had.
+func GrantedScopes(tok *oauth2.Token) []string {
+	raw, _ := tok.Extra("scope").(string)
+	return strings.Fields(raw)
+}
+
+// scopedExchange turns a scoped consent's callback code into a refresh token, shared by
+// every consent past the sign-in one — op names it in the error text, since that is the
+// only thing that differs between them once the scope/redirect are already applied.
+func scopedExchange(ctx context.Context, cfg oauth2.Config, op, scope, redirect, code string) (refreshToken string, scopes []string, err error) {
+	cfg.Scopes = []string{scope}
+	cfg.RedirectURL = redirect
+	tok, err := cfg.Exchange(safehttp.GuardedOAuth2Context(ctx, gmailHTTPTimeout), code)
+	if err != nil {
+		return "", nil, fmt.Errorf("%s: exchange code: %w", op, err)
+	}
+	if tok.RefreshToken == "" {
+		return "", nil, fmt.Errorf("%s: no refresh token (consent was not offline)", op)
+	}
+	return tok.RefreshToken, GrantedScopes(tok), nil
+}
+
+// ExchangeCalendar turns the calendar callback's code into a refresh token.
+//
+// Separate from Exchange because that one reads the mailbox address from the Gmail
+// profile API, which needs the mail scope. A candidate who granted only the calendar does
+// not have it, so asking would fail the connect for a field the calendar flow has no use
+// for. The token itself covers whatever they have granted in total — the consent is
+// incremental — so a candidate with both ends up with one grant covering both.
+func (c *Connector) ExchangeCalendar(ctx context.Context, code string) (refreshToken string, scopes []string, err error) {
+	return scopedExchange(ctx, *c.cfg, "calendar", CalendarScope, c.calendarRedirect, code)
+}
+
+// MentorCalendarAuthCodeURL builds the consent URL for a mentor's calendar.events
+// write grant, on its own — never folded into AuthCodeURL or CalendarAuthCodeURL.
+//
+// Separate from both for the reason CalendarAuthCodeURL is separate from AuthCodeURL:
+// two costs are two decisions. This one is also separate in KIND, not just degree — it
+// is the only write consent this connector ever asks for — so it gets its own
+// redirect and, in the handler, its own CSRF cookie, even though a successful exchange
+// lands in the same gmail_connections row as every other Google grant this account may
+// hold. Incremental, so a mentor who is also a candidate with mail/calendar-read
+// connected keeps those too.
+func (c *Connector) MentorCalendarAuthCodeURL(state string) string {
+	return scopedAuthCodeURL(*c.cfg, state, CalendarEventsScope, c.mentorCalendarRedirect)
+}
+
+// ExchangeMentorCalendar turns the mentor-calendar callback's code into a refresh
+// token, exactly as ExchangeCalendar does for the read-only flow.
+func (c *Connector) ExchangeMentorCalendar(ctx context.Context, code string) (refreshToken string, scopes []string, err error) {
+	return scopedExchange(ctx, *c.cfg, "mentor calendar", CalendarEventsScope, c.mentorCalendarRedirect, code)
+}
+
+// MentorBusyAuthCodeURL builds the consent URL for a mentor's busy-time sync — its own
+// redirect, on the same CalendarScope the candidate's read-only calendar flow already
+// uses. Google offers no narrower scope for free/busy alone, so unlike
+// MentorCalendarAuthCodeURL this cannot lean on a scope unique to the purpose; the
+// redirect is what a purpose-specific consent depends on here (see design.md of
+// mentor-calendar-busy-sync, and gmail_connections.mentor_busy_sync_opted_in, which
+// records the consent itself for the same reason).
+func (c *Connector) MentorBusyAuthCodeURL(state string) string {
+	return scopedAuthCodeURL(*c.cfg, state, CalendarScope, c.mentorBusyRedirect)
+}
+
+// ExchangeMentorBusy turns the mentor-busy-sync callback's code into a refresh token,
+// exactly as ExchangeCalendar does for the candidate's read-only flow.
+func (c *Connector) ExchangeMentorBusy(ctx context.Context, code string) (refreshToken string, scopes []string, err error) {
+	return scopedExchange(ctx, *c.cfg, "mentor busy sync", CalendarScope, c.mentorBusyRedirect, code)
+}
+
+// TokenSource mints access tokens from a stored refresh token (used by the sync
+// worker), refreshing transparently.
+func (c *Connector) TokenSource(ctx context.Context, refreshToken string) oauth2.TokenSource {
+	return c.cfg.TokenSource(safehttp.GuardedOAuth2Context(ctx, gmailHTTPTimeout), &oauth2.Token{RefreshToken: refreshToken})
+}
+
+// HTTPClient returns a token-bearing HTTP client for the Gmail API, minting and
+// refreshing access tokens from the stored refresh token. Used to build a live
+// GmailReader per user in the sync worker.
+func (c *Connector) HTTPClient(ctx context.Context, refreshToken string) *http.Client {
+	gctx := safehttp.GuardedOAuth2Context(ctx, gmailHTTPTimeout)
+	return oauth2.NewClient(gctx, c.cfg.TokenSource(gctx, &oauth2.Token{RefreshToken: refreshToken}))
+}
+
+// ReaderFactory builds the per-user GmailReader factory the sync Worker needs,
+// minting a token-bearing Gmail client from each user's refresh token — the
+// single source shared by the cron worker and the on-demand sync handler. The
+// learned domains are threaded in per run so the query reflects the current cache.
+func (c *Connector) ReaderFactory() ReaderFactory {
+	return func(ctx context.Context, refreshToken string, learned []string) GmailReader {
+		return NewAPIReader(c.HTTPClient(ctx, refreshToken), learned)
+	}
+}
+
+// Revoke best-effort revokes a refresh token with Google (disconnect). A failure
+// is ignored — we purge our copy regardless.
+func (c *Connector) Revoke(ctx context.Context, refreshToken string) {
+	client := safehttp.NewClient(gmailHTTPTimeout)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		"https://oauth2.googleapis.com/revoke?token="+url.QueryEscape(refreshToken), nil)
+	if err != nil {
+		return
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	if resp, err := client.Do(req); err == nil {
+		_ = resp.Body.Close()
+	}
+}
+
+// fetchEmail reads the mailbox address via the Gmail profile (needs only the
+// gmail.readonly scope we already hold — no extra email scope).
+func (c *Connector) fetchEmail(ctx context.Context, client *http.Client) (string, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, gmailProfileURL, nil)
+	if err != nil {
+		return "", err
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("gmail: profile: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("gmail: profile: %s", resp.Status)
+	}
+	var body struct {
+		EmailAddress string `json:"emailAddress"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		return "", fmt.Errorf("gmail: profile decode: %w", err)
+	}
+	return body.EmailAddress, nil
+}

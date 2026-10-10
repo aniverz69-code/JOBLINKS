@@ -1,0 +1,66 @@
+allowBuilds:
+  '@sentry/cli': false
+  core-js: false
+  # Pulled in transitively by @scalar/api-reference (Vue-based). Its postinstall only
+  # writes a Vue-2-vs-3 compatibility shim; Scalar's own build already targets Vue 3
+  # directly, and the reference renders and themes correctly with the script skipped
+  # (verified in a real browser, light and dark).
+  vue-demi: false
+# pnpm 11 structural config — not a workspace definition (no packages: list).
+# strictDepBuilds: false lets install proceed when @sentry/cli and core-js
+# build scripts are skipped. @sentry/cli is only needed for source-map upload
+# (gated on SENTRY_AUTH_TOKEN); core-js postinstall is non-critical.
+strictDepBuilds: false
+# @sveltejs/kit pins cookie@^0.6.0 on every 2.x release (GHSA-pxg6-pf52-xh8x /
+# CVE-2024-47764, low: out-of-bounds characters in cookie name/path/domain).
+# Pinned to the last 0.7.x patch, not an open '>=0.7.0' range: cookie has since
+# jumped to 1.x/2.x, and @sveltejs/kit has never declared support past 0.6/0.7 —
+# an unbounded override would silently ride a major bump its own tests never ran.
+overrides:
+  cookie@<0.7.0: 0.7.2
+  # GHSA-6g55-p6wh-862q: postcss reads an attacker-controlled sourceMappingURL
+  # path when `from` is unset, letting a crafted stylesheet exfiltrate
+  # arbitrary local .map files. Pulled in transitively by vite/eslint-plugin-svelte.
+  postcss@<8.5.23: 8.5.23
+  # GHSA-qrpm-p2h7-hrv2: nanoid's custom-alphabet generator can loop forever
+  # when passed size 0. Pulled in transitively by postcss. 3.3.17 (the prior
+  # pin) turned out not to fully close it — the advisory's fixed version is
+  # 3.3.18.
+  nanoid@<3.3.18: 3.3.18
+  # GHSA-jjrf-c9pj-88w6: DOMPurify's IN_PLACE hook path leaves a detached DOM
+  # subtree with executable content, allowing XSS despite sanitization.
+  # isomorphic-dompurify is used directly for XSS sanitization in this app.
+  # 3.4.13 was the prior pin; the advisory got a second patch release and the
+  # real fix only landed in 3.4.16 (GHSA re-opened as Dependabot alert #40).
+  dompurify@<3.4.16: 3.4.16
+  # Nine advisories fixed in 8.10.2, two of them critical: BalancedPool drops
+  # function-valued connection options, so a custom checkServerIdentity is
+  # silently stripped and a malicious certificate passes validation
+  # (SNYK-JS-UNDICI-19635218); and an interceptor trusts caller-controlled
+  # request metadata over the dispatcher's own origin (SNYK-JS-UNDICI-19635224).
+  # Reached transitively as isomorphic-dompurify > jsdom > undici, whose own
+  # range is ^8.9.0 — so this is a floor inside what jsdom already accepts, not
+  # a version it has never seen. The alternative Snyk proposes, a major bump of
+  # isomorphic-dompurify to 4.x, moves nothing: 4.1.0 declares the same
+  # jsdom ^30.0.0 and dompurify ^3.4.12, and differs only in its Node engines.
+  undici@<8.10.2: 8.10.2
+  # GHSA-px8p-9vwx-vf98 / CVE-2026-45820: fflate's unzipSync can loop forever
+  # parsing a malformed ZIP64 central-directory entry (missing extra-field tag
+  # 0x0001 after a 0xFFFFFFFF size sentinel). Reached transitively via
+  # satori > @shuding/opentype.js, which pins an exact "0.7.3" — satori itself
+  # only imports inflateSync (not unzipSync), so the vulnerable path is not
+  # actually reachable here, but there's no reason to keep a flagged version
+  # around when the override costs nothing.
+  fflate@<0.7.5: 0.7.5
+  # SNYK-JS-AI-16734889: the `ai` SDK's provider fetch path is vulnerable to
+  # SSRF. Reached transitively via @scalar/api-reference's bundled "Ask AI"
+  # feature (@scalar/agent-chat pins an exact "6.0.33", not a range) — a
+  # feature this app never configures a backend for and never exposes, but
+  # the vulnerable code still ships in the client bundle regardless.
+  ai@<6.0.203: 6.0.203
+  # SNYK-JS-AISDKPROVIDERUTILS-16734888 (SSRF) and
+  # SNYK-JS-AISDKPROVIDERUTILS-16735288 (unbounded resource allocation), both
+  # in @ai-sdk/provider-utils, reached the same way via @scalar/agent-chat's
+  # exact "@ai-sdk/vue": "3.0.33" pin. 4.0.33 is the lowest version fixing
+  # both (4.0.29 and 4.0.33 respectively).
+  '@ai-sdk/provider-utils@<4.0.33': 4.0.33

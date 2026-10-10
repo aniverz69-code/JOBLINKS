@@ -1,0 +1,312 @@
+<script lang="ts">
+  import { timeAgo, must } from '$lib/utils';
+  import { locale } from '$lib/i18n/currentLocale.svelte';
+  // A provider key is a source facet code, so it renders through the one label map every
+  // other surface uses: a provider must not be "WhatJobs" on the filter panel and
+  // "Whatjobs" here.
+  import { sourceLabel } from '$lib/facets';
+  import { TabStrip, tabStripId } from '$lib/ui';
+  import type { HealthStatus, IngestStatus, ProviderKind } from '$lib/types';
+
+  // The presentational half of the /status page: given the status read (or null
+  // when the API read failed), it renders the site/API's own status, the
+  // ingest-fleet overall banner, and the worst-first provider list. Kept separate
+  // from the route so it can be previewed and reasoned about without a live API.
+  // The route owns data loading + SEO.
+  let { status }: { status: IngestStatus | null } = $props();
+
+  // Status → display metadata. Tone classes mirror RealityBadge's light/dark
+  // convention; the dot is the at-a-glance signal, the pill spells it out.
+  const STATUS_META: Record<HealthStatus, { label: string; dot: string; pill: string }> = {
+    operational: {
+      label: 'Operational',
+      dot: 'bg-emerald-500',
+      pill: 'border-emerald-500/40 bg-emerald-500/10 text-emerald-700 dark:text-emerald-400',
+    },
+    degraded: {
+      label: 'Degraded',
+      dot: 'bg-warning',
+      pill: 'border-warning/40 bg-warning/10 text-warning-strong',
+    },
+    down: {
+      label: 'Down',
+      dot: 'bg-red-500',
+      pill: 'border-red-500/40 bg-red-500/10 text-red-700 dark:text-red-400',
+    },
+  };
+
+  const OVERALL_HEADLINE: Record<HealthStatus, string> = {
+    operational: 'All systems operational',
+    degraded: 'Partial degradation',
+    down: 'Major outage',
+  };
+
+  // The site/API's own status is a separate concern from the ingest fleet above —
+  // one is "is freehire.me itself working", the other is "are the crawlers working".
+  const SITE_HEADLINE: Record<HealthStatus, string> = {
+    operational: 'API operational',
+    degraded: 'API degraded',
+    down: 'API down',
+  };
+  const nfPercent = new Intl.NumberFormat('en', { style: 'percent', maximumFractionDigits: 1 });
+
+  // The daily history strip: 90 tiles, oldest first, each either a recorded
+  // HealthStatus or null for "no sample recorded that day" — a gap must render
+  // as its own neutral treatment, never silently as "operational".
+  const HISTORY_DAYS = 90;
+  const NO_DATA_TILE_META = { label: 'No data', dot: 'bg-border' };
+
+  function utcDateString(d: Date): string {
+    return d.toISOString().slice(0, 10);
+  }
+
+  const historyTiles = $derived.by(() => {
+    const byDay = new Map((site?.history ?? []).map((h) => [h.day, h.status]));
+    // Anchored on the response's own generated_at (UTC) rather than the visitor's
+    // local clock, so "today" here always matches the day the backend last wrote —
+    // the two can disagree by up to a day if left to the browser's local timezone.
+    const anchor = status?.generated_at ? new Date(status.generated_at) : new Date();
+    const tiles: { day: string; status: HealthStatus | null }[] = [];
+    for (let i = HISTORY_DAYS - 1; i >= 0; i--) {
+      const d = new Date(Date.UTC(anchor.getUTCFullYear(), anchor.getUTCMonth(), anchor.getUTCDate() - i));
+      const day = utcDateString(d);
+      tiles.push({ day, status: byDay.get(day) ?? null });
+    }
+    return tiles;
+  });
+
+  const SEVERITY: Record<HealthStatus, number> = { operational: 0, degraded: 1, down: 2 };
+
+  // Human labels for the source-kind taxonomy the backend derives from adapter type.
+  const KIND_LABEL: Record<ProviderKind, string> = {
+    ats: 'ATS',
+    aggregator: 'Aggregators',
+    company: 'Company pages',
+    other: 'Other',
+  };
+  // Order the kind chips deliberately (ATS first — the bulk), then filter to those
+  // that actually appear in the data.
+  const KIND_ORDER: ProviderKind[] = ['ats', 'aggregator', 'company', 'other'];
+
+  const nf = new Intl.NumberFormat('en');
+
+  // The site/API and the ingest fleet are different concerns (see SITE_HEADLINE's
+  // comment above) — tabs keep them from competing for the same screen instead of
+  // stacking sections a visitor has to scroll past to reach the one they want.
+  // TabStrip (the underline style every /my/* section nav already uses), not the
+  // pill/segmented Tabs primitive — this page reads as part of the same product,
+  // not a different widget kit bolted on.
+  const SECTION_TABS = [
+    { id: 'site', label: 'Site status' },
+    { id: 'fleet', label: 'Ingest fleet' },
+  ] as const;
+  const SECTION_PANEL_ID = 'status-section-panel';
+  let activeSection = $state<'site' | 'fleet'>('site');
+
+  // Worst-first, then alphabetical — problem providers surface at the top.
+  const providers = $derived(
+    [...(status?.providers ?? [])].sort(
+      (a, b) => SEVERITY[b.status] - SEVERITY[a.status] || a.provider.localeCompare(b.provider),
+    ),
+  );
+  const overall = $derived(status?.overall ?? null);
+  const site = $derived(status?.site ?? null);
+
+  // Kind chips: only kinds present in the data, each with its live count.
+  const kindCounts = $derived.by(() => {
+    const counts: Partial<Record<ProviderKind, number>> = {};
+    for (const p of providers) counts[p.kind] = (counts[p.kind] ?? 0) + 1;
+    return KIND_ORDER.filter((k) => counts[k]).map((k) => ({ kind: k, count: must(counts[k]) }));
+  });
+
+  // Two combined filters: a kind chip ('all' = no kind constraint) and a free-text
+  // match over the name. With dozens of providers, "narrow to aggregators, then find
+  // the one I care about" beats scrolling.
+  let kind = $state<ProviderKind | 'all'>('all');
+  let query = $state('');
+  const filtered = $derived.by(() => {
+    const q = query.trim().toLowerCase();
+    return providers.filter((p) => {
+      if (kind !== 'all' && p.kind !== kind) return false;
+      if (!q) return true;
+      return p.provider.toLowerCase().includes(q) || sourceLabel(p.provider).toLowerCase().includes(q);
+    });
+  });
+</script>
+
+{#if !status || !overall}
+  <div class="rounded-xl border border-border p-8 text-center text-muted-foreground">
+    Status is unavailable right now. Try again in a moment.
+  </div>
+{:else}
+  <TabStrip
+    tabs={SECTION_TABS}
+    active={activeSection}
+    onSelect={(id) => (activeSection = id)}
+    label="Status sections"
+    panelId={SECTION_PANEL_ID}
+  />
+
+  <div
+    id={SECTION_PANEL_ID}
+    role="tabpanel"
+    aria-labelledby={tabStripId(SECTION_PANEL_ID, activeSection)}
+    class="mt-6"
+  >
+    {#if activeSection === 'site'}
+      {#if site}
+        <!-- Site status: is freehire.me itself working, independent of the ingest fleet tab. -->
+        <div class="flex items-center gap-3 rounded-lg border p-4 {STATUS_META[site.status].pill}">
+          <span class="inline-flex h-2.5 w-2.5 shrink-0 rounded-full {STATUS_META[site.status].dot}"></span>
+          <div>
+            <div class="text-base font-semibold tracking-tight">{SITE_HEADLINE[site.status]}</div>
+            <div class="text-sm opacity-80">
+              Database {site.database} · {nfPercent.format(site.error_rate)} error rate over the last {site.window_minutes} min
+            </div>
+            <!-- Reported beside the error rate, never conditionally. The two answer
+                 different questions — the error rate describes requests that FINISHED,
+                 this describes how much of the connection pool is held at this instant,
+                 which is why requests may not start. An earlier draft showed this line
+                 only above 90% and read as a warning; the live pool touches its ceiling
+                 in ordinary bursts, so that phrasing cried wolf on a healthy site. A
+                 sustained reading is what matters, and judging that needs history the
+                 page does not have (the Grafana rule averages it over five minutes). -->
+            <div class="text-sm opacity-80">
+              Database connections in use: {nfPercent.format(site.pool_pressure)}
+            </div>
+          </div>
+        </div>
+
+        <!-- Daily history strip: worst status observed each day, oldest first. A gap
+             (no sample recorded) renders as a distinct neutral tile, never as if the
+             day were operational. -->
+        <div class="mt-4 rounded-xl border border-border p-4 sm:p-5">
+          <p class="text-xs text-muted-foreground">Last {HISTORY_DAYS} days</p>
+          <!-- flex-1 tiles (not a fixed width) so all 90 always fit the container —
+               a fixed width overflows on anything narrower than a wide desktop, and
+               the resulting horizontal scroll defaults to showing the OLDEST (gray)
+               end, hiding the recent, colorful end a visitor actually wants to see. -->
+          <div class="mt-3 flex h-7 gap-px">
+            {#each historyTiles as tile (tile.day)}
+              {@const meta = tile.status ? STATUS_META[tile.status] : NO_DATA_TILE_META}
+              <span
+                class="flex-1 rounded-sm {meta.dot}"
+                title="{tile.day} — {tile.status ? meta.label : 'no data recorded'}"
+              ></span>
+            {/each}
+          </div>
+        </div>
+      {:else}
+        <p class="rounded-xl border border-border p-8 text-center text-muted-foreground">
+          Site status is unavailable right now.
+        </p>
+      {/if}
+    {:else}
+      <!-- Overall banner -->
+      <div class="flex items-center gap-3 rounded-lg border p-4 {STATUS_META[overall].pill}">
+        <span class="inline-flex h-2.5 w-2.5 shrink-0 rounded-full {STATUS_META[overall].dot}"></span>
+        <div>
+          <div class="text-base font-semibold tracking-tight">{OVERALL_HEADLINE[overall]}</div>
+          <div class="text-sm opacity-80">
+            {providers.length} provider{providers.length === 1 ? '' : 's'} monitored
+          </div>
+        </div>
+      </div>
+
+      <!-- Provider list -->
+      <section class="mt-6">
+        <div class="flex items-baseline justify-between">
+          <p class="font-mono text-xs uppercase tracking-[0.2em] text-muted-foreground">// providers</p>
+          <!-- A raw JSON API endpoint, not a SvelteKit page route — there is nothing
+               for resolve() to map, so the internal-navigation rule doesn't apply. -->
+          <!-- eslint-disable-next-line svelte/no-navigation-without-resolve -->
+          <a href="/api/v1/status" class="font-mono text-xs text-muted-foreground underline-offset-4 hover:text-foreground hover:underline">
+            /status ↗
+          </a>
+        </div>
+
+        {#if providers.length === 0}
+          <p class="mt-6 text-sm text-muted-foreground">No providers have run yet.</p>
+        {:else}
+          <label class="mt-6 block">
+            <span class="sr-only">Filter providers by name</span>
+            <input
+              type="search"
+              bind:value={query}
+              placeholder="Filter providers…"
+              autocomplete="off"
+              class="w-full rounded-lg border border-border bg-background px-3 py-2 text-sm outline-none placeholder:text-muted-foreground focus:border-foreground"
+            />
+          </label>
+
+          {#if kindCounts.length > 1}
+            <div class="mt-3 flex flex-wrap gap-2">
+              <button
+                type="button"
+                onclick={() => (kind = 'all')}
+                class="rounded-full border px-3 py-1 text-xs font-medium transition-colors {kind === 'all'
+                  ? 'border-foreground bg-foreground text-background'
+                  : 'border-border text-muted-foreground hover:text-foreground'}"
+              >
+                All {nf.format(providers.length)}
+              </button>
+              {#each kindCounts as kc (kc.kind)}
+                <button
+                  type="button"
+                  onclick={() => (kind = kc.kind)}
+                  class="rounded-full border px-3 py-1 text-xs font-medium transition-colors {kind === kc.kind
+                    ? 'border-foreground bg-foreground text-background'
+                    : 'border-border text-muted-foreground hover:text-foreground'}"
+                >
+                  {KIND_LABEL[kc.kind]} {nf.format(kc.count)}
+                </button>
+              {/each}
+            </div>
+          {/if}
+
+          {#if filtered.length === 0}
+            <p class="mt-6 text-sm text-muted-foreground">
+              No providers match “{query.trim()}”.
+            </p>
+          {:else}
+            <ul class="mt-4 divide-y divide-border overflow-hidden rounded-xl border border-border">
+              {#each filtered as p (p.provider)}
+              {@const meta = STATUS_META[p.status]}
+              <li class="flex flex-wrap items-center gap-x-4 gap-y-1 bg-background p-4 sm:p-5">
+                <span class="h-2.5 w-2.5 shrink-0 rounded-full {meta.dot}"></span>
+                <div class="min-w-0 flex-1">
+                  <div class="flex items-center gap-2">
+                    <span class="font-medium">{sourceLabel(p.provider)}</span>
+                    <span class="font-mono text-[10px] uppercase tracking-wide text-muted-foreground">
+                      {KIND_LABEL[p.kind]}
+                    </span>
+                  </div>
+                  <div class="text-sm text-muted-foreground">
+                    {nf.format(p.healthy_boards)} / {nf.format(p.total_boards)} boards healthy{#if p.cooled_boards > 0}<span
+                        class="text-warning-strong"
+                      >
+                        · {nf.format(p.cooled_boards)} in cooldown</span
+                      >{/if}
+                  </div>
+                </div>
+                <div class="flex flex-col items-end gap-1">
+                  <span
+                    class="inline-flex items-center rounded-md border px-2 py-0.5 text-xs font-medium {meta.pill}"
+                  >
+                    {meta.label}
+                  </span>
+                  {#if p.last_run}
+                    <span class="text-xs text-muted-foreground" title={p.last_run}>
+                      ran {timeAgo(p.last_run, locale())}
+                    </span>
+                  {/if}
+                </div>
+              </li>
+              {/each}
+            </ul>
+          {/if}
+        {/if}
+      </section>
+    {/if}
+  </div>
+{/if}

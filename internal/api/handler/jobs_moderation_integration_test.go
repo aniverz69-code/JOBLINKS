@@ -1,0 +1,283 @@
+//go:build integration
+
+// End-to-end HTTP tests for the moderator-authored job endpoints against a real
+// Postgres: the full chain (route → cookie/key auth → role gate → handler → service →
+// DB). Create is moderator-only (201 / 403 / 401 / 400), the row lands under the manual
+// source with authorship recorded, and edit is partial + manual-scoped (200 / 404).
+// Run with: go test -tags=integration ./internal/api/handler/
+package handler
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+	"time"
+
+	"github.com/gofiber/fiber/v2"
+
+	"github.com/strelov1/freehire/internal/ai/enrich"
+	"github.com/strelov1/freehire/internal/identity/auth"
+	"github.com/strelov1/freehire/internal/ingest/moderation"
+	"github.com/strelov1/freehire/internal/platform/db"
+)
+
+func TestModeratorJobsEndToEnd(t *testing.T) {
+	pool := startPostgres(t)
+	ctx := context.Background()
+
+	var modID, userID int64
+	if err := pool.QueryRow(ctx,
+		`INSERT INTO users (email, role) VALUES ('mod@example.test', 'moderator') RETURNING id`).Scan(&modID); err != nil {
+		t.Fatalf("seed moderator: %v", err)
+	}
+	if err := pool.QueryRow(ctx,
+		`INSERT INTO users (email) VALUES ('user@example.test') RETURNING id`).Scan(&userID); err != nil {
+		t.Fatalf("seed user: %v", err)
+	}
+	// A non-manual job, to prove the edit path cannot touch it.
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO jobs (source, external_id, url, title, public_slug)
+		 VALUES ('greenhouse', 'gh:1', 'http://ats.test/1', 'ATS Job', 'ats-job-acme-aaaa1111')`); err != nil {
+		t.Fatalf("seed ats job: %v", err)
+	}
+
+	iss := auth.NewIssuer("test-secret", time.Hour)
+	modCookie, _ := iss.Issue(modID, testTokenVersion)
+	userCookie, _ := iss.Issue(userID, testTokenVersion)
+	queries := db.New(pool)
+	h := &jobsHandlers{
+		queries:    queries,
+		moderation: moderation.New(moderation.NewQueriesRepository(queries, pool, enrich.Version)),
+	}
+
+	app := fiber.New(fiber.Config{ErrorHandler: RenderError})
+	keyAuth := auth.RequireAuthOrKey(iss, testVersions, apiKeys{queries})
+	requireMod := auth.RequireRole(queries, "moderator")
+	app.Post("/api/v1/jobs", keyAuth, requireMod, h.CreateJob)
+	app.Patch("/api/v1/jobs/:slug", keyAuth, requireMod, h.UpdateJob)
+
+	req := func(method, path, cookie string, body string) *http.Request {
+		var r *http.Request
+		if body != "" {
+			r = httptest.NewRequest(method, path, bytes.NewReader([]byte(body)))
+			r.Header.Set("Content-Type", "application/json")
+		} else {
+			r = httptest.NewRequest(method, path, nil)
+		}
+		if cookie != "" {
+			r.AddCookie(&http.Cookie{Name: auth.CookieName, Value: cookie})
+		}
+		return r
+	}
+
+	const validBody = `{"url":"https://acme.example/jobs/1","title":"Senior Go Developer","company":"Acme","location":"Germany","remote":true,"description":"We use Golang."}`
+
+	var createdSlug, createdHash string
+
+	t.Run("moderator creates a manual job (201)", func(t *testing.T) {
+		resp, err := app.Test(req(fiber.MethodPost, "/api/v1/jobs", modCookie, validBody))
+		if err != nil {
+			t.Fatalf("create: %v", err)
+		}
+		if resp.StatusCode != fiber.StatusCreated {
+			b, _ := io.ReadAll(resp.Body)
+			t.Fatalf("status = %d, want 201 (body %s)", resp.StatusCode, b)
+		}
+		var out struct {
+			Data struct {
+				PublicSlug string   `json:"public_slug"`
+				Source     string   `json:"source"`
+				WorkMode   string   `json:"work_mode"`
+				Countries  []string `json:"countries"`
+			} `json:"data"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		createdSlug = out.Data.PublicSlug
+		if out.Data.Source != "manual" {
+			t.Errorf("source = %q, want manual", out.Data.Source)
+		}
+		if out.Data.WorkMode != "remote" {
+			t.Errorf("work_mode = %q, want remote (from the remote flag)", out.Data.WorkMode)
+		}
+
+		// Authorship is recorded and not on the wire.
+		var createdBy int64
+		var source string
+		if err := pool.QueryRow(ctx,
+			"SELECT created_by, source FROM jobs WHERE public_slug = $1", createdSlug).Scan(&createdBy, &source); err != nil {
+			t.Fatalf("read back: %v", err)
+		}
+		if createdBy != modID {
+			t.Errorf("created_by = %d, want %d", createdBy, modID)
+		}
+		body, _ := json.Marshal(out)
+		if bytes.Contains(body, []byte("created_by")) {
+			t.Error("wire response leaked created_by")
+		}
+
+		// The derived columns are written by the same mapping every other write path
+		// uses. A NULL role_fingerprint would keep the vacancy out of role clustering
+		// (RoleClusterCount filters role_fingerprint <> ''), and a NULL content_hash
+		// would make the re-embed comparison NULL IS DISTINCT FROM NULL — false —
+		// freezing its semantic vector on the text of the first embed.
+		var fingerprint string
+		if err := pool.QueryRow(ctx,
+			"SELECT coalesce(content_hash, ''), coalesce(role_fingerprint, '') FROM jobs WHERE public_slug = $1",
+			createdSlug).Scan(&createdHash, &fingerprint); err != nil {
+			t.Fatalf("read derived columns: %v", err)
+		}
+		if createdHash == "" {
+			t.Error("content_hash is NULL; a later edit could never re-embed")
+		}
+		if fingerprint == "" {
+			t.Error("role_fingerprint is NULL; the vacancy can never cluster with the crawled copy of its role")
+		}
+	})
+
+	t.Run("re-POST same URL is idempotent (no duplicate)", func(t *testing.T) {
+		resp, err := app.Test(req(fiber.MethodPost, "/api/v1/jobs", modCookie, validBody))
+		if err != nil {
+			t.Fatalf("re-create: %v", err)
+		}
+		if resp.StatusCode != fiber.StatusCreated {
+			t.Fatalf("status = %d, want 201", resp.StatusCode)
+		}
+		var n int
+		if err := pool.QueryRow(ctx,
+			"SELECT count(*) FROM jobs WHERE source = 'manual' AND url = 'https://acme.example/jobs/1'").Scan(&n); err != nil {
+			t.Fatalf("count: %v", err)
+		}
+		if n != 1 {
+			t.Errorf("manual jobs for the URL = %d, want 1 (idempotent)", n)
+		}
+	})
+
+	t.Run("non-moderator is forbidden (403)", func(t *testing.T) {
+		resp, err := app.Test(req(fiber.MethodPost, "/api/v1/jobs", userCookie, validBody))
+		if err != nil {
+			t.Fatalf("create as user: %v", err)
+		}
+		if resp.StatusCode != fiber.StatusForbidden {
+			t.Errorf("status = %d, want 403", resp.StatusCode)
+		}
+	})
+
+	t.Run("unauthenticated is rejected (401)", func(t *testing.T) {
+		resp, err := app.Test(req(fiber.MethodPost, "/api/v1/jobs", "", validBody))
+		if err != nil {
+			t.Fatalf("create anon: %v", err)
+		}
+		if resp.StatusCode != fiber.StatusUnauthorized {
+			t.Errorf("status = %d, want 401", resp.StatusCode)
+		}
+	})
+
+	t.Run("missing required field is a 400", func(t *testing.T) {
+		resp, err := app.Test(req(fiber.MethodPost, "/api/v1/jobs", modCookie, `{"title":"X","company":"Y"}`))
+		if err != nil {
+			t.Fatalf("create bad: %v", err)
+		}
+		if resp.StatusCode != fiber.StatusBadRequest {
+			t.Errorf("status = %d, want 400", resp.StatusCode)
+		}
+	})
+
+	t.Run("moderator edits the manual job (200)", func(t *testing.T) {
+		resp, err := app.Test(req(fiber.MethodPatch, "/api/v1/jobs/"+createdSlug, modCookie, `{"title":"Staff Go Developer"}`))
+		if err != nil {
+			t.Fatalf("edit: %v", err)
+		}
+		if resp.StatusCode != fiber.StatusOK {
+			b, _ := io.ReadAll(resp.Body)
+			t.Fatalf("status = %d, want 200 (body %s)", resp.StatusCode, b)
+		}
+		var title string
+		var updatedBy int64
+		if err := pool.QueryRow(ctx,
+			"SELECT title, updated_by FROM jobs WHERE public_slug = $1", createdSlug).Scan(&title, &updatedBy); err != nil {
+			t.Fatalf("read back: %v", err)
+		}
+		if title != "Staff Go Developer" {
+			t.Errorf("title = %q, want the edited value", title)
+		}
+		if updatedBy != modID {
+			t.Errorf("updated_by = %d, want %d", updatedBy, modID)
+		}
+
+		// The edit re-derives the facets from the edited content, so the content
+		// fingerprint must move with them — it is what makes the semantic vector
+		// re-embed instead of describing the pre-edit text forever. The role
+		// fingerprint moves too here, because the edited field is the title.
+		var editedHash, editedFingerprint string
+		if err := pool.QueryRow(ctx,
+			"SELECT coalesce(content_hash, ''), coalesce(role_fingerprint, '') FROM jobs WHERE public_slug = $1",
+			createdSlug).Scan(&editedHash, &editedFingerprint); err != nil {
+			t.Fatalf("read derived columns: %v", err)
+		}
+		if editedHash == "" || editedHash == createdHash {
+			t.Errorf("content_hash = %q after the edit, want a new fingerprint (was %q)", editedHash, createdHash)
+		}
+		if editedFingerprint == "" {
+			t.Error("role_fingerprint is NULL after the edit")
+		}
+	})
+
+	t.Run("editing a non-manual job is a 404", func(t *testing.T) {
+		resp, err := app.Test(req(fiber.MethodPatch, "/api/v1/jobs/ats-job-acme-aaaa1111", modCookie, `{"title":"Hijacked"}`))
+		if err != nil {
+			t.Fatalf("edit ats: %v", err)
+		}
+		if resp.StatusCode != fiber.StatusNotFound {
+			t.Errorf("status = %d, want 404", resp.StatusCode)
+		}
+	})
+
+	// A private job is the jd-tailor-intake path: one user's pasted JD, kept out of reach
+	// by an unguessable slug. It stamps created_by with the SUBMITTER, so the
+	// created_by IS NOT NULL scope that keeps this endpoint off crawled vacancies matched
+	// it too — a moderator holding the slug could read one user's private text and rewrite
+	// it, and the edit's company_upsert CTE would mint a public companies row from the
+	// employer that InsertPrivateJob deliberately refuses to register.
+	t.Run("editing a private job is a 404 and mints no company", func(t *testing.T) {
+		if _, err := pool.Exec(ctx,
+			`INSERT INTO jobs (source, external_id, url, title, company, company_slug, description,
+			                   public_slug, created_by, is_private)
+			 VALUES ('weblink', 'private:1', 'http://stealth.test/1', 'Private Role', 'Stealthworks', 'stealthworks',
+			         'Confidential body', 'private-role-stealthworks-bbbb2222', $1, true)`, userID); err != nil {
+			t.Fatalf("seed private job: %v", err)
+		}
+
+		resp, err := app.Test(req(fiber.MethodPatch, "/api/v1/jobs/private-role-stealthworks-bbbb2222", modCookie, `{"title":"Hijacked","company":"Stealthworks"}`))
+		if err != nil {
+			t.Fatalf("edit private: %v", err)
+		}
+		defer func() { _ = resp.Body.Close() }()
+		if resp.StatusCode != fiber.StatusNotFound {
+			t.Errorf("status = %d, want 404", resp.StatusCode)
+		}
+
+		var title string
+		if err := pool.QueryRow(ctx,
+			"SELECT title FROM jobs WHERE public_slug = 'private-role-stealthworks-bbbb2222'").Scan(&title); err != nil {
+			t.Fatalf("read back private job: %v", err)
+		}
+		if title != "Private Role" {
+			t.Errorf("title = %q, want the private job left untouched", title)
+		}
+
+		var companies int
+		if err := pool.QueryRow(ctx,
+			"SELECT count(*) FROM companies WHERE slug = 'stealthworks'").Scan(&companies); err != nil {
+			t.Fatalf("count companies: %v", err)
+		}
+		if companies != 0 {
+			t.Errorf("companies rows for the private JD's employer = %d, want 0", companies)
+		}
+	})
+}

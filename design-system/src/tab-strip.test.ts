@@ -1,0 +1,279 @@
+import { render } from '@testing-library/svelte';
+import { flushSync } from 'svelte';
+import { describe, expect, it, vi } from 'vitest';
+import { House } from '@lucide/svelte';
+import TabStrip, { tabStripId } from './tab-strip.svelte';
+import { must } from './test-utils';
+
+const TABS = [
+  { id: 'one', label: 'One' },
+  { id: 'two', label: 'Two' },
+  { id: 'three', label: 'Three' },
+];
+
+const LINK_TABS = [
+  { id: 'one', label: 'One', href: '/one' },
+  { id: 'two', label: 'Two', href: '/two' },
+  { id: 'three', label: 'Three', href: '/three' },
+];
+
+function setup(active = 'one') {
+  const onSelect = vi.fn();
+  const { getAllByRole, getByRole, rerender } = render(TabStrip, {
+    tabs: TABS,
+    active,
+    onSelect,
+    label: 'Demo sections',
+    panelId: 'demo-panel',
+  });
+  return { tabs: getAllByRole('tab') as HTMLButtonElement[], getByRole, onSelect, rerender };
+}
+
+describe('TabStrip', () => {
+  it('makes only the active tab reachable by Tab, the roving tabindex', () => {
+    const { tabs } = setup('two');
+
+    expect(tabs[0]?.tabIndex).toBe(-1);
+    expect(tabs[1]?.tabIndex).toBe(0);
+    expect(tabs[1]?.getAttribute('aria-selected')).toBe('true');
+  });
+
+  it('reports the selection to the caller rather than owning it', async () => {
+    const { tabs, onSelect } = setup('one');
+
+    await fireArrow(must(tabs[0]), 'ArrowRight');
+
+    expect(onSelect).toHaveBeenCalledWith('two');
+    // Controlled: the DOM has not moved on its own until the caller re-renders with the new active id.
+    expect(tabs[0]?.getAttribute('aria-selected')).toBe('true');
+  });
+
+  it('wraps around both ends', async () => {
+    const { tabs, onSelect, rerender } = setup('one');
+    await fireArrow(must(tabs[0]), 'ArrowLeft');
+    expect(onSelect).toHaveBeenCalledWith('three');
+
+    // Controlled component: simulate the caller committing the selection before
+    // checking the other end wraps too.
+    await rerender({ tabs: TABS, active: 'three', onSelect, label: 'Demo sections', panelId: 'demo-panel' });
+    await fireArrow(must(tabs[2]), 'ArrowRight');
+    expect(onSelect).toHaveBeenCalledWith('one');
+  });
+
+  it('Home and End jump to the first and last tab', async () => {
+    const { tabs, onSelect } = setup('two');
+
+    await fireArrow(must(tabs[1]), 'Home');
+    expect(onSelect).toHaveBeenCalledWith('one');
+
+    await fireArrow(must(tabs[1]), 'End');
+    expect(onSelect).toHaveBeenCalledWith('three');
+  });
+
+  it('leaves other keys to the browser', () => {
+    const { tabs, onSelect } = setup('one');
+    const event = new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true });
+
+    tabs[0]?.dispatchEvent(event);
+
+    expect(event.defaultPrevented).toBe(false);
+    expect(onSelect).not.toHaveBeenCalled();
+  });
+
+  it('points each tab id at its panel through the shared helper', () => {
+    const { tabs } = setup('one');
+
+    expect(tabs[0]?.id).toBe(tabStripId('demo-panel', 'one'));
+    expect(tabs[0]?.getAttribute('aria-controls')).toBe('demo-panel');
+  });
+
+  it('names the strip for assistive tech', () => {
+    const { getByRole } = render(TabStrip, {
+      tabs: TABS,
+      active: 'one',
+      onSelect: vi.fn(),
+      label: 'Profile sections',
+      panelId: 'demo-panel',
+    });
+
+    expect(getByRole('tablist').getAttribute('aria-label')).toBe('Profile sections');
+  });
+
+  // A strip whose tabs ARE routes has to be middle-clickable and openable in a new tab;
+  // a button plus a programmatic navigation looks identical and is neither.
+  it('renders a tab carrying an href as an anchor', () => {
+    const { getAllByRole } = render(TabStrip, {
+      tabs: [
+        { id: 'one', label: 'One', href: '/one' },
+        { id: 'two', label: 'Two', href: '/two' },
+      ],
+      active: 'one',
+      label: 'Demo sections',
+      panelId: 'demo-panel',
+    });
+
+    const tabs = getAllByRole('tab');
+    expect(must(tabs[0]).tagName).toBe('A');
+    expect(must(tabs[1]).getAttribute('href')).toBe('/two');
+  });
+
+  // Automatic activation is right for panes already rendered client-side and wrong for
+  // links: it would fire a navigation per keypress while the reader is still scanning.
+  it('moves focus without navigating when the tabs are links', async () => {
+    const onSelect = vi.fn();
+    const { getAllByRole } = render(TabStrip, {
+      tabs: LINK_TABS,
+      active: 'one',
+      onSelect,
+      label: 'Demo sections',
+      panelId: 'demo-panel',
+    });
+
+    const tabs = getAllByRole('tab');
+    await fireArrow(must(tabs[0]), 'ArrowRight');
+
+    expect(onSelect).not.toHaveBeenCalled();
+    expect(document.activeElement).toBe(tabs[1]);
+  });
+
+  // The regression a single press could not see: a link strip does not move its selection
+  // on an arrow, so a step measured from `active` returned the same neighbour every time
+  // and the row could not be walked past its first hop.
+  it('keeps walking a link strip across successive presses', async () => {
+    const { getAllByRole } = render(TabStrip, {
+      tabs: LINK_TABS,
+      active: 'one',
+      label: 'Demo sections',
+      panelId: 'demo-panel',
+    });
+
+    const tabs = getAllByRole('tab');
+    await fireArrow(must(tabs[0]), 'ArrowRight');
+    await fireArrow(must(tabs[1]), 'ArrowRight');
+
+    expect(document.activeElement).toBe(tabs[2]);
+  });
+
+  it('walks a link strip backwards from the focused tab too', async () => {
+    const { getAllByRole } = render(TabStrip, {
+      tabs: LINK_TABS,
+      active: 'one',
+      label: 'Demo sections',
+      panelId: 'demo-panel',
+    });
+
+    const tabs = getAllByRole('tab');
+    // Off the left end of the selected tab wraps to the last, then back one.
+    await fireArrow(must(tabs[0]), 'ArrowLeft');
+    await fireArrow(must(tabs[2]), 'ArrowLeft');
+
+    expect(document.activeElement).toBe(tabs[1]);
+  });
+
+  it('renders a tab icon when one is given', () => {
+    const { container } = render(TabStrip, {
+      tabs: [{ id: 'one', label: 'One', icon: House }],
+      active: 'one',
+      onSelect: vi.fn(),
+      label: 'Demo sections',
+      panelId: 'demo-panel',
+    });
+
+    expect(container.querySelectorAll('svg').length).toBe(1);
+  });
+
+  // The regression: the ResizeObserver effect only tracked `strip`, so a tab added
+  // after mount was never observed and the overflow fade mask could never react to it.
+  it('re-observes a tab added after mount', async () => {
+    const observed: Element[] = [];
+    const originalRO = globalThis.ResizeObserver;
+    class SpyResizeObserver {
+      observe(el: Element) {
+        observed.push(el);
+      }
+      unobserve() {}
+      disconnect() {}
+    }
+    globalThis.ResizeObserver = SpyResizeObserver as unknown as typeof ResizeObserver;
+
+    try {
+      const onSelect = vi.fn();
+      const { getAllByRole, rerender } = render(TabStrip, {
+        tabs: TABS,
+        active: 'one',
+        onSelect,
+        label: 'Demo sections',
+        panelId: 'demo-panel',
+      });
+      // The strip element itself plus one entry per tab button.
+      expect(observed.length).toBe(TABS.length + 1);
+      observed.length = 0;
+
+      const grown = [...TABS, { id: 'four', label: 'Four' }];
+      await rerender({ tabs: grown, active: 'one', onSelect, label: 'Demo sections', panelId: 'demo-panel' });
+
+      const newTab = must(getAllByRole('tab')[3]);
+      expect(observed).toContain(newTab);
+    } finally {
+      globalThis.ResizeObserver = originalRO;
+    }
+  });
+
+  // The strip is not sticky, so a page scroll carries a tab's boundary past a pointer
+  // that never moved — a real hover enter/leave the reader did nothing to cause. Without
+  // this guard `transition-colors` turns every one of those into a visible fade, and a
+  // scroll gesture fires a rapid string of them. The guard doesn't touch the hover
+  // affordance itself, only whether the color change animates while a scroll is in flight.
+  it('drops the hover color transition while the page is scrolling, and restores it once it settles', () => {
+    vi.useFakeTimers();
+    try {
+      const { tabs } = setup('one');
+
+      expect(tabs[1]?.className).toContain('transition-colors');
+      expect(tabs[1]?.className).not.toContain('transition-none');
+
+      window.dispatchEvent(new Event('scroll'));
+      flushSync();
+
+      expect(tabs[1]?.className).toContain('transition-none');
+      expect(tabs[1]?.className).not.toContain('transition-colors');
+
+      vi.advanceTimersByTime(150);
+      flushSync();
+
+      expect(tabs[1]?.className).toContain('transition-colors');
+      expect(tabs[1]?.className).not.toContain('transition-none');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  // The strip has a SECOND scroll of its own — its own row scrolls horizontally once the
+  // tabs outgrow it (`overflow-x-auto`), which is exactly what this component exists to
+  // handle on a narrow viewport. A DOM `scroll` event doesn't bubble, so that scroll never
+  // reaches the `window` listener above; it needs the same guard applied independently, or
+  // dragging the row under a stationary pointer flickers exactly like the vertical case.
+  it('also drops the transition while the strip scrolls itself, not just the page', () => {
+    vi.useFakeTimers();
+    try {
+      const { tabs, getByRole } = setup('one');
+
+      getByRole('tablist').dispatchEvent(new Event('scroll'));
+      flushSync();
+
+      expect(tabs[1]?.className).toContain('transition-none');
+
+      vi.advanceTimersByTime(150);
+      flushSync();
+
+      expect(tabs[1]?.className).toContain('transition-colors');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+async function fireArrow(el: HTMLElement, key: 'ArrowLeft' | 'ArrowRight' | 'Home' | 'End') {
+  el.dispatchEvent(new KeyboardEvent('keydown', { key, bubbles: true, cancelable: true }));
+  await Promise.resolve();
+}

@@ -1,0 +1,706 @@
+//go:build integration
+
+// Integration test for the company-list endpoint's name search: GET
+// /api/v1/companies?q= must filter the returned companies and report the
+// filtered count in meta.total (so search pagination is correct). The handler
+// uses a concrete *db.Queries, so the wire contract can only be exercised
+// against a real Postgres. Run with: go test -tags=integration ./internal/api/handler/
+package handler
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"io"
+	"net/http/httptest"
+	"reflect"
+	"sort"
+	"strings"
+	"testing"
+
+	"github.com/strelov1/freehire/internal/platform/testdb"
+
+	"github.com/gofiber/fiber/v2"
+	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/strelov1/freehire/internal/platform/db"
+)
+
+func startPostgres(t *testing.T) *pgxpool.Pool {
+	t.Helper()
+	return testdb.Pool(t)
+}
+
+func TestListCompaniesSearchEndpoint(t *testing.T) {
+	pool := startPostgres(t)
+	ctx := context.Background()
+	for _, c := range []struct{ slug, name string }{
+		{"acme", "Acme Corp"}, {"acme-labs", "ACME Labs"}, {"globex", "Globex"},
+	} {
+		if _, err := pool.Exec(ctx,
+			`INSERT INTO companies (slug, name, job_count) VALUES ($1, $2, 1)`, c.slug, c.name); err != nil {
+			t.Fatalf("seed %q: %v", c.slug, err)
+		}
+	}
+
+	h := &companiesHandlers{queries: db.New(pool)}
+	app := fiber.New(fiber.Config{ErrorHandler: RenderError})
+	app.Get("/api/v1/companies", h.ListCompanies)
+
+	doList := func(t *testing.T, url string) (names []string, total float64) {
+		t.Helper()
+		resp, err := app.Test(httptest.NewRequest("GET", url, nil))
+		if err != nil {
+			t.Fatalf("request %q: %v", url, err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != fiber.StatusOK {
+			body, _ := io.ReadAll(resp.Body)
+			t.Fatalf("status = %d, want 200 (body %s)", resp.StatusCode, body)
+		}
+		var body struct {
+			Data []struct {
+				Name string `json:"name"`
+			} `json:"data"`
+			Meta struct {
+				Total float64 `json:"total"`
+			} `json:"meta"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		for _, c := range body.Data {
+			names = append(names, c.Name)
+		}
+		return names, body.Meta.Total
+	}
+
+	t.Run("q filters companies and meta.total is the filtered count", func(t *testing.T) {
+		names, total := doList(t, "/api/v1/companies?q=acme")
+		if len(names) != 2 {
+			t.Errorf("names = %v, want 2 ACME companies", names)
+		}
+		for _, n := range names {
+			if !strings.Contains(strings.ToLower(n), "acme") {
+				t.Errorf("returned non-matching company %q for q=acme", n)
+			}
+		}
+		if total != 2 {
+			t.Errorf("meta.total = %v, want 2 (filtered count)", total)
+		}
+	})
+
+	t.Run("empty q returns the full list", func(t *testing.T) {
+		// The unfiltered catalogue total is a planner estimate (EstimateHiringCompanies),
+		// not an exact count, so only the returned row set is asserted here — on a tiny
+		// seed table the estimate is a fixed planner guess unrelated to the real count.
+		names, _ := doList(t, "/api/v1/companies")
+		if len(names) != 3 {
+			t.Errorf("full list: names=%v, want 3", names)
+		}
+	})
+}
+
+// TestListCompaniesMeiliFallback proves that when the companies searcher errors, the
+// list endpoint degrades to the Postgres substring path rather than surfacing the
+// error — so /companies gains no new failure point from the Meili routing.
+func TestListCompaniesMeiliFallback(t *testing.T) {
+	pool := startPostgres(t)
+	ctx := context.Background()
+	for _, c := range []struct{ slug, name string }{
+		{"acme", "Acme Corp"}, {"acme-labs", "ACME Labs"}, {"globex", "Globex"},
+	} {
+		if _, err := pool.Exec(ctx,
+			`INSERT INTO companies (slug, name, job_count) VALUES ($1, $2, 1)`, c.slug, c.name); err != nil {
+			t.Fatalf("seed %q: %v", c.slug, err)
+		}
+	}
+
+	// A searcher that always errors forces the fallback on every search request.
+	h := &companiesHandlers{queries: db.New(pool), companySearch: &fakeCompanySearcher{err: errors.New("meili down")}}
+	app := fiber.New(fiber.Config{ErrorHandler: RenderError})
+	app.Get("/api/v1/companies", h.ListCompanies)
+
+	resp, err := app.Test(httptest.NewRequest("GET", "/api/v1/companies?q=acme", nil))
+	if err != nil {
+		t.Fatalf("request: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != fiber.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, want 200 (fallback should not error): body %s", resp.StatusCode, body)
+	}
+	var body struct {
+		Data []struct {
+			Name string `json:"name"`
+		} `json:"data"`
+		Meta struct {
+			Total float64 `json:"total"`
+		} `json:"meta"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(body.Data) != 2 || body.Meta.Total != 2 {
+		t.Errorf("fallback result = %d rows total=%v, want the 2 Postgres ACME matches", len(body.Data), body.Meta.Total)
+	}
+}
+
+// TestListCompaniesUnfilteredSkipsMeili proves the unfiltered catalogue is served by
+// Postgres (its ordering + O(1) estimate), never routed to Meilisearch, even when a
+// company searcher is wired.
+func TestListCompaniesUnfilteredSkipsMeili(t *testing.T) {
+	pool := startPostgres(t)
+	ctx := context.Background()
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO companies (slug, name, job_count) VALUES ('acme', 'Acme', 1)`); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	fake := &fakeCompanySearcher{}
+	h := &companiesHandlers{queries: db.New(pool), companySearch: fake}
+	app := fiber.New(fiber.Config{ErrorHandler: RenderError})
+	app.Get("/api/v1/companies", h.ListCompanies)
+
+	resp, err := app.Test(httptest.NewRequest("GET", "/api/v1/companies", nil))
+	if err != nil {
+		t.Fatalf("request: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != fiber.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	if fake.called {
+		t.Error("the unfiltered catalogue must not route to Meilisearch")
+	}
+}
+
+func TestListCompaniesFacetFilterEndpoint(t *testing.T) {
+	pool := startPostgres(t)
+	ctx := context.Background()
+
+	// Seed the denormalized facet arrays directly — this exercises the endpoint's
+	// array-overlap filter independently of how the arrays get derived.
+	seed := func(slug, name string, collections, regions, companyTypes []string) {
+		t.Helper()
+		if _, err := pool.Exec(ctx,
+			`INSERT INTO companies (slug, name, job_count, collections, regions, company_types)
+			 VALUES ($1, $2, 1, $3, $4, $5)`,
+			slug, name, collections, regions, companyTypes); err != nil {
+			t.Fatalf("seed %q: %v", slug, err)
+		}
+	}
+	seed("euro-lab", "Euro Lab", []string{"yc"}, []string{"europe"}, []string{"startup"})
+	seed("asia-co", "Asia Co", []string{}, []string{"asia"}, []string{"product"})
+	seed("euro-corp", "Euro Corp", []string{"bigtech"}, []string{"europe"}, []string{"enterprise"})
+	seed("global-lab", "Global Lab", []string{"yc"}, []string{"north_america"}, []string{"enterprise"})
+
+	h := &companiesHandlers{queries: db.New(pool)}
+	app := fiber.New(fiber.Config{ErrorHandler: RenderError})
+	app.Get("/api/v1/companies", h.ListCompanies)
+
+	doList := func(t *testing.T, url string) (slugs []string, total float64) {
+		t.Helper()
+		resp, err := app.Test(httptest.NewRequest("GET", url, nil))
+		if err != nil {
+			t.Fatalf("request %q: %v", url, err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != fiber.StatusOK {
+			body, _ := io.ReadAll(resp.Body)
+			t.Fatalf("status = %d, want 200 (body %s)", resp.StatusCode, body)
+		}
+		var body struct {
+			Data []struct {
+				Slug string `json:"slug"`
+			} `json:"data"`
+			Meta struct {
+				Total float64 `json:"total"`
+			} `json:"meta"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		for _, c := range body.Data {
+			slugs = append(slugs, c.Slug)
+		}
+		sort.Strings(slugs)
+		return slugs, body.Meta.Total
+	}
+
+	assertSlugs := func(t *testing.T, url string, want []string) {
+		t.Helper()
+		got, total := doList(t, url)
+		sort.Strings(want)
+		if strings.Join(got, ",") != strings.Join(want, ",") {
+			t.Errorf("%s → slugs %v, want %v", url, got, want)
+		}
+		if int(total) != len(want) {
+			t.Errorf("%s → meta.total %v, want %d", url, total, len(want))
+		}
+	}
+
+	t.Run("single facet filters by array membership", func(t *testing.T) {
+		assertSlugs(t, "/api/v1/companies?regions=europe", []string{"euro-corp", "euro-lab"})
+	})
+
+	t.Run("each row carries its collections", func(t *testing.T) {
+		// The catalogue card renders the backer marks (Y Combinator, a16z) from this
+		// field. Filtering by a collection while not returning it left the list unable
+		// to show what it had just filtered on.
+		req := httptest.NewRequest("GET", "/api/v1/companies?q=euro-lab", nil)
+		resp, err := app.Test(req, -1)
+		if err != nil {
+			t.Fatalf("request: %v", err)
+		}
+		defer resp.Body.Close()
+		var got struct {
+			Data []struct {
+				Slug        string   `json:"slug"`
+				Collections []string `json:"collections"`
+			} `json:"data"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		if len(got.Data) != 1 {
+			t.Fatalf("got %d rows, want 1: %+v", len(got.Data), got.Data)
+		}
+		if !reflect.DeepEqual(got.Data[0].Collections, []string{"yc"}) {
+			t.Errorf("collections = %+v, want [yc]", got.Data[0].Collections)
+		}
+	})
+
+	t.Run("multiple values within a facet are OR-ed", func(t *testing.T) {
+		assertSlugs(t, "/api/v1/companies?regions=europe&regions=asia",
+			[]string{"asia-co", "euro-corp", "euro-lab"})
+	})
+
+	t.Run("different facets are AND-ed", func(t *testing.T) {
+		assertSlugs(t, "/api/v1/companies?collections=yc&company_type=startup",
+			[]string{"euro-lab"})
+	})
+
+	t.Run("facets compose with the name search", func(t *testing.T) {
+		assertSlugs(t, "/api/v1/companies?collections=yc&q=lab",
+			[]string{"euro-lab", "global-lab"})
+	})
+
+	t.Run("no facet params returns the full list", func(t *testing.T) {
+		// Unfiltered: meta.total is a planner estimate, so assert only the row set.
+		got, _ := doList(t, "/api/v1/companies")
+		want := []string{"asia-co", "euro-corp", "euro-lab", "global-lab"}
+		if strings.Join(got, ",") != strings.Join(want, ",") {
+			t.Errorf("/api/v1/companies → slugs %v, want %v", got, want)
+		}
+	})
+}
+
+func TestListCompaniesSubindustryFacet(t *testing.T) {
+	pool := startPostgres(t)
+	ctx := context.Background()
+
+	// subindustry is a nullable SCALAR column filtered by membership (= ANY), so a
+	// NULL-subindustry company must never match a subindustries filter.
+	seed := func(slug string, subindustry any) {
+		t.Helper()
+		if _, err := pool.Exec(ctx,
+			`INSERT INTO companies (slug, name, job_count, subindustry) VALUES ($1, $1, 1, $2)`,
+			slug, subindustry); err != nil {
+			t.Fatalf("seed %q: %v", slug, err)
+		}
+	}
+	seed("payco", "Payments")
+	seed("payco2", "Payments")
+	seed("diagco", "Diagnostics")
+	seed("plainco", nil) // NULL subindustry
+
+	h := &companiesHandlers{queries: db.New(pool)}
+	app := fiber.New(fiber.Config{ErrorHandler: RenderError})
+	app.Get("/api/v1/companies", h.ListCompanies)
+
+	query := func(t *testing.T, url string) (slugs []string, total float64) {
+		t.Helper()
+		resp, err := app.Test(httptest.NewRequest("GET", url, nil))
+		if err != nil {
+			t.Fatalf("request %q: %v", url, err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != fiber.StatusOK {
+			body, _ := io.ReadAll(resp.Body)
+			t.Fatalf("status = %d, want 200 (body %s)", resp.StatusCode, body)
+		}
+		var body struct {
+			Data []struct {
+				Slug string `json:"slug"`
+			} `json:"data"`
+			Meta struct {
+				Total float64 `json:"total"`
+			} `json:"meta"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		for _, c := range body.Data {
+			slugs = append(slugs, c.Slug)
+		}
+		sort.Strings(slugs)
+		return slugs, body.Meta.Total
+	}
+
+	assert := func(t *testing.T, url string, want []string) {
+		t.Helper()
+		got, total := query(t, url)
+		sort.Strings(want)
+		if strings.Join(got, ",") != strings.Join(want, ",") {
+			t.Errorf("%s → slugs %v, want %v", url, got, want)
+		}
+		if int(total) != len(want) {
+			t.Errorf("%s → meta.total %v, want %d", url, total, len(want))
+		}
+	}
+
+	t.Run("single subindustry filters by membership", func(t *testing.T) {
+		assert(t, "/api/v1/companies?subindustries=Payments", []string{"payco", "payco2"})
+	})
+
+	t.Run("multiple subindustries are OR-ed", func(t *testing.T) {
+		assert(t, "/api/v1/companies?subindustries=Payments&subindustries=Diagnostics",
+			[]string{"diagco", "payco", "payco2"})
+	})
+
+	t.Run("NULL subindustry matches no filter", func(t *testing.T) {
+		assert(t, "/api/v1/companies?subindustries=Payments", []string{"payco", "payco2"})
+	})
+
+	t.Run("no subindustry param returns all", func(t *testing.T) {
+		// Unfiltered: meta.total is a planner estimate, so assert only the row set.
+		got, _ := query(t, "/api/v1/companies")
+		want := []string{"diagco", "payco", "payco2", "plainco"}
+		if strings.Join(got, ",") != strings.Join(want, ",") {
+			t.Errorf("/api/v1/companies → slugs %v, want %v", got, want)
+		}
+	})
+}
+
+func TestCompanySubindustriesEndpoint(t *testing.T) {
+	pool := startPostgres(t)
+	ctx := context.Background()
+
+	seed := func(slug string, subindustry any) {
+		t.Helper()
+		if _, err := pool.Exec(ctx,
+			`INSERT INTO companies (slug, name, job_count, subindustry) VALUES ($1, $1, 1, $2)`,
+			slug, subindustry); err != nil {
+			t.Fatalf("seed %q: %v", slug, err)
+		}
+	}
+	seed("payco", "Payments")
+	seed("payco2", "Payments")
+	seed("diagco", "Diagnostics")
+	seed("plainco", nil) // NULL — excluded from the vocabulary
+
+	h := &companiesHandlers{queries: db.New(pool)}
+	app := fiber.New(fiber.Config{ErrorHandler: RenderError})
+	app.Get("/api/v1/companies/subindustries", h.CompanySubindustries)
+
+	resp, err := app.Test(httptest.NewRequest("GET", "/api/v1/companies/subindustries", nil))
+	if err != nil {
+		t.Fatalf("request: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != fiber.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, want 200 (body %s)", resp.StatusCode, body)
+	}
+	var body struct {
+		Data []struct {
+			Value string `json:"value"`
+			Count int    `json:"count"`
+		} `json:"data"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	// Distinct non-NULL subindustries, most common first; NULL excluded.
+	if len(body.Data) != 2 {
+		t.Fatalf("got %d rows, want 2: %+v", len(body.Data), body.Data)
+	}
+	if body.Data[0].Value != "Payments" || body.Data[0].Count != 2 {
+		t.Errorf("row[0] = %+v, want {Payments 2}", body.Data[0])
+	}
+	if body.Data[1].Value != "Diagnostics" || body.Data[1].Count != 1 {
+		t.Errorf("row[1] = %+v, want {Diagnostics 1}", body.Data[1])
+	}
+}
+
+func TestListCompaniesRemoteRegionsFacet(t *testing.T) {
+	pool := startPostgres(t)
+	ctx := context.Background()
+	if _, err := pool.Exec(ctx, "TRUNCATE companies RESTART IDENTITY CASCADE"); err != nil {
+		t.Fatalf("truncate: %v", err)
+	}
+
+	// remote_regions (curated) and regions (job-derived) are deliberately crossed,
+	// so a filter that hit the wrong column would return the wrong company.
+	seed := func(slug string, remote, regions []string) {
+		t.Helper()
+		if _, err := pool.Exec(ctx,
+			`INSERT INTO companies (slug, name, job_count, remote_regions, regions) VALUES ($1, $1, 1, $2, $3)`,
+			slug, remote, regions); err != nil {
+			t.Fatalf("seed %q: %v", slug, err)
+		}
+	}
+	seed("eu-remote", []string{"eu"}, []string{"north_america"})
+	seed("na-remote", []string{"north_america"}, []string{"eu"})
+	seed("global-remote", []string{"global"}, []string{})
+
+	h := &companiesHandlers{queries: db.New(pool)}
+	app := fiber.New(fiber.Config{ErrorHandler: RenderError})
+	app.Get("/api/v1/companies", h.ListCompanies)
+
+	list := func(url string) (slugs []string, total float64) {
+		resp, err := app.Test(httptest.NewRequest("GET", url, nil))
+		if err != nil {
+			t.Fatalf("request %q: %v", url, err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != fiber.StatusOK {
+			body, _ := io.ReadAll(resp.Body)
+			t.Fatalf("status = %d, want 200 (body %s)", resp.StatusCode, body)
+		}
+		var body struct {
+			Data []struct {
+				Slug string `json:"slug"`
+			} `json:"data"`
+			Meta struct {
+				Total float64 `json:"total"`
+			} `json:"meta"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		for _, c := range body.Data {
+			slugs = append(slugs, c.Slug)
+		}
+		sort.Strings(slugs)
+		return slugs, body.Meta.Total
+	}
+
+	t.Run("filters by the remote_regions column", func(t *testing.T) {
+		got, total := list("/api/v1/companies?remote_regions=eu")
+		if strings.Join(got, ",") != "eu-remote" || int(total) != 1 {
+			t.Errorf("?remote_regions=eu → %v total=%v, want [eu-remote]/1", got, total)
+		}
+	})
+
+	t.Run("is independent of the job-derived regions facet", func(t *testing.T) {
+		got, _ := list("/api/v1/companies?regions=eu")
+		if strings.Join(got, ",") != "na-remote" {
+			t.Errorf("?regions=eu → %v, want [na-remote] (regions column, not remote_regions)", got)
+		}
+	})
+}
+
+func TestListCompaniesYCFacets(t *testing.T) {
+	pool := startPostgres(t)
+	ctx := context.Background()
+	if _, err := pool.Exec(ctx, "TRUNCATE companies RESTART IDENTITY CASCADE"); err != nil {
+		t.Fatalf("truncate: %v", err)
+	}
+	seed := func(slug string, batch, status []string) {
+		t.Helper()
+		if _, err := pool.Exec(ctx,
+			`INSERT INTO companies (slug, name, job_count, yc_batch, yc_status) VALUES ($1, $1, 1, $2, $3)`,
+			slug, batch, status); err != nil {
+			t.Fatalf("seed %q: %v", slug, err)
+		}
+	}
+	seed("stripe", []string{"Summer 2009"}, []string{"Public"})
+	seed("airbnb", []string{"Winter 2009"}, []string{"Public"})
+	seed("newco", []string{"Winter 2024"}, []string{"Active"})
+	seed("nonyc", []string{}, []string{}) // no YC facets
+
+	h := &companiesHandlers{queries: db.New(pool)}
+	app := fiber.New(fiber.Config{ErrorHandler: RenderError})
+	app.Get("/api/v1/companies", h.ListCompanies)
+
+	list := func(url string) (slugs []string, total float64) {
+		resp, err := app.Test(httptest.NewRequest("GET", url, nil))
+		if err != nil {
+			t.Fatalf("request %q: %v", url, err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != fiber.StatusOK {
+			body, _ := io.ReadAll(resp.Body)
+			t.Fatalf("status %d (body %s)", resp.StatusCode, body)
+		}
+		var body struct {
+			Data []struct {
+				Slug string `json:"slug"`
+			} `json:"data"`
+			Meta struct {
+				Total float64 `json:"total"`
+			} `json:"meta"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		for _, c := range body.Data {
+			slugs = append(slugs, c.Slug)
+		}
+		sort.Strings(slugs)
+		return slugs, body.Meta.Total
+	}
+
+	t.Run("status facet", func(t *testing.T) {
+		got, total := list("/api/v1/companies?yc_status=Public")
+		if strings.Join(got, ",") != "airbnb,stripe" || int(total) != 2 {
+			t.Errorf("yc_status=Public → %v total=%v, want [airbnb stripe]/2", got, total)
+		}
+	})
+
+	t.Run("batch AND status compose", func(t *testing.T) {
+		got, _ := list("/api/v1/companies?yc_status=Public&yc_batch=Summer%202009")
+		if strings.Join(got, ",") != "stripe" {
+			t.Errorf("→ %v, want [stripe]", got)
+		}
+	})
+}
+
+func TestListCompaniesYCStageFlags(t *testing.T) {
+	pool := startPostgres(t)
+	ctx := context.Background()
+	if _, err := pool.Exec(ctx, "TRUNCATE companies RESTART IDENTITY CASCADE"); err != nil {
+		t.Fatalf("truncate: %v", err)
+	}
+	seed := func(slug string, stage, flags []string) {
+		t.Helper()
+		if _, err := pool.Exec(ctx,
+			`INSERT INTO companies (slug, name, job_count, yc_stage, yc_flags) VALUES ($1, $1, 1, $2, $3)`,
+			slug, stage, flags); err != nil {
+			t.Fatalf("seed %q: %v", slug, err)
+		}
+	}
+	seed("growthtop", []string{"Growth"}, []string{"top_company", "hiring"})
+	seed("earlyhiring", []string{"Early"}, []string{"hiring"})
+	seed("growthplain", []string{"Growth"}, []string{})
+
+	h := &companiesHandlers{queries: db.New(pool)}
+	app := fiber.New(fiber.Config{ErrorHandler: RenderError})
+	app.Get("/api/v1/companies", h.ListCompanies)
+
+	list := func(url string) (slugs []string, total float64) {
+		resp, err := app.Test(httptest.NewRequest("GET", url, nil))
+		if err != nil {
+			t.Fatalf("request: %v", err)
+		}
+		defer resp.Body.Close()
+		var body struct {
+			Data []struct {
+				Slug string `json:"slug"`
+			} `json:"data"`
+			Meta struct {
+				Total float64 `json:"total"`
+			} `json:"meta"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		for _, c := range body.Data {
+			slugs = append(slugs, c.Slug)
+		}
+		sort.Strings(slugs)
+		return slugs, body.Meta.Total
+	}
+
+	t.Run("flags facet (OR within)", func(t *testing.T) {
+		got, total := list("/api/v1/companies?yc_flags=hiring")
+		if strings.Join(got, ",") != "earlyhiring,growthtop" || int(total) != 2 {
+			t.Errorf("yc_flags=hiring → %v/%v", got, total)
+		}
+	})
+	t.Run("stage AND flags", func(t *testing.T) {
+		got, _ := list("/api/v1/companies?yc_stage=Growth&yc_flags=top_company")
+		if strings.Join(got, ",") != "growthtop" {
+			t.Errorf("→ %v, want [growthtop]", got)
+		}
+	})
+}
+
+// A company's public page must not list the jd-tailor-intake private postings that name
+// it. InsertPrivateJob derives a company_slug from whatever employer the pasted text
+// names, the route is anonymous, and the list is ordered newest-first — so a private JD
+// naming a company the catalogue already knows arrived at the TOP of that company's page,
+// with its full pasted body. The page also contradicted itself: RefreshCompanyFacets
+// already leaves private rows out of companies.job_count.
+func TestGetCompanyOmitsPrivateJobs(t *testing.T) {
+	pool := startPostgres(t)
+	ctx := context.Background()
+
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO companies (slug, name, job_count) VALUES ('stealthco', 'Stealth Co', 1)`); err != nil {
+		t.Fatalf("seed company: %v", err)
+	}
+	var submitterID int64
+	if err := pool.QueryRow(ctx,
+		`INSERT INTO users (email) VALUES ('paster@example.test') RETURNING id`).Scan(&submitterID); err != nil {
+		t.Fatalf("seed submitter: %v", err)
+	}
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO jobs (source, external_id, url, title, company, company_slug, description, public_slug)
+		 VALUES ('greenhouse', 'gh:stealth:1', 'http://ats.test/s1', 'Public Role', 'Stealth Co', 'stealthco',
+		         'Public body', 'public-role-stealthco-cccc3333')`); err != nil {
+		t.Fatalf("seed public job: %v", err)
+	}
+	// Written after the public one, so newest-first ordering would put it first.
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO jobs (source, external_id, url, title, company, company_slug, description, public_slug,
+		                   created_by, is_private)
+		 VALUES ('pasted', 'private:stealth:1', '', 'Private Role', 'Stealth Co', 'stealthco',
+		         'Confidential body', 'private-role-stealthco-dddd4444', $1, true)`, submitterID); err != nil {
+		t.Fatalf("seed private job: %v", err)
+	}
+
+	h := &companiesHandlers{queries: db.New(pool)}
+	app := fiber.New(fiber.Config{ErrorHandler: RenderError})
+	app.Get("/api/v1/companies/:slug", h.GetCompany)
+
+	resp, err := app.Test(httptest.NewRequestWithContext(ctx, "GET", "/api/v1/companies/stealthco", nil))
+	if err != nil {
+		t.Fatalf("request: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != fiber.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, want 200 (body %s)", resp.StatusCode, body)
+	}
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	var body struct {
+		Data struct {
+			Jobs []struct {
+				PublicSlug string `json:"public_slug"`
+			} `json:"jobs"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(raw, &body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+
+	var slugs []string
+	for _, j := range body.Data.Jobs {
+		slugs = append(slugs, j.PublicSlug)
+	}
+	sort.Strings(slugs)
+	if strings.Join(slugs, ",") != "public-role-stealthco-cccc3333" {
+		t.Errorf("company jobs = %v, want only the public posting", slugs)
+	}
+	// Belt and braces on the leak that matters: the pasted body must not be on the wire
+	// under any key, whatever the projection is shaped like.
+	if strings.Contains(string(raw), "Confidential body") {
+		t.Error("the private posting's pasted description reached the anonymous company page")
+	}
+}

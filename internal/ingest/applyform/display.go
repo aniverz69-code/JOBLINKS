@@ -1,0 +1,169 @@
+package applyform
+
+import (
+	"html"
+	"slices"
+	"strings"
+
+	"github.com/microcosm-cc/bluemonday"
+)
+
+// Display is a captured form shaped for a candidate to read rather than for a
+// machine to submit. It is the near-inverse of what the store keeps: the store holds
+// the platform's identifiers and option values because they exist to be handed back,
+// and a reader wants none of that — only the question and one word about the answer.
+type Display struct {
+	// Provider is the platform the form was read from, so a reader can say where the
+	// answer came from.
+	Provider string `json:"provider"`
+	// Basics are the controls every application demands — name, contact details, CV —
+	// listed once instead of one entry each. Stated rather than dropped, because a
+	// form that does NOT want a CV is worth knowing too.
+	Basics []string `json:"basics"`
+	// Questions are the employer's own, in the order the form presents them.
+	Questions []Question `json:"questions"`
+}
+
+// Question is one thing the employer will ask.
+type Question struct {
+	// Text is the question as the employer wrote it, unedited.
+	Text string `json:"text"`
+	// Required is whether the platform refuses the application without an answer.
+	Required bool `json:"required"`
+	// Answer names the kind of answer expected, empty where naming it would add
+	// nothing (a one-line answer is the default expectation) or where the capture
+	// could not normalize the control's kind.
+	Answer string `json:"answer,omitempty"`
+}
+
+// answerWords name each control kind for a reader. The absent entries are deliberate:
+// a single-line answer is what anyone assumes, so naming it is noise, and a kind the
+// capture left unnormalized gets no word rather than the nearest one — the same
+// dict-only rule the capture follows, carried through to display.
+var answerWords = map[FieldType]string{
+	TypeTextarea:    "written answer",
+	TypeSelect:      "choose one",
+	TypeMultiSelect: "choose any",
+	TypeBoolean:     "yes / no",
+	TypeFile:        "upload",
+}
+
+// standardFieldIDs are the controls each platform puts on every form. They are
+// identified by the identifiers OUR OWN mappers produce, not by guessing from labels:
+// the mappers are deterministic, so this set is exact rather than heuristic.
+//
+// Ashby is absent because it needs no list — it prefixes every standard field's path
+// with `_systemfield_`, which isStandard checks directly.
+var standardFieldIDs = map[string][]string{
+	"greenhouse": {
+		"first_name", "last_name", "email", "phone",
+		"resume", "resume_text", "cover_letter", "cover_letter_text",
+		"location", "longitude", "latitude",
+	},
+	"recruitee": {
+		"name", "email", "phone", "cv", "cover_letter", "photo", "salutation", "title",
+	},
+}
+
+// isStandard reports whether a field is one every application demands rather than
+// something this employer chose to ask.
+//
+// Three platforms answer it by their own convention rather than by a list, which is both
+// exact and immune to the platform adding profile fields later: Ashby prefixes every
+// standard field's path with `_systemfield_`, while Workable (`QA_`) and Lever
+// (`cards[`) prefix every EMPLOYER question — the inverse marker, so for those two the
+// test is inverted too.
+func isStandard(provider string, f Field) bool {
+	switch provider {
+	case "workable":
+		return !strings.HasPrefix(f.ID, "QA_")
+	case "lever":
+		// Lever names an employer's question `cards[<uuid>][fieldN]`; everything else —
+		// name, email, phone, the profile links, the CV, the consent boxes — is the
+		// standard application. Same kind of marker, read the same inverted way.
+		return !strings.HasPrefix(f.ID, "cards[")
+	}
+	if strings.HasPrefix(f.ID, "_systemfield_") {
+		return true
+	}
+	return slices.Contains(standardFieldIDs[provider], f.ID)
+}
+
+// labelPolicy strips all markup, leaving text. Compiled once, safe for concurrent use —
+// the same shape internal/ingest/sources uses for the same purpose.
+var labelPolicy = bluemonday.StrictPolicy()
+
+// asText flattens a label to plain text. Some platforms author question text as HTML —
+// Recruitee's consent questions arrive as a full <p> with an anchor inside — and the store
+// keeps what the platform sent, which is right. The reader shows text, so the tags come
+// off here.
+//
+// Deliberately flattened rather than rendered: this is employer-controlled markup, and a
+// block listing questions has no reason to be the one place it gets injected into our own
+// page.
+//
+// Not htmltext.ToText, which renders for reading and turns <b>CV</b> into *CV* — emphasis
+// markers are noise in a one-line label. Sanitize-then-unescape is what internal/ingest/sources
+// already does when it wants text rather than a rendering.
+func asText(label string) string {
+	if !strings.ContainsRune(label, '<') && !strings.ContainsRune(label, '&') {
+		return label
+	}
+	// Whitespace is normalized because stripping tags leaves the newlines and runs of
+	// spaces that were laying out the markup, not the sentence.
+	return strings.Join(strings.Fields(html.UnescapeString(labelPolicy.Sanitize(label))), " ")
+}
+
+// ForDisplay projects a captured form into what a candidate reads. It is pure: no
+// database, no network, so what it includes and what it refuses can be tested
+// without a fixture of either.
+func (f Form) ForDisplay() Display {
+	d := Display{Provider: f.Provider}
+
+	for _, field := range f.Fields {
+		switch {
+		// Neither is a question: one the platform fills itself and the candidate
+		// never sees, and one that is a block of text the employer placed mid-form.
+		case field.Type == TypeHidden || field.Type == TypeInfo:
+			continue
+
+		// Not the employer's questions — the platform's mandated diversity survey,
+		// always optional and near-identical everywhere. Listing it would bury what
+		// a candidate actually has to prepare for.
+		case field.Demographic:
+			continue
+
+		// A consent checkbox is the platform's legal boilerplate rather than the
+		// employer's question: it is on every application, its text is a paragraph of
+		// data-protection language, and a candidate deciding whether to apply learns
+		// nothing from it. Same reasoning as the equal-opportunity survey above — and
+		// left in, that paragraph sits in the standard-fields line beside "Email".
+		//
+		// It stays in the store. Anything that eventually FILLS a form has to tick it.
+		case strings.HasPrefix(field.ID, "consent["):
+			continue
+
+		// A control nothing could name cannot be described to anyone. It stays in the
+		// store — the identifier is still what a form-filler needs — but an unnamed
+		// entry on the page is a stray comma at best and a blank bullet at worst.
+		case strings.TrimSpace(field.Label) == "":
+			continue
+
+		case isStandard(f.Provider, field):
+			// One label may cover several controls (Greenhouse offers the CV as an
+			// upload OR pasted text under a single label), so the reader sees it once.
+			if label := asText(field.Label); !slices.Contains(d.Basics, label) {
+				d.Basics = append(d.Basics, label)
+			}
+
+		default:
+			d.Questions = append(d.Questions, Question{
+				Text:     asText(field.Label),
+				Required: field.Required,
+				Answer:   answerWords[field.Type],
+			})
+		}
+	}
+
+	return d
+}

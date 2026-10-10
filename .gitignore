@@ -1,0 +1,263 @@
+# Binaries
+/bin/
+/out/
+hire
+
+# Local git worktrees for isolated feature work.
+/.worktrees/
+# Worker binaries. release.sh builds every cmd/ target into the checkout ROOT, so each
+# one lands here as an untracked file — and one committed by accident (prune, 25 MB, in
+# #1212) blocks `git pull` on every deploy host that already has its own build sitting
+# there. Named individually rather than by a glob: these are real, expected artifacts,
+# and a blanket rule would also swallow a source file someone adds with the same name.
+#
+# Each pattern is ANCHORED with a leading slash. Unanchored, a bare name matches that name
+# at ANY depth — including the package directory of the same name, so `migrate` silently
+# ignored every new file under internal/migrate/, and `enrich`/`embed`/`ingest` did the same
+# to theirs. 26 package directories were shadowed this way; a new source file in one of them
+# would simply never be committed.
+/add-board
+/apple-revoke
+/auth-cleanup
+/auto-apply
+/auto-apply-orchestrate
+/backfill-application-events
+/backfill-applications
+/backfill-blank-company
+/backfill-clearance
+/backfill-company-info
+/backfill-company-info-wikipedia
+/backfill-company-type-hint
+/backfill-company-names
+/backfill-derive
+/backfill-descriptions
+/backfill-duplicate-marker-owner
+/backfill-echojobs
+/backfill-experience
+/backfill-experience-dates
+/backfill-profession-it-tech
+/backfill-remote-perk-false-positive
+/backfill-remote-region-restriction
+/backfill-requirements
+/backfill-talent-handle
+/backfill-resume-geo
+/backfill-resume-structured
+/backfill-slug-folded
+/backfill-telegram-prefilter
+/backfill-us-subdivision-collision
+/backfill-username-from-mailbox
+/billing-sync
+/broadcast
+/cal-sync
+/capture-apply-form
+/classify-mail
+/close-apploi-misattributed
+/close-chronic-boards
+/cv-previews
+/discord-sync
+/embed
+/enrich
+/ghost-crosscheck
+/gmail-sync
+/harvest-linkedin
+/harvest-orphans
+/hire-api
+/hydrate-adzuna-description
+/import-company-industries
+/linkedin-auth
+/linkedin-token-refresh
+/ingest
+/ingest-scheduler
+/liveness
+/llm-probe
+/mail-ingest
+/mail-preview
+/mentor-busy-sync
+/mentorship-remind
+/migrate
+/mine-titles
+/notify
+/nudge
+/onboarding
+/pro-welcome-mail
+/prune
+/publish-logo-domains
+/push-receipts
+/queue-metrics
+/recount-companies
+/reindex
+/remind
+/resolve-url
+/rollup-company
+/rollup-views
+/schedule-board
+/search-ping
+/social-digest
+/search-drain
+/search-settings-drift
+/seed-adzuna-description-queue
+/seed-from-inventory
+/similar-backfill
+# Root-level build output of `go build ./cmd/<name>/` — never commit these artifacts.
+/backfill-company-info
+/backfill-derive
+/discord-register-commands
+/enrich
+/gen-contracts
+/harvest-ats
+/harvest-boards
+/harvest-erecruiter
+/harvest-role
+/import-collections
+/ingest
+/liveness
+/notify
+/recount-companies
+/reindex
+/reslug
+/server
+/tg-extract
+/tg-ingest
+
+# Local scratch: scraped pages and ad-hoc source dumps used while spiking new
+# adapters. Multi-MB and sometimes carry third-party keys embedded in saved pages —
+# never commit.
+/remoteok.txt
+/workatastartup.html
+/native-boards.md
+/ats_emails.json
+/scratch/
+
+# Environment
+#
+# Default-deny, because the file that leaks is never the one a rule was written for: a copy
+# of .env taken before a risky change (.env.bak.pre-bifrost, .env.old, .env.2026-09-12) holds
+# exactly the same credentials and is named whatever the person was thinking at the time. An
+# allowlist of backup suffixes would only ever cover the shapes somebody already met.
+#
+# The negations name the env files that are meant to be committed — they carry no secrets.
+# Listing one here is the decision to publish it, so a new one must be added deliberately.
+#
+# Each negation is ANCHORED to its full path, for the reason the worker-binary block above
+# records in the other direction: a pattern with no slash in it matches that name at ANY
+# depth. Unanchored, `!.env.example` would also re-admit a `.env.example` nobody has written
+# yet, in a directory nobody has created yet — and `!.env.production` would re-admit a
+# future service's production env, which is the one file in this whole block most likely to
+# hold a live credential. Default-deny only holds if the exceptions cannot spread.
+.env
+.env.*
+!/.env.example
+!/web/.env.example
+!/extension/.env.production
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+
+# Claude Code local settings
+.claude/
+.agents/
+skills-lock.json
+
+# Spec Kit — local-only (not part of the freehire tree). Keep on disk for personal
+# workflows; never commit tooling, constitution memory, or generated feature specs.
+.specify/
+# Ignore Cursor local state; keep shared agent rules in the tree.
+.cursor/*
+!.cursor/rules/
+!.cursor/rules/**
+/specs/
+
+# Python
+__pycache__/
+*.pyc
+
+# Superpowers visual brainstorm scratch
+.superpowers/
+
+# Agent scratch: review reports, local run logs, throwaway seed SQL. Deliberately
+# outside git — it is a working directory, not an artifact, and a `git add -A` had
+# already swept a server log and a local seed script into a commit before this line
+# existed.
+.cache/
+
+# Node / Vite / Vitest caches. The frontend lives in web/ with its own
+# .gitignore; these guard against a stray tool run (e.g. vitest) from the repo
+# root leaking a node_modules/.vite cache into the Go project.
+node_modules/
+.vite/
+.svelte-kit/
+
+# extension/ (WXT + Svelte browser extension) generated dirs and release zips
+extension/.wxt/
+extension/.output/
+extension/*.zip
+
+# Compiled cmd/* worker binaries (go build ./cmd/<name>/ writes <name> into the repo root)
+/backfill-company-info
+/backfill-derive
+/backfill-descriptions
+/backfill-justjoin
+/embed
+/enrich
+/gen-cities
+/gen-contracts
+/gen-skill-descriptions
+/gmail-sync
+/harvest-ats
+/harvest-boards
+/harvest-erecruiter
+/harvest-loxo
+/harvest-role
+/import-collections
+/import-yc
+/ingest
+/liveness
+/mail-ingest
+/merge-companies
+/notify
+/recount-companies
+/reindex
+/reindex-companies
+/report-classify-drift
+/report-skill-gaps
+/report-unclassified-titles
+/reslug
+/rollup-facets
+/build-suggestions
+/rollup-stats
+/server
+/tg-extract
+/tg-ingest
+
+# Local-only compose overrides (per-machine service wiring; never shared).
+/docker-compose.override.yml
+
+# Go / Vitest coverage profiles and HTML (make cover, pnpm test:coverage).
+/coverage/
+/web/coverage/
+
+# Playwright e2e run artifacts (pnpm --dir web run test:e2e).
+/web/test-results/
+.pnpm-store/
+.tmp-containers/
+
+# The model bake-off's profile fixtures: a real CV, a real experience bank. This repository
+# is public and a CV is a name, a phone number, an address and an employment history, so
+# they stay local and are rebuilt from the account they belong to. The postings the bake-off
+# runs against ARE committed — they are already public.
+#
+# The pattern is a PREFIX, not two filenames. Naming each file meant the second one
+# (bakeoff-resume.json) landed untracked-but-visible until somebody noticed, and the next
+# one would too. See internal/api/handler/assistant_bakeoff.go.
+/internal/api/handler/testdata/bakeoff-profile*.json
+/internal/api/handler/testdata/bakeoff-resume*.json
+
+# Local Talent Network demo data (see the catalogue AGENTS.md); not part of the change.
+/seed-talent.sql
+
+# scripts/harvest_boards.py / discover_boards.py --write output: per-provider seed JSON for
+# cmd/harvest-boards, regenerated from the live boards table + whatever aggregator/query ran.
+# Not the catalog's own record (that's `boards`, written by cmd/harvest-boards --apply).
+/scripts/.harvest-seeds/

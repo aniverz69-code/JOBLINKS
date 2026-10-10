@@ -1,0 +1,290 @@
+// Package plan answers one question for the metered AI features: may this user do this
+// now. Everything behind that question — which plan they are on, what it allows per day,
+// how much they have already used, and whether a refusal is switched on yet — is this
+// package's business and nobody else's. A caller names a feature and a reference; it gets
+// yes or no back.
+//
+// The unit is a calendar day in UTC, and the reset is lazy: a new day is a different key,
+// so nothing expires anything and no scheduled job can forget to run.
+//
+// It replaces internal/ai/credits, which counted a currency. The measurement that ended
+// that design is in the add-plan-limits change: the assistant was 99.4% of model spend
+// and debited nothing, while tailoring debited three points once per session and nothing
+// for the 54 turns one account then ran inside it.
+package plan
+
+import "time"
+
+// Tier is the plan a user is on. There are three that anyone can buy, and there is no
+// fourth for staff — an exemption that exists only in code is one nobody can see when the
+// numbers look wrong.
+type Tier string
+
+const (
+	TierFree Tier = "free"
+	TierPro  Tier = "pro"
+	// TierUltra is priced on auto-apply, the only action here that drives a browser and
+	// submits something to a third party on somebody's behalf.
+	TierUltra Tier = "ultra"
+)
+
+// Paid reports whether this tier was bought.
+//
+// It exists so that a rule meaning "somebody is paying" is not written as `== TierPro`, which
+// is the shape that silently excluded Ultra from the tailoring turn ceiling the first time —
+// buying the more expensive plan would have cut a session short where the cheaper one ran
+// on. A fourth tier gets the rule for free.
+func (t Tier) Paid() bool { return t == TierPro || t == TierUltra }
+
+// Feature identifies a metered action. The value is persisted in the ledger and matched
+// by the idempotency index, so it must stay stable.
+//
+// FeatureAssistant covers the chat and profile presets together, deliberately: they are
+// the same conversation surface pointed at different things, and a per-preset allowance
+// would only teach a user which name to type. Tailoring is NOT one of them — it is metered
+// by its own two bounds (a daily session count and a per-session turn ceiling), and
+// charging it here as well would let the daily assistant allowance decide how deep one CV
+// may be edited.
+type Feature string
+
+const (
+	FeatureTailor    Feature = "tailor"
+	FeatureFit       Feature = "match"
+	FeatureAssistant Feature = "assistant"
+	FeatureDictation Feature = "dictation"
+	// FeatureCoverLetter is one drafted cover letter: three model calls over a fit analysis
+	// and a tailoring context that are already computed and cached by the time it runs. It is
+	// the cheapest metered feature per action, which is why its daily figures sit above the
+	// tailoring session's and below the assistant's.
+	FeatureCoverLetter Feature = "cover-letter"
+	// FeatureAutoApply is one unattended application: a headless browser opens the
+	// employer's form, fills it from the candidate's answers and submits it. It costs a
+	// browser rather than a model call, and it puts our name on something a stranger
+	// receives — which is why it is the one feature whose ceiling is a real daily count on
+	// pro rather than a fair-use guard, and the one that refuses from its first deploy.
+	FeatureAutoApply Feature = "auto-apply"
+)
+
+// AllFeatures lists every metered feature. Tests walk it, and the usage surface reports
+// each one, so a feature added to the config and forgotten here is a feature the user
+// cannot see.
+func AllFeatures() []Feature {
+	return []Feature{
+		FeatureTailor, FeatureFit, FeatureAssistant, FeatureDictation, FeatureCoverLetter,
+		FeatureAutoApply,
+	}
+}
+
+// TierOf resolves a plan from the columns that decide it: the better tier still live wins.
+//
+// Ultra is checked first, and it wins even when a pro entitlement reaches FURTHER. Both can
+// be live at once — the provider's portal makes that ordinary during an upgrade — and a
+// resolution that could go DOWN when somebody spends more is a bug people notice in the
+// worst possible way. Which one lasts longer is a question for the day the ultra one lapses,
+// and this function is asked again then.
+//
+// The comparison is strict, so an entitlement is over at the instant it expires — any grace
+// beyond that is a product decision and belongs where somebody can see it, not here.
+func TierOf(proUntil, ultraUntil, now time.Time) Tier {
+	if ultraUntil.After(now) {
+		return TierUltra
+	}
+	if proUntil.After(now) {
+		return TierPro
+	}
+	return TierFree
+}
+
+// Day is the UTC calendar day an allowance is keyed by. Always UTC, whatever the caller's
+// clock says: the counter row is keyed this way, and reading it in local time would put a
+// user's own sense of "today" out of step with the row that bounds them.
+func Day(t time.Time) time.Time {
+	u := t.UTC()
+	return time.Date(u.Year(), u.Month(), u.Day(), 0, 0, 0, 0, time.UTC)
+}
+
+// ResetsAt is the instant the current day's allowances lapse — midnight UTC on the next
+// day. Reported to the user, so a refusal says when to come back rather than just no.
+func ResetsAt(t time.Time) time.Time {
+	return Day(t).AddDate(0, 0, 1)
+}
+
+// Allowance is what one plan permits for one feature in a day. A pro-plan allowance is
+// Unlimited with Limit carrying the fair-use guard behind it: the guard is real and it
+// refuses, but it is not a plan limit and is never shown as one.
+type Allowance struct {
+	Limit     int
+	Unlimited bool
+}
+
+// tierAllowance is what one tier may do with one feature in a day.
+//
+// `daily` is a real ceiling; `unlimited` says there is none and makes `daily` the fair-use
+// guard behind it instead. The zero value therefore allows NOTHING, which is what an
+// unconfigured tier should do.
+type tierAllowance struct {
+	daily     int
+	unlimited bool
+}
+
+// featureConfig is one feature's economics on every plan.
+//
+// One allowance per tier rather than the earlier pair of fields (a free number and a pro
+// fair-use guard). That pair could only express "free has a ceiling, pro does not", and
+// auto-apply needs the third shape: a REAL daily ceiling on pro, unlimited above it. Bolting
+// a `proDaily` beside `proFairUse` would have left two fields whose interaction nobody could
+// read from the call site.
+type featureConfig struct {
+	free    tierAllowance
+	pro     tierAllowance
+	ultra   tierAllowance
+	enforce bool
+}
+
+// of returns this feature's allowance for one tier. An unknown tier allows nothing, for the
+// same reason an unknown feature does.
+func (fc featureConfig) of(tier Tier) tierAllowance {
+	switch tier {
+	case TierFree:
+		return fc.free
+	case TierPro:
+		return fc.pro
+	case TierUltra:
+		return fc.ultra
+	}
+	return tierAllowance{}
+}
+
+// Config is the whole product decision in one place: which features are metered, how much
+// each plan allows, and whether a refusal is switched on. Call sites name a feature and
+// nothing else, which is what keeps five handlers from drifting apart about what a limit is.
+type Config struct {
+	features map[Feature]featureConfig
+
+	// TailorTurnsPerSession bounds how deep one tailoring session goes, separately from
+	// how many sessions a day may be started. Both bounds are needed and they stop
+	// different things: measured on production the median session ran 2.7 turns and one
+	// ran 54, so a session count alone leaves that session unbounded.
+	TailorTurnsPerSession int
+}
+
+// DefaultConfig is the configuration the change ships with.
+//
+// The free numbers sit a little above the 90th percentile of measured behaviour, so an
+// ordinary day never meets a wall and a deliberate evening of editing does. The fair-use
+// guards are set roughly twenty times higher: they exist to stop a script from draining
+// the gateway on one subscription, not to bound a person.
+//
+// Every metered AI feature is subscription-only: free gets none of it, and enforcement is
+// ON from the start — a zero allowance needs no shadow run to justify refusing it, unlike
+// the pro/ultra numbers themselves, which are still the unverified reading of 101 users
+// over 23 days under no paywall at all. PLAN_FREE_DAILY_<FEATURE> (env.go) is the lever
+// that reopens a free allowance for one feature without a deploy, if that is ever wanted;
+// nothing here forecloses it.
+func DefaultConfig() Config {
+	return Config{
+		features: map[Feature]featureConfig{
+			FeatureTailor: {
+				free:    tierAllowance{},
+				pro:     tierAllowance{daily: 40, unlimited: true},
+				ultra:   tierAllowance{daily: 120, unlimited: true},
+				enforce: true,
+			},
+			FeatureFit: {
+				free:    tierAllowance{},
+				pro:     tierAllowance{daily: 60, unlimited: true},
+				ultra:   tierAllowance{daily: 180, unlimited: true},
+				enforce: true,
+			},
+			FeatureAssistant: {
+				free:    tierAllowance{},
+				pro:     tierAllowance{daily: 200, unlimited: true},
+				ultra:   tierAllowance{daily: 600, unlimited: true},
+				enforce: true,
+			},
+			FeatureDictation: {
+				free:    tierAllowance{},
+				pro:     tierAllowance{daily: 200, unlimited: true},
+				ultra:   tierAllowance{daily: 600, unlimited: true},
+				enforce: true,
+			},
+			// Same shape as every other feature here now, not a special case: it once shipped
+			// in shadow ("a ceiling set before there is any usage to read is a guess"), and
+			// that reasoning was about the PRO/ULTRA numbers, which are still unverified. It
+			// says nothing about free, where the number is zero by product decision rather
+			// than a guess to be read back from usage.
+			FeatureCoverLetter: {
+				free:    tierAllowance{},
+				pro:     tierAllowance{daily: 60, unlimited: true},
+				ultra:   tierAllowance{daily: 180, unlimited: true},
+				enforce: true,
+			},
+			// No longer the one exception — see the package-level comment above. What is
+			// still specific to auto-apply: pro carries a REAL three a day rather than a
+			// fair-use guard, because that ceiling is what the tier above is sold on, and
+			// Ultra's figure is deliberately loose and admittedly unmeasured — it guards the
+			// HOST (each attempt is a browser) rather than a price, and there is no usage
+			// history to set it from.
+			FeatureAutoApply: {
+				free:    tierAllowance{},
+				pro:     tierAllowance{daily: 3},
+				ultra:   tierAllowance{daily: 100, unlimited: true},
+				enforce: true,
+			},
+		},
+		TailorTurnsPerSession: 15,
+	}
+}
+
+// with returns a copy of this configuration, having applied edit to each feature. Every
+// variation copies rather than mutating, because a Config holds a map and two callers
+// sharing one would otherwise reconfigure each other's.
+func (c Config) with(edit func(Feature, *featureConfig)) Config {
+	out := Config{
+		features:              make(map[Feature]featureConfig, len(c.features)),
+		TailorTurnsPerSession: c.TailorTurnsPerSession,
+	}
+	for f, fc := range c.features {
+		edit(f, &fc)
+		out.features[f] = fc
+	}
+	return out
+}
+
+// Enforcing returns this configuration with every feature's refusal switched on — the
+// state the shadow run ends in, and the one a test asserting a refusal has to be in.
+func (c Config) Enforcing() Config {
+	return c.with(func(_ Feature, fc *featureConfig) { fc.enforce = true })
+}
+
+// WithFreeDaily returns this configuration with one feature's free allowance set to n.
+func (c Config) WithFreeDaily(f Feature, n int) Config {
+	return c.with(func(k Feature, fc *featureConfig) {
+		if k == f {
+			fc.free.daily = n
+		}
+	})
+}
+
+// FreeDaily is the free plan's daily allowance for a feature. An unconfigured feature
+// allows nothing rather than everything: a surface somebody forgot to configure should
+// show up as refused in a shadow run, not as free in a bill.
+func (c Config) FreeDaily(f Feature) int { return c.features[f].free.daily }
+
+// Enforced reports whether a refusal for this feature actually refuses. False is shadow
+// mode: the consumption is recorded and reported, and the caller is allowed through.
+func (c Config) Enforced(f Feature) bool { return c.features[f].enforce }
+
+// Allowance is what the given plan permits for the feature in a day.
+//
+// A lookup now rather than a branch on one tier. Where the tier is unlimited, Limit carries
+// the fair-use guard behind it — the convention this type already had for pro, and the
+// reason `decide` can apply the guard to every unlimited tier without knowing which.
+func (c Config) Allowance(tier Tier, f Feature) Allowance {
+	cfg, ok := c.features[f]
+	if !ok {
+		return Allowance{}
+	}
+	a := cfg.of(tier)
+	return Allowance{Limit: a.daily, Unlimited: a.unlimited}
+}

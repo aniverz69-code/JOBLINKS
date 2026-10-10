@@ -1,0 +1,146 @@
+import { describe, expect, it } from 'vitest';
+import {
+  appliedOnError,
+  decisionLabel,
+  decisionNotePlaceholder,
+  decisionNotePrompt,
+  decisionOutcome,
+  moderationReasonOf,
+  processKindOf,
+  reportReasons,
+  reportRoute,
+  reportReasonLabel,
+  type DecisionKind,
+} from './reports';
+import type { ReportReason } from './types';
+
+describe('reportReasonLabel', () => {
+  it('labels a known reason and falls back to the raw value', () => {
+    expect(reportReasonLabel('fraud')).toBe('Fraud');
+    expect(reportReasonLabel('nonsense' as never)).toBe('nonsense');
+  });
+});
+
+describe('decisionLabel', () => {
+  it('names each decision the way the button reads', () => {
+    const labels = (['close', 'resolve', 'dismiss'] as DecisionKind[]).map(decisionLabel);
+    expect(new Set(labels).size).toBe(3);
+    expect(decisionLabel('close')).toMatch(/close/i);
+  });
+});
+
+describe('decisionNotePrompt', () => {
+  it('tells the moderator the reporter reads what they write', () => {
+    for (const kind of ['close', 'resolve', 'dismiss'] as DecisionKind[]) {
+      expect(decisionNotePrompt(kind)).toMatch(/reporter/i);
+    }
+  });
+
+  it('shapes the example note to the decision', () => {
+    expect(decisionNotePlaceholder('dismiss')).not.toBe(decisionNotePlaceholder('resolve'));
+    // A dismissal fixed nothing, so its example must not claim a fix.
+    expect(decisionNotePlaceholder('dismiss')).not.toMatch(/fixed/i);
+  });
+});
+
+describe('decisionOutcome', () => {
+  it('is silent when the decision landed and the notice went out', () => {
+    expect(decisionOutcome({ notifyRequested: true, notified: true })).toBeNull();
+  });
+
+  it('is silent when no notice was asked for', () => {
+    expect(decisionOutcome({ notifyRequested: false, notified: false })).toBeNull();
+  });
+
+  it('warns when a requested notice did not go out', () => {
+    const warning = decisionOutcome({ notifyRequested: true, notified: false });
+    expect(warning).not.toBeNull();
+    // The moderator must learn two things: the decision stands, and nobody was told.
+    expect(warning).toMatch(/recorded|saved|stands/i);
+    expect(warning).toMatch(/email|notif/i);
+  });
+
+  it('names who was not reached, since the row leaves the queue either way', () => {
+    const warning = decisionOutcome({
+      notifyRequested: true,
+      notified: false,
+      reporterEmail: 'lina@example.test',
+      jobTitle: 'Senior Web Designer',
+    });
+    expect(warning).toContain('lina@example.test');
+    expect(warning).toContain('Senior Web Designer');
+  });
+
+  it('never claims a notice was sent that was not', () => {
+    const warning = decisionOutcome({ notifyRequested: true, notified: false });
+    expect(warning).not.toMatch(/\bsent\b(?!.*(not|n't))/i);
+  });
+});
+
+describe('reportRoute', () => {
+  it('routes no_response to the ghost signal', () => {
+    expect(reportRoute('no_response')).toBe('ghost');
+  });
+
+  // ai_interview is a statement of fact about an employer. There is nothing for a
+  // moderator to DO about a true statement, and the queue's only lever — closing the
+  // posting — would answer it with something nobody asked for.
+  it('routes ai_interview to the company process report', () => {
+    expect(reportRoute('ai_interview')).toBe('process');
+    expect(processKindOf('ai_interview')).toBe('ai_interview');
+    expect(moderationReasonOf('ai_interview')).toBeNull();
+  });
+
+  // The narrowing helpers are the guard that keeps an entry off the endpoint whose
+  // vocabulary does not contain it, so they must disagree in both directions.
+  it('keeps a moderation reason out of the process endpoint', () => {
+    expect(processKindOf('fraud')).toBeNull();
+    expect(moderationReasonOf('fraud')).toBe('fraud');
+  });
+
+  it('offers every entry it can route', () => {
+    for (const option of reportReasons) {
+      expect(['moderation', 'ghost', 'process']).toContain(reportRoute(option.value));
+    }
+  });
+
+  // The moderation queue's only verdict is closing the job. A reason routed there
+  // by mistake reaches a reviewer who cannot express "noted, counted".
+  it.each<ReportReason>(['not_relevant', 'spam', 'fraud', 'other'])(
+    'keeps %s on the moderation path',
+    (reason) => {
+      expect(reportRoute(reason)).toBe('moderation');
+    },
+  );
+
+  it('sends exactly one entry down each non-moderation lane', () => {
+    const lanes = reportReasons.map((r) => reportRoute(r.value));
+    expect(lanes.filter((l) => l === 'ghost')).toHaveLength(1);
+    expect(lanes.filter((l) => l === 'process')).toHaveLength(1);
+  });
+});
+
+describe('appliedOnError', () => {
+  const today = '2026-07-30';
+
+  it('accepts a past date and today itself', () => {
+    expect(appliedOnError({ value: '2026-06-01', badInput: false, today })).toBeNull();
+    expect(appliedOnError({ value: today, badInput: false, today })).toBeNull();
+  });
+
+  // A date input answers an impossible entry — 30 February, a half-typed year —
+  // by clearing its value, so the empty string alone cannot say whether the user
+  // typed nothing or typed something that does not exist. Only badInput can, and
+  // the two deserve different sentences.
+  it('separates an impossible date from an empty field', () => {
+    const impossible = appliedOnError({ value: '', badInput: true, today });
+    const empty = appliedOnError({ value: '', badInput: false, today });
+    expect(impossible).toMatch(/exist/i);
+    expect(empty).not.toBeNull();
+    expect(empty).not.toBe(impossible);
+  });
+
+  it('rejects a date in the future', () => {
+    expect(appliedOnError({ value: '2026-07-31', badInput: false, today })).toMatch(/future/i);
+  });
+});
